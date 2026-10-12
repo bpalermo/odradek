@@ -1,4 +1,4 @@
-package io.github.bpalermo.odradek.sidecar;
+package io.github.bpalermo.odradek.server;
 
 import static org.assertj.core.api.Assertions.assertThat;
 

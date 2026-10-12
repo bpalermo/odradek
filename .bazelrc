@@ -22,7 +22,7 @@ build --tool_java_runtime_version=remotejdk_25
 # source here and would fail them. First-party targets opt in with JAVACOPTS from
 # //bazel/java:defs.bzl.
 
-# The git commit goes into the push tag (//sidecar:image_push) and nowhere else.
+# The git commit goes into the push tag (//server:image_push) and nowhere else.
 # Stamping is left to the targets that ask for it (image_push); there is no global
 # --stamp, so every other target's action key is unaffected by the commit.
 build --workspace_status_command=bazel/workspace_status.sh

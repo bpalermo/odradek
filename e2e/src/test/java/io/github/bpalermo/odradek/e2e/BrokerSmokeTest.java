@@ -22,7 +22,7 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.Test;
 
 /**
- * Smoke test of the two e2e brokers, using kafka-clients directly (no sidecar involved yet).
+ * Smoke test of the two e2e brokers, using kafka-clients directly (no server involved yet).
  *
  * <p>The bootstrap addresses come from {@code ODRADEK_E2E_KAFKA_A} and {@code ODRADEK_E2E_KAFKA_B};
  * a missing variable fails the test.

@@ -17,7 +17,7 @@ proto_library(
 
 java_proto_library(
     name = "config_java_proto",
-    visibility = ["//sidecar:__subpackages__"],
+    visibility = ["//server:__subpackages__"],
     deps = [":config_proto"],
 )
 

@@ -7,12 +7,12 @@ load("//bazel/java:junit.bzl", "java_junit_test")
 package(default_visibility = ["//visibility:private"])
 
 java_library(
-    name = "sidecar_lib",
+    name = "server_lib",
     srcs = glob(["src/main/java/**/*.java"]),
     javacopts = JAVACOPTS,
     deps = [
-        "//api/odradek/kafka/v1:sidecar_java_grpc",
-        "//api/odradek/kafka/v1:sidecar_java_proto",
+        "//api/odradek/kafka/v1:odradek_java_grpc",
+        "//api/odradek/kafka/v1:odradek_java_proto",
         "@grpc-java//api",
         "@grpc-java//netty",
         "@grpc-java//stub",
@@ -32,12 +32,12 @@ java_library(
 )
 
 java_binary(
-    name = "sidecar",
-    main_class = "io.github.bpalermo.odradek.sidecar.Main",
+    name = "server",
+    main_class = "io.github.bpalermo.odradek.server.Main",
     visibility = ["//visibility:public"],
     runtime_deps = [
         ":netty_epoll_native",
-        ":sidecar_lib",
+        ":server_lib",
         "@maven//:ch_qos_logback_logback_classic",
     ],
 )
@@ -45,8 +45,8 @@ java_binary(
 java_image(
     name = "image",
     base = "@distroless_java25",
-    deploy_jar = ":sidecar_deploy.jar",
-    jar_path = "/app/sidecar.jar",
+    deploy_jar = ":server_deploy.jar",
+    jar_path = "/app/server.jar",
     load_tag = "localhost/odradek:e2e",
     registry = IMAGE_REGISTRY,
     repository = image_repository("odradek"),
@@ -58,13 +58,13 @@ java_junit_test(
     srcs = glob(["src/test/java/**/*.java"]),
     javacopts = JAVACOPTS,
     test_classes = [
-        "io.github.bpalermo.odradek.sidecar.MainTest",
-        "io.github.bpalermo.odradek.sidecar.config.SidecarConfigValidationTest",
+        "io.github.bpalermo.odradek.server.MainTest",
+        "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
     ],
     deps = [
-        ":sidecar_lib",
+        ":server_lib",
         "//api/odradek/config/v1:config_java_proto",
-        "//api/odradek/kafka/v1:sidecar_java_grpc",
+        "//api/odradek/kafka/v1:odradek_java_grpc",
         "@maven//:build_buf_protovalidate",
         "@maven//:org_assertj_assertj_core",
         "@maven//:org_junit_jupiter_junit_jupiter_api",

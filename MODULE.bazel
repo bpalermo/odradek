@@ -1,4 +1,4 @@
-"""odradek: a Kafka client sidecar, spoken to over gRPC on a Unix domain socket."""
+"""odradek: a server that owns the Kafka clients for an application, spoken to over gRPC on a Unix domain socket."""
 
 module(
     name = "odradek",
@@ -12,7 +12,7 @@ bazel_dep(name = "rules_jvm_external", version = "7.1")
 bazel_dep(name = "protobuf", version = "36.2")
 bazel_dep(name = "grpc-java", version = "1.84.0")
 
-# Container image (//sidecar:image_*) and the cosign CLI that verifies it.
+# Container image (//server:image_*) and the cosign CLI that verifies it.
 bazel_dep(name = "rules_img", version = "0.3.21")
 bazel_dep(name = "rules_img_signer_cosign", version = "0.0.1")
 bazel_dep(name = "rules_shell", version = "0.8.0")
@@ -63,8 +63,8 @@ maven.install(
         # against (IO_GRPC_GRPC_JAVA_ARTIFACTS in its MODULE.bazel). grpc-netty-shaded
         # is deliberately NOT used. Unix domain sockets for grpc-netty need netty's epoll transport, and its
         # native library is a per-arch classifier jar. Both architectures are
-        # listed because the sidecar runs in pods on amd64 and arm64 nodes; the
-        # build picks one with a select() on the target CPU (//sidecar).
+        # listed because the server runs in pods on amd64 and arm64 nodes; the
+        # build picks one with a select() on the target CPU (//server).
         "io.netty:netty-transport-native-epoll:jar:linux-x86_64:4.2.16.Final",
         "io.netty:netty-transport-native-epoll:jar:linux-aarch_64:4.2.16.Final",
         "io.netty:netty-transport-native-unix-common:4.2.16.Final",
@@ -76,7 +76,7 @@ maven.install(
         "build.buf:protovalidate:1.3.0",
         "com.google.protobuf:protobuf-java-util:4.36.2",
         "org.snakeyaml:snakeyaml-engine:3.2",
-        # Logging: the slf4j API in code, logback behind it in the sidecar binary.
+        # Logging: the slf4j API in code, logback behind it in the server binary.
         "org.slf4j:slf4j-api:2.0.20",
         "ch.qos.logback:logback-classic:1.5.38",
         # Tests: JUnit 6 (Jupiter) via the JUnit Platform console launcher, AssertJ.

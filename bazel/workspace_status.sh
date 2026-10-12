@@ -5,7 +5,7 @@
 # Bazel treats as constant metadata: an action that embeds one is not
 # invalidated when it changes, so a cached action could keep publishing a stale
 # value. A commit identity must invalidate when the commit changes. Only the
-# image_push target consumes it (see //sidecar), so nothing else is re-run.
+# image_push target consumes it (see //server), so nothing else is re-run.
 # Never fails, so it cannot break a build.
 set -euo pipefail
 

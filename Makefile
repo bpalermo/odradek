@@ -23,10 +23,10 @@ tidy:
 	@bazel mod tidy
 
 image:
-	@bazel build //sidecar:image_index
+	@bazel build //server:image_index
 
 image-load:
-	@bazel run //sidecar:image_load
+	@bazel run //server:image_load
 
 # Regenerate api/baseline.binpb from the current protos (a release, or an accepted break).
 baseline:

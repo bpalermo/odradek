@@ -5,7 +5,7 @@ Keep it short. The interesting part is usually "how it was verified" and
 
 ## What
 
-<!-- One or two sentences. What changes for an app using the sidecar, or for someone operating it? -->
+<!-- One or two sentences. What changes for an app using the server, or for someone operating it? -->
 
 ## Why
 
