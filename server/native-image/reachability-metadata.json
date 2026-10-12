@@ -706,6 +706,14 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Telemetry"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Telemetry$Builder"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.config.v1.Tls"
     },
     {

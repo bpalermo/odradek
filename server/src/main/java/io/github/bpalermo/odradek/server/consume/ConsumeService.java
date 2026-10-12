@@ -10,6 +10,7 @@ import io.github.bpalermo.odradek.kafka.v1.Subscribe;
 import io.github.bpalermo.odradek.kafka.v1.Subscribed;
 import io.github.bpalermo.odradek.server.codec.CodecRegistry;
 import io.github.bpalermo.odradek.server.codec.RecordDecoder;
+import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.Status;
 import io.grpc.stub.ServerCallStreamObserver;
@@ -51,6 +52,7 @@ public final class ConsumeService {
   private final ServerConfig config;
   private final CodecRegistry codecs;
   private final TlsSources tls;
+  private final ServerMetrics metrics;
   private final Factory factory;
   private final String serverEpoch;
   private final LongSupplier nanoClock;
@@ -63,11 +65,16 @@ public final class ConsumeService {
   private volatile boolean shuttingDown;
 
   public ConsumeService(
-      ServerConfig config, CodecRegistry codecs, TlsSources tls, String serverEpoch) {
+      ServerConfig config,
+      CodecRegistry codecs,
+      TlsSources tls,
+      String serverEpoch,
+      ServerMetrics metrics) {
     this(
         config,
         codecs,
         tls,
+        metrics,
         serverEpoch,
         (cluster, properties) ->
             new KafkaConsumer<>(
@@ -81,19 +88,21 @@ public final class ConsumeService {
       String serverEpoch,
       Factory factory,
       LongSupplier nanoClock) {
-    this(config, codecs, TlsSources.none(), serverEpoch, factory, nanoClock);
+    this(config, codecs, TlsSources.none(), ServerMetrics.noop(), serverEpoch, factory, nanoClock);
   }
 
   ConsumeService(
       ServerConfig config,
       CodecRegistry codecs,
       TlsSources tls,
+      ServerMetrics metrics,
       String serverEpoch,
       Factory factory,
       LongSupplier nanoClock) {
     this.config = config;
     this.codecs = codecs;
     this.tls = tls;
+    this.metrics = metrics;
     this.serverEpoch = serverEpoch;
     this.factory = factory;
     this.nanoClock = nanoClock;
@@ -287,6 +296,25 @@ public final class ConsumeService {
           clusterName,
           subscribe.getClient().getLanguage(),
           subscribe.getClient().getVersion());
+      String group = first.getGroupId();
+      metrics.consumeStreamOpened(clusterName, group);
+      started.events(
+          new ConsumeSession.Events() {
+            @Override
+            public void delivered(String topic, long records, long undecodable) {
+              metrics.delivered(topic, records, undecodable);
+            }
+
+            @Override
+            public void rebalanced(String event) {
+              metrics.rebalanced(clusterName, group, event);
+            }
+
+            @Override
+            public void ended(String reason) {
+              metrics.consumeStreamClosed(clusterName, group, reason);
+            }
+          });
       sessions.add(started);
       session = started;
       started.start("odradek-consume-" + first.getGroupId() + "-" + streamCounter.get());

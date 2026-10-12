@@ -12,6 +12,7 @@ import io.github.bpalermo.odradek.kafka.v1.ProduceResult;
 import io.github.bpalermo.odradek.server.codec.RecordEncodeException;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes.Route;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes.Target;
+import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
 import io.grpc.Status;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
@@ -46,12 +47,19 @@ public final class ProduceService {
   private final int maxInFlightRecords;
   private final long maxInFlightBytes;
   private final LongSupplier clock;
+  private final ServerMetrics metrics;
 
-  public ProduceService(ServerConfig config, ProduceRoutes routes) {
-    this(config, routes, System::currentTimeMillis);
+  public ProduceService(ServerConfig config, ProduceRoutes routes, ServerMetrics metrics) {
+    this(config, routes, System::currentTimeMillis, metrics);
   }
 
   ProduceService(ServerConfig config, ProduceRoutes routes, LongSupplier clock) {
+    this(config, routes, clock, ServerMetrics.noop());
+  }
+
+  ProduceService(
+      ServerConfig config, ProduceRoutes routes, LongSupplier clock, ServerMetrics metrics) {
+    this.metrics = metrics;
     this.routes = routes;
     this.maxInFlightRecords =
         config.getProduce().hasMaxInFlightRecords()
@@ -93,6 +101,7 @@ public final class ProduceService {
     private ProduceSession session;
     private boolean closed;
     private boolean halfClosed;
+    private boolean counted;
 
     ProduceStream(ServerCallStreamObserver<ProduceResponse> call) {
       this.call = call;
@@ -148,6 +157,10 @@ public final class ProduceService {
           request.getOpen().getClient().getLanguage(),
           request.getOpen().getClient().getVersion());
       session = session(id);
+      synchronized (this) {
+        counted = true;
+      }
+      metrics.produceStreamOpened();
       session.attach(
           sink,
           () ->
@@ -179,6 +192,7 @@ public final class ProduceService {
         }
         case STALE -> {
           reject(
+              record.getTopic(),
               seq,
               ErrorCode.ERROR_CODE_PROTOCOL_VIOLATION,
               "seq " + seq + " is not above the highest seen and has no retained result");
@@ -189,6 +203,7 @@ public final class ProduceService {
       Route route = routes.find(record.getTopic());
       if (route == null) {
         reject(
+            record.getTopic(),
             seq,
             ErrorCode.ERROR_CODE_TOPIC_NOT_CONFIGURED,
             "topic " + record.getTopic() + " has no entry under producers");
@@ -197,6 +212,7 @@ public final class ProduceService {
       long bytes = size(record);
       if (!session.fits(bytes, maxInFlightRecords, maxInFlightBytes)) {
         reject(
+            record.getTopic(),
             seq,
             ErrorCode.ERROR_CODE_PROTOCOL_VIOLATION,
             "the in-flight window is exceeded: wait for results before sending more");
@@ -213,7 +229,7 @@ public final class ProduceService {
         key = route.encoder().encodeKey(headers, bytes(record.hasKey(), record.getKey()));
         value = route.encoder().encodeValue(headers, bytes(record.hasValue(), record.getValue()));
       } catch (RecordEncodeException e) {
-        reject(seq, ErrorCode.ERROR_CODE_INVALID_RECORD, e.getMessage());
+        reject(record.getTopic(), seq, ErrorCode.ERROR_CODE_INVALID_RECORD, e.getMessage());
         return;
       }
       Integer partition = record.hasPartition() ? record.getPartition() : null;
@@ -222,7 +238,16 @@ public final class ProduceService {
 
       session.begin(seq, bytes);
       List<Target> targets = route.targets();
-      Write write = new Write(seq, targets, session::complete);
+      String topic = record.getTopic();
+      Write write =
+          new Write(
+              seq,
+              targets,
+              result -> {
+                metrics.produced(
+                    topic, result.hasError() ? result.getError().getCode().name() : null);
+                session.complete(result);
+              });
       // The session lock is not held here: send() may wait for metadata, and the callbacks that
       // need the lock run on the producers' I/O threads.
       for (int i = 0; i < targets.size(); i++) {
@@ -235,6 +260,11 @@ public final class ProduceService {
                   new ProducerRecord<>(
                       record.getTopic(), partition, timestamp, key, value, copy(headers)),
                   (metadata, failure) -> {
+                    metrics.clusterWrite(
+                        topic,
+                        targets.get(index).cluster(),
+                        !targets.get(index).bestEffort(),
+                        failure == null);
                     if (failure == null) {
                       write.acked(index, metadata);
                     } else {
@@ -242,13 +272,16 @@ public final class ProduceService {
                     }
                   });
         } catch (RuntimeException e) {
+          metrics.clusterWrite(
+              topic, targets.get(i).cluster(), !targets.get(i).bestEffort(), false);
           write.failed(index, e);
         }
       }
     }
 
     /** Answers a record that is not handed to Kafka, and remembers the answer for resends. */
-    private void reject(long seq, ErrorCode code, String message) {
+    private void reject(String topic, long seq, ErrorCode code, String message) {
+      metrics.produced(topic, code.name());
       session.complete(
           ProduceResult.newBuilder().setSeq(seq).setError(ProduceErrors.of(code, message)).build());
     }
@@ -306,6 +339,14 @@ public final class ProduceService {
     }
 
     private void detach() {
+      boolean wasCounted;
+      synchronized (this) {
+        wasCounted = counted;
+        counted = false;
+      }
+      if (wasCounted) {
+        metrics.produceStreamClosed();
+      }
       if (session != null) {
         session.detach(sink);
       }

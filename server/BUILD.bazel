@@ -14,6 +14,7 @@ package(default_visibility = ["//visibility:private"])
 JVM_FLAGS = ["--enable-native-access=ALL-UNNAMED"]
 
 _TEST_PKI = [
+    "src/test/java/io/github/bpalermo/odradek/server/telemetry/FakeCollector.java",
     "src/test/java/io/github/bpalermo/odradek/server/tls/FakeWorkloadApi.java",
     "src/test/java/io/github/bpalermo/odradek/server/tls/TestPki.java",
 ]
@@ -25,6 +26,8 @@ java_library(
     resource_strip_prefix = "server/src/main/resources",
     resources = glob(["src/main/resources/**"]),
     visibility = ["//e2e:__pkg__"],
+    # The OTLP exporter's transport on grpc-java, found through ServiceLoader.
+    runtime_deps = ["@maven//:io_opentelemetry_opentelemetry_exporter_sender_grpc_managed_channel"],
     deps = [
         "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
@@ -37,6 +40,10 @@ java_library(
         "@maven//:io_netty_netty_transport",
         "@maven//:io_netty_netty_transport_classes_epoll",
         "@maven//:io_netty_netty_transport_native_unix_common",
+        "@maven//:io_opentelemetry_opentelemetry_api",
+        "@maven//:io_opentelemetry_opentelemetry_exporter_otlp",
+        "@maven//:io_opentelemetry_opentelemetry_sdk_common",
+        "@maven//:io_opentelemetry_opentelemetry_sdk_metrics",
         "@maven//:org_apache_kafka_kafka_clients",
         "@maven//:org_slf4j_slf4j_api",
         "@maven//:org_snakeyaml_snakeyaml_engine",
@@ -170,8 +177,8 @@ executable_image(
     tag_flag = ":image_tag",
 )
 
-# A throwaway certificate authority and a stand-in SPIRE agent, for the TLS tests
-# here and for the end-to-end suite (//e2e:pki makes the mTLS broker's
+# A throwaway certificate authority, a stand-in SPIRE agent and a stand-in
+# OpenTelemetry collector, for the tests here and for the end-to-end suite (//e2e:pki makes the mTLS broker's
 # certificates).
 java_library(
     name = "test_pki",
@@ -183,6 +190,7 @@ java_library(
         ":server_lib",
         "@grpc-java//api",
         "@grpc-java//netty",
+        "@grpc-java//stub",
         "@maven//:io_netty_netty_transport",
         "@maven//:io_netty_netty_transport_classes_epoll",
         "@maven//:io_netty_netty_transport_native_unix_common",
@@ -212,6 +220,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.consume.PartitionStateTest",
         "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
+        "io.github.bpalermo.odradek.server.telemetry.TelemetryTest",
         "io.github.bpalermo.odradek.server.tls.TlsTest",
         "io.github.bpalermo.odradek.server.tls.WorkloadApiTest",
     ],
@@ -234,6 +243,9 @@ java_junit_test(
         "@maven//:io_netty_netty_transport",
         "@maven//:io_netty_netty_transport_classes_epoll",
         "@maven//:io_netty_netty_transport_native_unix_common",
+        "@maven//:io_opentelemetry_opentelemetry_api",
+        "@maven//:io_opentelemetry_opentelemetry_sdk_metrics",
+        "@maven//:io_opentelemetry_opentelemetry_sdk_testing",
         "@maven//:org_apache_kafka_kafka_clients",
         "@maven//:org_assertj_assertj_core",
         "@maven//:org_junit_jupiter_junit_jupiter_api",

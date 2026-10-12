@@ -66,6 +66,7 @@ public final class FileCredentialSource implements CredentialSource {
     }
     this.current = parse(content);
     this.seen = content;
+    reloads.incrementAndGet();
     LOG.info(
         "cluster {}: TLS credentials loaded from {}, certificate expires {}",
         cluster,
@@ -78,12 +79,12 @@ public final class FileCredentialSource implements CredentialSource {
     return current;
   }
 
-  /** How many times new content replaced the current set. */
+  @Override
   public long reloads() {
     return reloads.get();
   }
 
-  /** How many times new content was rejected. */
+  @Override
   public long failures() {
     return failures.get();
   }

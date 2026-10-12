@@ -23,6 +23,7 @@ import io.github.bpalermo.odradek.server.OdradekService;
 import io.github.bpalermo.odradek.server.codec.CodecRegistry;
 import io.github.bpalermo.odradek.server.codec.ContractRegistry;
 import io.github.bpalermo.odradek.server.consume.ConsumeService;
+import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
@@ -136,7 +137,12 @@ class ProduceServiceTest {
             .addService(
                 new OdradekService(
                     service,
-                    new ConsumeService(config, codecs, TlsSources.none(), service.serverEpoch())))
+                    new ConsumeService(
+                        config,
+                        codecs,
+                        TlsSources.none(),
+                        service.serverEpoch(),
+                        ServerMetrics.noop())))
             .build()
             .start();
     channel = InProcessChannelBuilder.forName(name).build();

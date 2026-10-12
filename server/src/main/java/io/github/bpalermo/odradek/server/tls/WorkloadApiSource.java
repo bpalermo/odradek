@@ -98,12 +98,13 @@ public final class WorkloadApiSource implements CredentialSource, Closeable {
     return current;
   }
 
-  /** How many times an update replaced the current set, the first one included. */
+  @Override
   public long reloads() {
     return reloads.get();
   }
 
-  /** How many updates were rejected, plus how many times the stream ended. */
+  /** Updates rejected, plus the times the stream ended. */
+  @Override
   public long failures() {
     return failures.get();
   }

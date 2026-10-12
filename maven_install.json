@@ -41,6 +41,13 @@
     "io.netty:netty-transport-native-unix-common": 514688630,
     "io.opencensus:opencensus-api": 2042364617,
     "io.opencensus:opencensus-contrib-grpc-metrics": 317094357,
+    "io.opentelemetry:opentelemetry-api": 605644259,
+    "io.opentelemetry:opentelemetry-exporter-otlp": 977532126,
+    "io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel": 193903949,
+    "io.opentelemetry:opentelemetry-exporter-sender-okhttp": -632979231,
+    "io.opentelemetry:opentelemetry-sdk-common": 581680921,
+    "io.opentelemetry:opentelemetry-sdk-metrics": -1612942215,
+    "io.opentelemetry:opentelemetry-sdk-testing": 372942598,
     "io.perfmark:perfmark-api": 1019157794,
     "junit:junit": -744267592,
     "org.apache.kafka:kafka-clients": -338642463,
@@ -65,7 +72,7 @@
     "com.google.api.grpc:proto-google-common-protos": 185673783,
     "com.google.api:api-common": 1706143050,
     "com.google.auth:google-auth-library-credentials": -426926107,
-    "com.google.auth:google-auth-library-oauth2-http": -114165260,
+    "com.google.auth:google-auth-library-oauth2-http": -444294950,
     "com.google.auto.value:auto-value": -1399392164,
     "com.google.auto.value:auto-value-annotations": -1206181257,
     "com.google.code.findbugs:jsr305": -1038659426,
@@ -74,13 +81,13 @@
     "com.google.guava:failureaccess": -56291903,
     "com.google.guava:guava": 1101732799,
     "com.google.guava:listenablefuture": 1588902908,
-    "com.google.http-client:google-http-client": 1494356068,
-    "com.google.http-client:google-http-client-gson": 703986017,
+    "com.google.http-client:google-http-client": 1658991610,
+    "com.google.http-client:google-http-client-gson": 240467633,
     "com.google.j2objc:j2objc-annotations": -2074422376,
     "com.google.protobuf:protobuf-java": 1679593551,
     "com.google.protobuf:protobuf-java-util": -2080941069,
     "com.google.re2j:re2j": -461460138,
-    "com.google.s2a.proto.v2:s2a-proto": 952894641,
+    "com.google.s2a.proto.v2:s2a-proto": 1587106773,
     "com.google.truth:truth": -1742796803,
     "com.squareup.okhttp:okhttp": -737509755,
     "com.squareup.okio:okio": 330712912,
@@ -91,11 +98,11 @@
     "dev.cel:protobuf": 1051071068,
     "dev.cel:runtime": -928569700,
     "dev.cel:v1alpha1": -1522283694,
-    "io.grpc:grpc-api": 744463734,
-    "io.grpc:grpc-context": 59484519,
-    "io.grpc:grpc-protobuf": -35892952,
-    "io.grpc:grpc-protobuf-lite": 1569533051,
-    "io.grpc:grpc-stub": -1172879995,
+    "io.grpc:grpc-api": 1650246748,
+    "io.grpc:grpc-context": -1599813506,
+    "io.grpc:grpc-protobuf": 319751986,
+    "io.grpc:grpc-protobuf-lite": -2032949270,
+    "io.grpc:grpc-stub": -1896051700,
     "io.netty:netty-buffer": 1937584729,
     "io.netty:netty-codec-base": -1614257132,
     "io.netty:netty-codec-compression": -1586636804,
@@ -118,9 +125,22 @@
     "io.netty:netty-transport-native-epoll:jar:linux-aarch_64": 1756290442,
     "io.netty:netty-transport-native-epoll:jar:linux-x86_64": -1252125359,
     "io.netty:netty-transport-native-unix-common": 1839882222,
-    "io.opencensus:opencensus-api": 1032836012,
-    "io.opencensus:opencensus-contrib-grpc-metrics": -1646997766,
-    "io.opencensus:opencensus-contrib-http-util": 1302997820,
+    "io.opencensus:opencensus-api": -361358057,
+    "io.opencensus:opencensus-contrib-grpc-metrics": -333028925,
+    "io.opencensus:opencensus-contrib-http-util": -1678000635,
+    "io.opentelemetry:opentelemetry-api": 812238330,
+    "io.opentelemetry:opentelemetry-common": 78263280,
+    "io.opentelemetry:opentelemetry-context": 896054515,
+    "io.opentelemetry:opentelemetry-exporter-common": -1396793872,
+    "io.opentelemetry:opentelemetry-exporter-otlp": 829839478,
+    "io.opentelemetry:opentelemetry-exporter-otlp-common": 1371189717,
+    "io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel": -501734913,
+    "io.opentelemetry:opentelemetry-sdk": 1558284825,
+    "io.opentelemetry:opentelemetry-sdk-common": 1050478578,
+    "io.opentelemetry:opentelemetry-sdk-logs": -576997537,
+    "io.opentelemetry:opentelemetry-sdk-metrics": -931108686,
+    "io.opentelemetry:opentelemetry-sdk-testing": 1505391340,
+    "io.opentelemetry:opentelemetry-sdk-trace": 647493031,
     "io.perfmark:perfmark-api": -752483303,
     "javax.annotation:javax.annotation-api": 193132517,
     "junit:junit": 712711302,
@@ -380,9 +400,9 @@
     },
     "io.grpc:grpc-api": {
       "shasums": {
-        "jar": "45faf2ac1bf2791e8fdabce53684a86b62c99b84cba26fb13a5ba3f4abf80d6c"
+        "jar": "1b81e8c74e0eff61cc032f127120d8c05d0e1a47d3fedbfe8c832e8b30a5fba2"
       },
-      "version": "1.70.0"
+      "version": "1.84.1"
     },
     "io.grpc:grpc-context": {
       "shasums": {
@@ -404,9 +424,9 @@
     },
     "io.grpc:grpc-stub": {
       "shasums": {
-        "jar": "5adaa1ec1f744b67ae14a8dbc39c9589c010fad0fd557b0a02966202e4d23a18"
+        "jar": "005473c94328005f2ea17e111e771bc47113c7ac1a33c63dd9cac78aae800014"
       },
-      "version": "1.70.0"
+      "version": "1.84.1"
     },
     "io.netty:netty-buffer": {
       "shasums": {
@@ -527,6 +547,84 @@
         "jar": "3ea995b55a4068be22989b70cc29a4d788c2d328d1d50613a7a9afd13fdd2d0a"
       },
       "version": "0.31.1"
+    },
+    "io.opentelemetry:opentelemetry-api": {
+      "shasums": {
+        "jar": "538d1dff2f9a37aecbc0ef98fd17273a3affb058e734e6763a3a07a38a5fdc59"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-common": {
+      "shasums": {
+        "jar": "da97bdb395418e16ecdcbe7ad3497f45b9e767ceda4ae7e86133e7a757ac377f"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-context": {
+      "shasums": {
+        "jar": "40fb813fb5e27ec2691daa29c81b572b5b1541ef9b41e62490c3ee3e6407c55e"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-exporter-common": {
+      "shasums": {
+        "jar": "eb61aab6d20bf105102dfa061b478b659cec17e82a50969898046456768ba09b"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-exporter-otlp": {
+      "shasums": {
+        "jar": "6724a9c8f9f42de757682c6194c48d9fee4670cd19a85c37954eba526c58b836"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-exporter-otlp-common": {
+      "shasums": {
+        "jar": "75530ab4d93e6fdef478d3e112713337625e70a63df357e6e7b9060c13788015"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel": {
+      "shasums": {
+        "jar": "7d1e37942c9cdd6a5d7b071d6f71b4b232f0c8cc6c56de3f7daee10f4869565a"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-sdk": {
+      "shasums": {
+        "jar": "52a8f599a368a3d62185e37053f6a53175d6fbe3ecc1d565baba13b1a854267f"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-sdk-common": {
+      "shasums": {
+        "jar": "628a4c00db9561ff4c608a650d5e7fd66a1e153ccdf1ba3cdc5ac0b7c6518fea"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-sdk-logs": {
+      "shasums": {
+        "jar": "dd0f0b625e08787af49d7e270abc6def4c2eabc2f18f5f145b7924024a3311e3"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-sdk-metrics": {
+      "shasums": {
+        "jar": "c157ff10da59a87a57e5236d9f3290792d9b749433be5e5b449a7d1604c320a9"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-sdk-testing": {
+      "shasums": {
+        "jar": "c3d74c825e423e7bf28f0e3f22f10bbf7fe3b00984d0d9ea6ef1327b05c274e2"
+      },
+      "version": "1.67.0"
+    },
+    "io.opentelemetry:opentelemetry-sdk-trace": {
+      "shasums": {
+        "jar": "14d9615c8a5dcf471dcbb74902b771dcfa8656b755ac38dce904042289ccd198"
+      },
+      "version": "1.67.0"
     },
     "io.perfmark:perfmark-api": {
       "shasums": {
@@ -1043,6 +1141,55 @@
       "com.google.guava:guava",
       "io.opencensus:opencensus-api"
     ],
+    "io.opentelemetry:opentelemetry-api": [
+      "io.opentelemetry:opentelemetry-context"
+    ],
+    "io.opentelemetry:opentelemetry-context": [
+      "io.opentelemetry:opentelemetry-common"
+    ],
+    "io.opentelemetry:opentelemetry-exporter-common": [
+      "io.opentelemetry:opentelemetry-api"
+    ],
+    "io.opentelemetry:opentelemetry-exporter-otlp": [
+      "io.opentelemetry:opentelemetry-exporter-otlp-common",
+      "io.opentelemetry:opentelemetry-sdk-logs",
+      "io.opentelemetry:opentelemetry-sdk-metrics",
+      "io.opentelemetry:opentelemetry-sdk-trace"
+    ],
+    "io.opentelemetry:opentelemetry-exporter-otlp-common": [
+      "io.opentelemetry:opentelemetry-exporter-common"
+    ],
+    "io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel": [
+      "io.grpc:grpc-stub",
+      "io.opentelemetry:opentelemetry-exporter-common",
+      "io.opentelemetry:opentelemetry-sdk-common"
+    ],
+    "io.opentelemetry:opentelemetry-sdk": [
+      "io.opentelemetry:opentelemetry-api",
+      "io.opentelemetry:opentelemetry-sdk-common",
+      "io.opentelemetry:opentelemetry-sdk-logs",
+      "io.opentelemetry:opentelemetry-sdk-metrics",
+      "io.opentelemetry:opentelemetry-sdk-trace"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-common": [
+      "io.opentelemetry:opentelemetry-api"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-logs": [
+      "io.opentelemetry:opentelemetry-api",
+      "io.opentelemetry:opentelemetry-sdk-common"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-metrics": [
+      "io.opentelemetry:opentelemetry-api",
+      "io.opentelemetry:opentelemetry-sdk-common"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-testing": [
+      "io.opentelemetry:opentelemetry-api",
+      "io.opentelemetry:opentelemetry-sdk"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-trace": [
+      "io.opentelemetry:opentelemetry-api",
+      "io.opentelemetry:opentelemetry-sdk-common"
+    ],
     "junit:junit": [
       "org.hamcrest:hamcrest-core"
     ],
@@ -1547,6 +1694,117 @@
     "io.opencensus:opencensus-contrib-http-util": [
       "io.opencensus.contrib.http",
       "io.opencensus.contrib.http.util"
+    ],
+    "io.opentelemetry:opentelemetry-api": [
+      "io.opentelemetry.api",
+      "io.opentelemetry.api.baggage",
+      "io.opentelemetry.api.baggage.propagation",
+      "io.opentelemetry.api.common",
+      "io.opentelemetry.api.impl",
+      "io.opentelemetry.api.internal",
+      "io.opentelemetry.api.logs",
+      "io.opentelemetry.api.metrics",
+      "io.opentelemetry.api.trace",
+      "io.opentelemetry.api.trace.propagation",
+      "io.opentelemetry.api.trace.propagation.internal"
+    ],
+    "io.opentelemetry:opentelemetry-common": [
+      "io.opentelemetry.common",
+      "io.opentelemetry.common.impl"
+    ],
+    "io.opentelemetry:opentelemetry-context": [
+      "io.opentelemetry.context",
+      "io.opentelemetry.context.internal.shaded",
+      "io.opentelemetry.context.propagation",
+      "io.opentelemetry.context.propagation.internal"
+    ],
+    "io.opentelemetry:opentelemetry-exporter-common": [
+      "io.opentelemetry.exporter.internal",
+      "io.opentelemetry.exporter.internal.grpc",
+      "io.opentelemetry.exporter.internal.marshal",
+      "io.opentelemetry.exporter.internal.metrics"
+    ],
+    "io.opentelemetry:opentelemetry-exporter-otlp": [
+      "io.opentelemetry.exporter.otlp.all.internal",
+      "io.opentelemetry.exporter.otlp.http.logs",
+      "io.opentelemetry.exporter.otlp.http.metrics",
+      "io.opentelemetry.exporter.otlp.http.trace",
+      "io.opentelemetry.exporter.otlp.internal",
+      "io.opentelemetry.exporter.otlp.logs",
+      "io.opentelemetry.exporter.otlp.metrics",
+      "io.opentelemetry.exporter.otlp.trace"
+    ],
+    "io.opentelemetry:opentelemetry-exporter-otlp-common": [
+      "io.opentelemetry.exporter.internal.otlp",
+      "io.opentelemetry.exporter.internal.otlp.logs",
+      "io.opentelemetry.exporter.internal.otlp.metrics",
+      "io.opentelemetry.exporter.internal.otlp.traces",
+      "io.opentelemetry.proto.collector.logs.v1.internal",
+      "io.opentelemetry.proto.collector.metrics.v1.internal",
+      "io.opentelemetry.proto.collector.profiles.v1development.internal",
+      "io.opentelemetry.proto.collector.trace.v1.internal",
+      "io.opentelemetry.proto.common.v1.internal",
+      "io.opentelemetry.proto.logs.v1.internal",
+      "io.opentelemetry.proto.metrics.v1.internal",
+      "io.opentelemetry.proto.profiles.v1development.internal",
+      "io.opentelemetry.proto.resource.v1.internal",
+      "io.opentelemetry.proto.trace.v1.internal"
+    ],
+    "io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel": [
+      "io.opentelemetry.exporter.sender.grpc.managedchannel.internal"
+    ],
+    "io.opentelemetry:opentelemetry-sdk": [
+      "io.opentelemetry.sdk",
+      "io.opentelemetry.sdk.internal"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-common": [
+      "io.opentelemetry.sdk.common",
+      "io.opentelemetry.sdk.common.export",
+      "io.opentelemetry.sdk.common.internal",
+      "io.opentelemetry.sdk.resources",
+      "io.opentelemetry.sdk.resources.internal"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-logs": [
+      "io.opentelemetry.sdk.logs",
+      "io.opentelemetry.sdk.logs.data",
+      "io.opentelemetry.sdk.logs.export",
+      "io.opentelemetry.sdk.logs.internal"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-metrics": [
+      "io.opentelemetry.sdk.metrics",
+      "io.opentelemetry.sdk.metrics.data",
+      "io.opentelemetry.sdk.metrics.export",
+      "io.opentelemetry.sdk.metrics.internal",
+      "io.opentelemetry.sdk.metrics.internal.aggregator",
+      "io.opentelemetry.sdk.metrics.internal.concurrent",
+      "io.opentelemetry.sdk.metrics.internal.data",
+      "io.opentelemetry.sdk.metrics.internal.debug",
+      "io.opentelemetry.sdk.metrics.internal.descriptor",
+      "io.opentelemetry.sdk.metrics.internal.exemplar",
+      "io.opentelemetry.sdk.metrics.internal.export",
+      "io.opentelemetry.sdk.metrics.internal.state",
+      "io.opentelemetry.sdk.metrics.internal.view"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-testing": [
+      "io.opentelemetry.sdk.testing.assertj",
+      "io.opentelemetry.sdk.testing.context",
+      "io.opentelemetry.sdk.testing.exporter",
+      "io.opentelemetry.sdk.testing.junit4",
+      "io.opentelemetry.sdk.testing.junit5",
+      "io.opentelemetry.sdk.testing.logs",
+      "io.opentelemetry.sdk.testing.metrics",
+      "io.opentelemetry.sdk.testing.time",
+      "io.opentelemetry.sdk.testing.trace"
+    ],
+    "io.opentelemetry:opentelemetry-sdk-trace": [
+      "io.opentelemetry.sdk.trace",
+      "io.opentelemetry.sdk.trace.data",
+      "io.opentelemetry.sdk.trace.export",
+      "io.opentelemetry.sdk.trace.internal",
+      "io.opentelemetry.sdk.trace.internal.shaded.jctools.queues",
+      "io.opentelemetry.sdk.trace.internal.shaded.jctools.queues.atomic",
+      "io.opentelemetry.sdk.trace.internal.shaded.jctools.util",
+      "io.opentelemetry.sdk.trace.samplers"
     ],
     "io.perfmark:perfmark-api": [
       "io.perfmark"
@@ -2171,6 +2429,19 @@
       "io.opencensus:opencensus-api",
       "io.opencensus:opencensus-contrib-grpc-metrics",
       "io.opencensus:opencensus-contrib-http-util",
+      "io.opentelemetry:opentelemetry-api",
+      "io.opentelemetry:opentelemetry-common",
+      "io.opentelemetry:opentelemetry-context",
+      "io.opentelemetry:opentelemetry-exporter-common",
+      "io.opentelemetry:opentelemetry-exporter-otlp",
+      "io.opentelemetry:opentelemetry-exporter-otlp-common",
+      "io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel",
+      "io.opentelemetry:opentelemetry-sdk",
+      "io.opentelemetry:opentelemetry-sdk-common",
+      "io.opentelemetry:opentelemetry-sdk-logs",
+      "io.opentelemetry:opentelemetry-sdk-metrics",
+      "io.opentelemetry:opentelemetry-sdk-testing",
+      "io.opentelemetry:opentelemetry-sdk-trace",
       "io.perfmark:perfmark-api",
       "javax.annotation:javax.annotation-api",
       "junit:junit",
@@ -2241,6 +2512,35 @@
     "io.netty:netty-common": {
       "reactor.blockhound.integration.BlockHoundIntegration": [
         "io.netty.util.internal.Hidden$NettyBlockHoundIntegration"
+      ]
+    },
+    "io.opentelemetry:opentelemetry-exporter-otlp": {
+      "io.opentelemetry.sdk.autoconfigure.spi.internal.ComponentProvider": [
+        "io.opentelemetry.exporter.otlp.internal.OtlpGrpcLogRecordExporterComponentProvider",
+        "io.opentelemetry.exporter.otlp.internal.OtlpGrpcMetricExporterComponentProvider",
+        "io.opentelemetry.exporter.otlp.internal.OtlpGrpcSpanExporterComponentProvider",
+        "io.opentelemetry.exporter.otlp.internal.OtlpHttpLogRecordExporterComponentProvider",
+        "io.opentelemetry.exporter.otlp.internal.OtlpHttpMetricExporterComponentProvider",
+        "io.opentelemetry.exporter.otlp.internal.OtlpHttpSpanExporterComponentProvider"
+      ],
+      "io.opentelemetry.sdk.autoconfigure.spi.logs.ConfigurableLogRecordExporterProvider": [
+        "io.opentelemetry.exporter.otlp.internal.OtlpLogRecordExporterProvider"
+      ],
+      "io.opentelemetry.sdk.autoconfigure.spi.metrics.ConfigurableMetricExporterProvider": [
+        "io.opentelemetry.exporter.otlp.internal.OtlpMetricExporterProvider"
+      ],
+      "io.opentelemetry.sdk.autoconfigure.spi.traces.ConfigurableSpanExporterProvider": [
+        "io.opentelemetry.exporter.otlp.internal.OtlpSpanExporterProvider"
+      ]
+    },
+    "io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel": {
+      "io.opentelemetry.sdk.common.export.GrpcSenderProvider": [
+        "io.opentelemetry.exporter.sender.grpc.managedchannel.internal.UpstreamGrpcSenderProvider"
+      ]
+    },
+    "io.opentelemetry:opentelemetry-sdk-testing": {
+      "io.opentelemetry.context.ContextStorageProvider": [
+        "io.opentelemetry.sdk.testing.context.SettableContextStorageProvider"
       ]
     },
     "org.apache.kafka:kafka-clients": {

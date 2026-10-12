@@ -114,12 +114,12 @@ class TlsTest {
     TestPki.write(dir, client, ca);
     FileCredentialSource source = source();
     source.poll();
-    assertThat(source.reloads()).isZero();
+    assertThat(source.reloads()).isEqualTo(1);
 
     TestPki.write(dir, clientNext, ca);
     source.poll();
     assertThat(subject(source.current().chain().get(0))).isEqualTo("CN=client-next");
-    assertThat(source.reloads()).isEqualTo(1);
+    assertThat(source.reloads()).isEqualTo(2);
     assertThat(source.failures()).isZero();
   }
 
@@ -138,7 +138,7 @@ class TlsTest {
     Files.writeString(dir.resolve("tls.key"), clientNext.keyPem());
     source.poll();
     assertThat(subject(source.current().chain().get(0))).isEqualTo("CN=client-next");
-    assertThat(source.reloads()).isEqualTo(1);
+    assertThat(source.reloads()).isEqualTo(2);
   }
 
   @Test

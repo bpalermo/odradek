@@ -192,6 +192,13 @@ public final class TlsSources implements Closeable {
     properties.put(ReloadingSslEngineFactory.BINDING_CONFIG, binding);
   }
 
+  /** The credential source of every cluster with {@code tls}, by cluster name. */
+  public Map<String, CredentialSource> sources() {
+    Map<String, CredentialSource> sources = new TreeMap<>();
+    bindings.forEach((cluster, binding) -> sources.put(cluster, binding.source()));
+    return sources;
+  }
+
   /**
    * Why the credentials of some cluster cannot be used at {@code now}; empty when all can. A
    * certificate expires when whatever renews it stopped doing so: the files were not replaced, or
