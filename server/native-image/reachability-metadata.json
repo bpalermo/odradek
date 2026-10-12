@@ -955,6 +955,15 @@
           "parameterTypes": []
         }
       ],
+      "type": "io.github.bpalermo.odradek.server.telemetry.KafkaMetricsReporter"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
       "type": "io.github.bpalermo.odradek.server.tls.ReloadingSslEngineFactory"
     },
     {

@@ -220,6 +220,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.consume.PartitionStateTest",
         "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
+        "io.github.bpalermo.odradek.server.telemetry.KafkaClientMetricsTest",
         "io.github.bpalermo.odradek.server.telemetry.TelemetryTest",
         "io.github.bpalermo.odradek.server.tls.TlsTest",
         "io.github.bpalermo.odradek.server.tls.WorkloadApiTest",

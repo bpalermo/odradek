@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server.produce;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.ProduceTarget;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
+import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import java.io.Closeable;
 import java.time.Duration;
@@ -37,9 +38,16 @@ public final class ClusterProducers implements Closeable {
 
   /** Creates real Kafka producers. Creating one does not connect to the cluster. */
   public static ClusterProducers create(ServerConfig config, TlsSources tls) {
+    return create(config, tls, ServerMetrics.noop());
+  }
+
+  /** As above, with the producers' own metrics exported through {@code metrics}. */
+  public static ClusterProducers create(
+      ServerConfig config, TlsSources tls, ServerMetrics metrics) {
     return create(
         config,
         tls,
+        metrics,
         (cluster, properties) ->
             new KafkaProducer<>(properties, new ByteArraySerializer(), new ByteArraySerializer()));
   }
@@ -54,6 +62,12 @@ public final class ClusterProducers implements Closeable {
    * {@code tls} gets the credentials {@code tls} holds for it.
    */
   public static ClusterProducers create(ServerConfig config, TlsSources tls, Factory factory) {
+    return create(config, tls, ServerMetrics.noop(), factory);
+  }
+
+  /** As above, with the producers' own metrics exported through {@code metrics}. */
+  public static ClusterProducers create(
+      ServerConfig config, TlsSources tls, ServerMetrics metrics, Factory factory) {
     TreeSet<String> used = new TreeSet<>();
     config
         .getProducersMap()
@@ -66,6 +80,7 @@ public final class ClusterProducers implements Closeable {
         Cluster cluster = config.getClustersOrThrow(name);
         Map<String, Object> properties = properties(name, cluster);
         tls.apply(name, properties);
+        metrics.kafkaClients().applyToProducer(name, properties);
         producers.put(name, factory.create(name, properties));
       }
     } catch (RuntimeException e) {

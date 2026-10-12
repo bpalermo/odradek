@@ -13,7 +13,8 @@ import java.time.Clock;
 import java.util.Map;
 
 /**
- * Every metric the server reports, in one place.
+ * Every metric the server reports, in one place; the Kafka clients' own are listed in {@link
+ * KafkaClientMetrics}.
  *
  * <p>Names and attributes are the contract with dashboards and alerts: a change here is a breaking
  * change for whoever reads them. All names start with {@code odradek.}.
@@ -40,9 +41,15 @@ public final class ServerMetrics {
   private final LongUpDownCounter consumeStreams;
   private final LongCounter consumeRebalances;
   private final LongCounter consumeStreamEnds;
+  private final KafkaClientMetrics kafkaClients;
 
   public ServerMetrics(Meter meter) {
+    this(meter, true);
+  }
+
+  private ServerMetrics(Meter meter, boolean exported) {
     this.meter = meter;
+    kafkaClients = new KafkaClientMetrics(meter, exported);
     produceRecords =
         meter
             .counterBuilder("odradek.produce.records")
@@ -100,7 +107,15 @@ public final class ServerMetrics {
 
   /** Metrics that go nowhere, for a server without telemetry and for tests. */
   public static ServerMetrics noop() {
-    return new ServerMetrics(OpenTelemetry.noop().getMeter("odradek"));
+    return new ServerMetrics(OpenTelemetry.noop().getMeter("odradek"), false);
+  }
+
+  /**
+   * The Kafka clients' own metrics. Every client the server creates is passed through it; when
+   * nothing is exported it leaves the client's properties alone.
+   */
+  public KafkaClientMetrics kafkaClients() {
+    return kafkaClients;
   }
 
   /** A record was answered to the app; {@code errorCode} is null when it was written. */

@@ -101,7 +101,37 @@ Metrics are pushed over OTLP/gRPC to the collector named by `telemetry.endpoint`
 | `odradek.tls.credential.reload.failures` | counter | `cluster` | Times new credentials were rejected or could not be fetched |
 | `odradek.ready` | gauge | | 1 when the health service answers `SERVING`, 0 otherwise |
 
-Not built yet: the Kafka clients' own metrics (lag, request latency, batch sizes), latency histograms, and configuration reload metrics.
+The Kafka clients' own metrics are exported too, from an allow-list: Kafka has hundreds, and the per-node and per-topic ones multiply. Each is read from the client on every collection, so its value and its window are Kafka's (an `avg` or a `max` covers Kafka's sample window, 30 s by default, and is absent while there are no samples).
+
+| Metric | Kind | Attributes | Kafka metric |
+|---|---|---|---|
+| `odradek.kafka.consumer.records.lag` | gauge, records | `cluster`, `group`, `topic`, `partition` | `records-lag`: records between the partition's end and the consumer's position, as of its last fetch |
+| `odradek.kafka.consumer.records.lag.max` | gauge, records | `cluster`, `group` | `records-lag-max` |
+| `odradek.kafka.consumer.commit.latency.avg`, `.max` | gauge, ms | `cluster`, `group` | `commit-latency-avg`, `commit-latency-max` |
+| `odradek.kafka.consumer.commits` | counter | `cluster`, `group` | `commit-total` |
+| `odradek.kafka.consumer.last_poll.age` | gauge, s | `cluster`, `group` | `last-poll-seconds-ago` |
+| `odradek.kafka.consumer.rebalances` | counter | `cluster`, `group` | `rebalance-total` |
+| `odradek.kafka.consumer.rebalance.failures` | counter | `cluster`, `group` | `failed-rebalance-total` |
+| `odradek.kafka.consumer.rebalance.latency.avg`, `.max` | gauge, ms | `cluster`, `group` | `rebalance-latency-avg`, `rebalance-latency-max` |
+| `odradek.kafka.consumer.assigned_partitions` | gauge | `cluster`, `group` | `assigned-partitions` |
+| `odradek.kafka.consumer.connections` | gauge | `cluster`, `group` | `connection-count` |
+| `odradek.kafka.consumer.authentication.failures` | counter | `cluster`, `group` | `failed-authentication-total`, a failed TLS handshake included |
+| `odradek.kafka.producer.request.latency.avg`, `.max` | gauge, ms | `cluster` | `request-latency-avg`, `request-latency-max` |
+| `odradek.kafka.producer.record.error.rate` | gauge, records/s | `cluster` | `record-error-rate` |
+| `odradek.kafka.producer.record.errors` | counter | `cluster` | `record-error-total` |
+| `odradek.kafka.producer.record.retries` | counter | `cluster` | `record-retry-total` |
+| `odradek.kafka.producer.buffer.available` | gauge, bytes | `cluster` | `buffer-available-bytes`. At zero, sends block |
+| `odradek.kafka.producer.record.queue_time.avg`, `.max` | gauge, ms | `cluster` | `record-queue-time-avg`, `record-queue-time-max` |
+| `odradek.kafka.producer.batch.size.avg`, `.max` | gauge, bytes | `cluster` | `batch-size-avg`, `batch-size-max` |
+| `odradek.kafka.producer.connections` | gauge | `cluster` | `connection-count` |
+| `odradek.kafka.producer.authentication.failures` | counter | `cluster` | `failed-authentication-total` |
+
+- The client id is not an attribute: a consumer's changes with every stream. The consumers of one group on one cluster are therefore one series. A counter, `assigned_partitions`, `connections` and `buffer.available` are their sum; every other gauge is the largest among them (the worst consumer).
+- A consumer's gauges stop being reported when its stream ends, and a partition's lag when the partition is revoked. A counter keeps what closed consumers counted, so it only goes up while the server runs.
+- Lag is what the consumer saw at its last fetch. A group with no open stream reports none: lag of a group nobody consumes is the broker's to report.
+- The metrics reach the SDK through a Kafka `MetricsReporter` that the server adds to `metric.reporters`, after any reporter the cluster's properties name (Kafka's JMX reporter when they name none). Without `telemetry.endpoint` the reporter is not installed.
+
+Not built yet: latency histograms, and configuration reload metrics.
 
 ## 3. API
 

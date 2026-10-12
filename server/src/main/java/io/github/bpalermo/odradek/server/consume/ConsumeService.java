@@ -262,6 +262,7 @@ public final class ConsumeService {
                 streamCounter.incrementAndGet(),
                 maxProcessingMs + revokeDeadlineMs + POLL_INTERVAL_MARGIN_MS);
         tls.apply(clusterName, properties);
+        metrics.kafkaClients().applyToConsumer(clusterName, first.getGroupId(), topics, properties);
         consumer = factory.create(clusterName, properties);
       } catch (RuntimeException e) {
         decoders.values().forEach(RecordDecoder::close);
