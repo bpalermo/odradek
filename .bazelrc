@@ -68,6 +68,10 @@ build:ci --color=yes
 common:ci --noshow_progress
 common:ci --noshow_loading_progress
 test:ci --test_output=errors
+# The end-to-end suites print the server's log, which is well over Bazel's 1 MB
+# limit for output it shows. Past the limit Bazel shows none of it, and a failed
+# test in CI has no visible cause.
+common:ci --experimental_ui_max_stdouterr_bytes=33554432
 
 # LLM-friendly output (usage: --config=llm)
 common:llm --color=no
