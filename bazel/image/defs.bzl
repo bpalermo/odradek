@@ -122,3 +122,97 @@ def java_image(
         tag = load_tag or (repository + ":" + default_tag),
         visibility = visibility,
     )
+
+def executable_image(
+        name,
+        binary,
+        registry,
+        repository,
+        base,
+        tag_flag,
+        path = "/app/server",
+        suffix = "-native",
+        labels = {},
+        load_tag = None,
+        visibility = ["//visibility:public"]):
+    """Builds a single-architecture image around one native executable.
+
+    A native executable cannot be cross-compiled (GraalVM compiles for the
+    machine it runs on), so unlike `java_image` this does not build an index
+    for several platforms: the image is for the architecture of the machine
+    running Bazel. Each architecture is built and pushed on a machine of that
+    architecture, and the multi-arch index is assembled from the pushed
+    manifests (.github/workflows/publish.yml).
+
+    Defines, for `name = "image_native"`:
+
+      //pkg:image_native_layer     the executable, one layer
+      //pkg:image_native_manifest  the image of this machine's architecture
+      //pkg:image_native_push      pushes it under one tag naming commit and
+                                   architecture (`<tag>-<commit>-native-amd64`)
+      //pkg:image_native_load      loads it into the local daemon as `load_tag`
+
+    Args:
+      name: prefix for the generated targets.
+      binary: label of the native executable.
+      registry: registry host: IMAGE_REGISTRY of //bazel:registry.bzl.
+      repository: repository path within the registry.
+      base: base image (a digest-pinned image with glibc).
+      tag_flag: the string_flag holding the mutable tag, shared with the
+        image this one is a variant of.
+      path: absolute path of the executable inside the image.
+      suffix: marks the variant in every tag.
+      labels: OCI labels; constant values only, as for `java_image`.
+      load_tag: the name the image gets in a local daemon.
+      visibility: visibility of the manifest, push and load targets.
+    """
+
+    # The executable is built by a native-image run, which `bazel build //...`
+    # should not start: every target here is named explicitly by CI.
+    manual = ["manual"]
+
+    image_layer(
+        name = name + "_layer",
+        srcs = {path: binary},
+        compress = "zstd",
+        default_metadata = file_metadata(mode = "0755"),
+        include_runfiles = False,
+        tags = manual,
+    )
+
+    image_manifest(
+        name = name + "_manifest",
+        base = base,
+        entrypoint = [path],
+        labels = labels,
+        layers = [name + "_layer"],
+        tags = manual,
+        visibility = visibility,
+    )
+
+    # One tag, immutable because it names the commit. STABLE_, as for the JVM
+    # image. The architecture is the machine's; select() on the CPU keeps it
+    # out of the macro's arguments.
+    tag = "{{.tag}}{{if .STABLE_GIT_COMMIT}}-{{.STABLE_GIT_COMMIT}}{{end}}" + suffix
+    image_push(
+        name = name + "_push",
+        build_settings = {"tag": tag_flag},
+        image = name + "_manifest",
+        registry = registry,
+        repository = repository,
+        stamp = "force",
+        tag_list = select({
+            "@platforms//cpu:aarch64": [tag + "-arm64"],
+            "//conditions:default": [tag + "-amd64"],
+        }),
+        tags = manual,
+        visibility = visibility,
+    )
+
+    image_load(
+        name = name + "_load",
+        image = name + "_manifest",
+        tag = load_tag or (repository + ":native"),
+        tags = manual,
+        visibility = visibility,
+    )

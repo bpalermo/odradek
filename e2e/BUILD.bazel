@@ -12,6 +12,9 @@ package(default_visibility = ["//visibility:private"])
 # Tags: `e2e` selects (and excludes) them; `external` and `requires-network`
 # say they talk to something outside the build, so Bazel never caches the result
 # or sandboxes the network away.
+#
+# `e2e_native_binary_test` is tagged manual as well, because it builds the native
+# image: name it, `bazel test //e2e:e2e_native_binary_test --config=e2e`.
 _DEPS = [
     "//api/odradek/config/v1:config_java_proto",
     "//api/odradek/kafka/v1:odradek_java_grpc",
@@ -46,6 +49,7 @@ java_junit_test(
     test_classes = [
         "io.github.bpalermo.odradek.e2e.BrokerSmokeTest",
         "io.github.bpalermo.odradek.e2e.ClientE2eTest",
+        "io.github.bpalermo.odradek.e2e.CompressionE2eTest",
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
     ],
@@ -68,6 +72,33 @@ java_junit_test(
     tags = _TAGS,
     test_classes = [
         "io.github.bpalermo.odradek.e2e.ClientE2eTest",
+        "io.github.bpalermo.odradek.e2e.CompressionE2eTest",
+        "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
+        "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
+    ],
+    runtime_deps = [
+        "//server:netty_epoll_native",
+        "@maven//:ch_qos_logback_logback_classic",
+    ],
+    deps = _DEPS,
+)
+
+# The same again against the native image of the server (ADR 5), compiled
+# ahead of time by GraalVM. A test that passes on the JVM and fails here is a
+# failure of the native image.
+java_junit_test(
+    name = "e2e_native_binary_test",
+    size = "large",
+    srcs = glob(["src/test/java/**/*.java"]),
+    data = ["//server:server_native"],
+    env = {"ODRADEK_E2E_SERVER": "$(rootpath //server:server_native)"},
+    javacopts = JAVACOPTS,
+    # server_native is built by CI's `native` job, not by //...
+    tags = _TAGS + ["manual"],
+    target_compatible_with = ["@platforms//os:linux"],
+    test_classes = [
+        "io.github.bpalermo.odradek.e2e.ClientE2eTest",
+        "io.github.bpalermo.odradek.e2e.CompressionE2eTest",
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
     ],

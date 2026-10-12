@@ -1,6 +1,8 @@
 load("@rules_java//java:defs.bzl", "java_binary", "java_library")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel:registry.bzl", "IMAGE_REGISTRY", "image_repository")
-load("//bazel/image:defs.bzl", "java_image")
+load("//bazel/graalvm:defs.bzl", "native_image")
+load("//bazel/image:defs.bzl", "executable_image", "java_image")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
 load("//bazel/java:junit.bzl", "java_junit_test")
 
@@ -49,16 +51,82 @@ java_library(
     }),
 )
 
+# What the server runs with, beyond the code it is compiled against.
+SERVER_RUNTIME_DEPS = [
+    ":netty_epoll_native",
+    ":server_lib",
+    "@maven//:ch_qos_logback_logback_classic",
+]
+
 java_binary(
     name = "server",
     jvm_flags = JVM_FLAGS,
     main_class = "io.github.bpalermo.odradek.server.Main",
     visibility = ["//visibility:public"],
-    runtime_deps = [
-        ":netty_epoll_native",
-        ":server_lib",
-        "@maven//:ch_qos_logback_logback_classic",
+    runtime_deps = SERVER_RUNTIME_DEPS,
+)
+
+# The same class path as a library: a java_binary's JavaInfo carries no runtime
+# jars, and the native image is compiled from the jars, not the launcher.
+java_library(
+    name = "server_runtime",
+    visibility = ["//visibility:public"],
+    runtime_deps = SERVER_RUNTIME_DEPS,
+)
+
+# Reflection, resource and JNI metadata of the native image. Exported so that an
+# image with extra codec classes can add its own metadata next to it.
+filegroup(
+    name = "native_metadata",
+    srcs = glob(["native-image/*.json"]),
+    visibility = ["//visibility:public"],
+)
+
+# The same jars as :server, compiled ahead of time (ADR 5). Linux only, and for
+# the architecture of the machine building it: GraalVM does not cross-compile.
+native_image(
+    name = "server_native",
+    binary = ":server_runtime",
+    flags = [
+        # Logback is configured while the image is built (netty, initialized at
+        # build time, creates its loggers then): logback.xml is read here, not
+        # at start.
+        "--initialize-at-build-time=ch.qos.logback,org.slf4j",
+        # zlib linked in, libc not: runs on a base that has glibc and nothing
+        # else, and netty's epoll library can still be loaded.
+        "--static-nolibc",
     ],
+    main_class = "io.github.bpalermo.odradek.server.Main",
+    metadata = [":native_metadata"],
+    # Not part of //...: building it needs gcc and zlib, and a minute of 4 GB.
+    # CI's `native` job builds and tests it by name.
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+)
+
+# A serializer in a jar of its own, as an extension directory would hold it.
+java_library(
+    name = "native_fixture",
+    srcs = glob(["src/native_fixture/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    deps = ["@maven//:org_apache_kafka_kafka_clients"],
+)
+
+# What the native image does with configurations, without a broker: starts and
+# stops, accepts Kafka's own codecs, rejects what it cannot load.
+sh_test(
+    name = "native_config_test",
+    size = "small",
+    srcs = ["native_config_test.sh"],
+    args = ["$(rootpath :server_native)"],
+    data = [
+        ":native_fixture",
+        ":server_native",
+    ],
+    env = {"EXTENSION_JAR": "$(rootpath :native_fixture)"},
+    tags = ["manual"],
+    target_compatible_with = ["@platforms//os:linux"],
 )
 
 java_image(
@@ -72,14 +140,26 @@ java_image(
     repository = image_repository("odradek"),
 )
 
+# The native variant of the image (ADR 5): one architecture per machine.
+executable_image(
+    name = "image_native",
+    base = "@distroless_base_nossl",
+    binary = ":server_native",
+    load_tag = "localhost/odradek:e2e-native",
+    registry = IMAGE_REGISTRY,
+    repository = image_repository("odradek"),
+    tag_flag = ":image_tag",
+)
+
 java_junit_test(
     name = "main_test",
     size = "small",
     srcs = glob(["src/test/java/**/*.java"]),
-    data = glob(["testdata/**"]),
+    data = glob(["testdata/**"]) + glob(["native-image/*.json"]),
     javacopts = JAVACOPTS,
     test_classes = [
         "io.github.bpalermo.odradek.server.MainTest",
+        "io.github.bpalermo.odradek.server.NativeMetadataTest",
         "io.github.bpalermo.odradek.server.OdradekServerTest",
         "io.github.bpalermo.odradek.server.codec.CodecRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ContractRegistryTest",
