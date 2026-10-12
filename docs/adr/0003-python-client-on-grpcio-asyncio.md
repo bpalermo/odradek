@@ -1,4 +1,4 @@
-# 4. Build the Python client on grpcio with asyncio
+# 3. Build the Python client on grpcio with asyncio
 
 ## Status
 
@@ -6,7 +6,7 @@ Proposed
 
 ## Context
 
-We want a client for Python applications. Python cannot use the Java protocol core from [ADR 2](0002-shared-client-protocol-core.md), so the protocol logic has to be written again.
+We want a client for Python applications. Python cannot use the Java protocol core from [ADR 1](0001-shared-client-protocol-core.md), so the protocol logic has to be written again.
 
 The API is two long-lived bidirectional streams with messages arriving at any time: produce results, record batches, revocations with a deadline. Python's gRPC library, `grpcio`, supports Unix domain sockets and offers a blocking API and an asyncio API. Bidirectional streams with unsolicited inbound messages fit asyncio naturally; with the blocking API they need a thread per stream and hand-written coordination.
 
@@ -16,7 +16,7 @@ Many Python services are still synchronous, and many run under prefork servers s
 
 We will build the Python client on `grpcio` and asyncio.
 
-- The protocol logic is a Python port of the core, with the same event and action model and no I/O. It must pass the conformance scenarios from ADR 2.
+- The protocol logic is a Python port of the core, with the same event and action model and no I/O. It must pass the conformance scenarios from ADR 1.
 - The first public API is asynchronous. A blocking wrapper, which runs the asynchronous client on a background event loop, follows once the asynchronous API is stable.
 - Applications pass protobuf message objects for keys and values. The client serializes them as the topic's contract type.
 - The client detects that it is being used in a process other than the one that created it and fails with a clear error. It is created after forking, never before.

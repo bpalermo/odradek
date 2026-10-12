@@ -1,4 +1,4 @@
-# 2. Share one client protocol core, checked by conformance scenarios
+# 1. Share one client protocol core, checked by conformance scenarios
 
 ## Status
 
@@ -20,8 +20,8 @@ Java and Clojure share the JVM. Python shares nothing with them at run time.
 We will write the client protocol once, as a core with no I/O, and bind it to a transport in each client.
 
 - The core is a plain Java library. It consumes events (an application call, a message received, a stream broken, a timer fired) and returns actions (send this message, complete this result, fail these sends). It does not depend on gRPC, threads or clocks.
-- The Java client binds the core to grpc-java. The Clojure client binds the same core to clj-grpc ([ADR 3](0003-clojure-client-on-clj-grpc.md)).
-- The Python client is a port of the core ([ADR 4](0004-python-client-on-grpcio-asyncio.md)).
+- The Java client binds the core to grpc-java. The Clojure client binds the same core to clj-grpc ([ADR 2](0002-clojure-client-on-clj-grpc.md)).
+- The Python client is a port of the core ([ADR 3](0003-python-client-on-grpcio-asyncio.md)).
 - We will describe the expected behaviour as conformance scenarios: language-neutral files, each a sequence of events with the actions expected in response. Every implementation of the core must pass all of them.
 - Each client also runs the same end-to-end test list against real brokers.
 - Both stream handshakes will carry the client's language and version, so the server can report them in metrics and logs.
