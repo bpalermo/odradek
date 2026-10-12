@@ -44,6 +44,39 @@ bazel_dep(name = "aspect_rules_lint", version = "2.9.1")
 bazel_dep(name = "buildifier_prebuilt", version = "10.1.0")
 bazel_dep(name = "rules_buf", version = "0.5.4")
 
+# --- Clojure client (//client/clojure, ADR 2) -------------------------------------
+# rules_clj builds and tests it; protoc-gen-clojure generates the API namespace
+# from the proto in the build (its toolchain fetches a prebuilt native plugin).
+bazel_dep(name = "rules_clj", version = "0.2.5")
+bazel_dep(name = "protoc_gen_clojure", version = "0.7.0")
+
+protoc_gen_clojure = use_extension("@protoc_gen_clojure//clojure:extensions.bzl", "toolchains")
+use_repo(protoc_gen_clojure, "protoc_gen_clojure_toolchains")
+
+register_toolchains("@protoc_gen_clojure_toolchains//:all")
+
+# The Clojure libraries, from //client/clojure:deps.edn through its committed
+# lockfile. The lock holds ONLY Clojure source jars (clj-grpc, clj-protobuf):
+# gRPC, Netty, protobuf-java and Clojure itself are excluded there and come from
+# this module's own pinned targets (@grpc-java, @maven, @protobuf, the rules_clj
+# toolchain), so a class path never holds two copies. //client/clojure:classpath_test
+# enforces that. Regenerate with `bazel run //client/clojure:lock`.
+clj_deps = use_extension("@rules_clj//clojure:extensions.bzl", "deps")
+clj_deps.install(
+    name = "clj_deps",
+    lock = "//client/clojure:deps.lock.json",
+)
+
+# The lock tool's own dependencies (tools.deps), from the lockfile rules_clj ships
+# for them. rules_clj declares this repository as a dev dependency, so it does not
+# exist for a consumer and `bazel run @rules_clj//tools/lock` cannot be analysed
+# from here; //client/clojure:lock builds the same program on this copy.
+clj_deps.install(
+    name = "clj_lock_deps",
+    lock = "@rules_clj//tools/lock:deps.lock.json",
+)
+use_repo(clj_deps, "clj_deps", "clj_lock_deps")
+
 # Java proto codegen skips buf/validate/validate.proto; protovalidate-java supplies it.
 register_toolchains("//bazel/java:proto_toolchain_toolchain")
 

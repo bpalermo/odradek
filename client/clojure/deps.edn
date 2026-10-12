@@ -1,0 +1,68 @@
+;; The Clojure client's dependencies, read twice.
+;;
+;; 1. The top-level :deps are what an application gets from Clojars: the pom of
+;;    com.github.bpalermo/odradek-clj is these entries, verbatim
+;;    (//client/clojure:clojars). clj-grpc names gRPC 1.83.1 and protobuf-java
+;;    4.36.1 in its own pom; the pins below move both to the versions this
+;;    repository builds and tests against (MODULE.bazel: grpc-java 1.84.0,
+;;    protobuf 36.2). A top-level entry beats a transitive one in tools.deps and
+;;    in Maven alike. Netty needs no entry: clj-grpc already pins 4.2.16.Final,
+;;    the version gRPC 1.84.0 is built for.
+;;
+;; 2. The :bazel alias is what the Bazel build takes from here, through
+;;    deps.lock.json: the two Clojure libraries and nothing else. Every JVM
+;;    library they name is excluded, because the build already has exactly one
+;;    copy of each from MODULE.bazel (@grpc-java and @protobuf built from source,
+;;    @maven for Netty, the rules_clj toolchain for Clojure). Without the
+;;    exclusions a class path would hold gRPC and protobuf-java twice, at two
+;;    versions.
+;;
+;; //client/clojure:classpath_test fails when the two readings disagree, when a
+;; pin here is not the version on the class path, or when a class path holds a
+;; second copy of anything. After editing: `bazel run //client/clojure:lock`.
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.1"}
+        com.github.bpalermo/clj-grpc {:mvn/version "0.1.12"}
+        com.github.bpalermo/clj-protobuf {:mvn/version "0.4.0"}
+
+        com.google.protobuf/protobuf-java {:mvn/version "4.36.2"}
+        com.google.protobuf/protobuf-java-util {:mvn/version "4.36.2"}
+
+        io.grpc/grpc-api {:mvn/version "1.84.0"}
+        io.grpc/grpc-core {:mvn/version "1.84.0"}
+        io.grpc/grpc-netty {:mvn/version "1.84.0"}
+        io.grpc/grpc-protobuf {:mvn/version "1.84.0"}
+        io.grpc/grpc-services {:mvn/version "1.84.0"}
+        io.grpc/grpc-stub {:mvn/version "1.84.0"}}
+ :aliases
+ {:bazel
+  {:replace-deps
+   {com.github.bpalermo/clj-grpc
+    {:mvn/version "0.1.12"
+     :exclusions [org.clojure/clojure
+                  com.github.bpalermo/clj-protobuf
+                  com.google.protobuf/protobuf-java-util
+                  io.grpc/grpc-api
+                  io.grpc/grpc-core
+                  io.grpc/grpc-netty
+                  io.grpc/grpc-protobuf
+                  io.grpc/grpc-services
+                  io.grpc/grpc-stub
+                  io.netty/netty-buffer
+                  io.netty/netty-codec
+                  io.netty/netty-codec-base
+                  io.netty/netty-codec-http
+                  io.netty/netty-codec-http2
+                  io.netty/netty-codec-socks
+                  io.netty/netty-common
+                  io.netty/netty-handler
+                  io.netty/netty-handler-proxy
+                  io.netty/netty-resolver
+                  io.netty/netty-transport
+                  io.netty/netty-transport-native-unix-common
+                  io.netty/netty-transport-native-epoll$linux-x86_64
+                  io.netty/netty-transport-native-epoll$linux-aarch_64]}
+    com.github.bpalermo/clj-protobuf
+    {:mvn/version "0.4.0"
+     :exclusions [org.clojure/clojure
+                  com.google.protobuf/protobuf-java]}}}}}

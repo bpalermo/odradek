@@ -10,6 +10,7 @@ odradek moves the Kafka client out of the application. Its server is a Java proc
 | `server/` | The server `java_binary` (`src/main/java`, `src/test/java`) and its GraalVM native image (`native-image/` holds the reachability metadata) |
 | `client/core/` | The client protocol without I/O, shared by the JVM clients (ADR 1) |
 | `client/java/` | Java client library for applications |
+| `client/clojure/` | Clojure client library for applications (`odradek.client`): the same core on clj-grpc and clj-protobuf, built with rules_clj (ADR 2) |
 | `conformance/` | Scenarios every client core must pass |
 | `extension/java/` | Interfaces for extension jars: `RecordTransform`, the byte-to-byte codec step (encryption and similar) |
 | `bazel/` | Shared build code: formatter, linters, JUnit 6 macro, gRPC codegen shims |
@@ -30,6 +31,9 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 | Check formatting | `bazel run //:format.check` (`make format-check`) |
 | Lint | `bazel build --config=lint //...` (`make lint`); `--config=ci` makes violations fail |
 | Re-pin Maven dependencies | `REPIN=1 bazel run @maven//:pin` (`make repin`) after editing `maven.install` in `MODULE.bazel` |
+| Re-lock the Clojure dependencies | `bazel run //client/clojure:lock -- --aliases=bazel --deps-edn=$PWD/client/clojure/deps.edn --output=$PWD/client/clojure/deps.lock.json` after editing `client/clojure/deps.edn`; gRPC, Netty and protobuf-java are not in that lock, they come from `MODULE.bazel` |
+| Test the Clojure client | `bazel test //client/clojure/...` (unit tests, a stand-in server, and the check that the class path holds one copy of each library); its end-to-end suite is `//e2e:clojure_client_e2e_test`, part of the end-to-end tests below |
+| Build the Clojure client's Clojars jar and pom | `bazel build //client/clojure:clojars` (`com.github.bpalermo/odradek-clj`); `bazel run //client/clojure:clojars.publish -- --dry-run` prints the uploads without sending |
 | Tidy the module graph | `bazel mod tidy` (`make tidy`) |
 | Proto breaking changes | checked by `//api:breaking_test` inside `bazel test //...` against `api/baseline.binpb`; accept a deliberate break or cut a release baseline with `bazel run //api:update_baseline` (`make baseline`) and commit the file |
 | Build the image (linux/amd64 + linux/arm64) | `bazel build //server:image_index` (`make image`) |

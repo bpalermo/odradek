@@ -1,0 +1,229 @@
+load("@protoc_gen_clojure//clojure:defs.bzl", "clojure_proto_library")
+load("@rules_clj//clojure:defs.bzl", "clj_binary", "clj_library", "clj_maven_export", "clj_test")
+load("@rules_java//java:defs.bzl", "java_library")
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files([
+    "deps.edn",
+    "deps.lock.json",
+])
+
+# --- One class path --------------------------------------------------------------
+# The JVM libraries the Clojure libraries need, from this module's own pins.
+# @clj_deps holds clj-grpc and clj-protobuf only (see deps.edn): what their poms
+# would have brought is named here instead, so there is one gRPC, one Netty and
+# one protobuf-java, the ones the server and the Java client use.
+java_library(
+    name = "jvm_deps",
+    exports = [
+        "@grpc-java//api",
+        "@grpc-java//netty",
+        "@grpc-java//protobuf",
+        "@grpc-java//stub",
+        "@maven//:io_netty_netty_transport",
+        "@maven//:io_netty_netty_transport_classes_epoll",
+        "@maven//:io_netty_netty_transport_native_unix_common",
+        "@protobuf//java/core",
+    ] + select({
+        # Netty's epoll transport (needed for AF_UNIX) ships its native code in a
+        # per-architecture classifier jar.
+        "@platforms//cpu:aarch64": ["@maven//:io_netty_netty_transport_native_epoll_linux_aarch_64"],
+        "//conditions:default": ["@maven//:io_netty_netty_transport_native_epoll_linux_x86_64"],
+    }),
+)
+
+# --- The API as Clojure ------------------------------------------------------------
+# Generated in the build by protoc-gen-clojure, never checked in. The copy puts
+# the file under src/, next to the hand-written namespaces, so the library and the
+# Clojars jar strip one prefix.
+clojure_proto_library(
+    name = "odradek_clj_proto",
+    outs = ["odradek/kafka/v1/odradek.clj"],
+    proto = "//api/odradek/kafka/v1:odradek_proto",
+)
+
+# The API has a message named Error. protoc-gen-clojure 0.7.0 emits
+# `(defrecord Error ...)` for it, which does not load: every namespace already maps
+# Error to java.lang.Error. Until the plugin handles such names, the one line
+# that frees the name is added here, and the build fails if the place for it is
+# no longer found.
+genrule(
+    name = "odradek_clj_proto_src",
+    srcs = ["odradek/kafka/v1/odradek.clj"],
+    outs = ["src/odradek/kafka/v1/odradek.clj"],
+    cmd = """
+awk '/^\\(defrecord Error \\[/ { print "(ns-unmap *ns* (quote Error))" } { print }' $< > $@
+grep -q '^(ns-unmap \\*ns\\* (quote Error))$$' $@
+""",
+)
+
+clj_library(
+    name = "api",
+    srcs = [":odradek_clj_proto_src"],
+    namespaces = ["odradek.kafka.v1.odradek"],
+    strip_prefix = "client/clojure/src",
+    deps = [
+        ":jvm_deps",
+        # With protoc's Java classes on the class path the generated namespace
+        # uses them as its message type, which is what lets a message go from
+        # clj-grpc to the Java core and back without a copy.
+        "//api/odradek/kafka/v1:odradek_java_proto",
+        "@clj_deps//:com_github_bpalermo_clj_grpc",
+        "@clj_deps//:com_github_bpalermo_clj_protobuf",
+    ],
+)
+
+# --- The client --------------------------------------------------------------------
+# odradek.client is the public namespace. The protocol is the Java core
+# (//client/core, ADR 1), bound here to clj-grpc.
+_SRCS = [
+    "src/odradek/client.clj",
+    "src/odradek/client/consumer.clj",
+    "src/odradek/client/producer.clj",
+    "src/odradek/client/records.clj",
+    "src/odradek/client/stream.clj",
+]
+
+_RESOURCES = ["src/odradek/client/version.edn"]
+
+clj_library(
+    name = "client",
+    srcs = _SRCS,
+    namespaces = [
+        "odradek.client.stream",
+        "odradek.client.records",
+        "odradek.client.producer",
+        "odradek.client.consumer",
+        "odradek.client",
+    ],
+    resources = _RESOURCES,
+    strip_prefix = "client/clojure/src",
+    visibility = ["//e2e:__pkg__"],
+    deps = [
+        ":api",
+        ":jvm_deps",
+        "//api/odradek/client/v1:core_java_proto",
+        "//api/odradek/kafka/v1:odradek_java_proto",
+        "//client/core",
+        "@clj_deps//:com_github_bpalermo_clj_grpc",
+        "@clj_deps//:com_github_bpalermo_clj_protobuf",
+    ],
+)
+
+# --- Clojars -----------------------------------------------------------------------
+# com.github.bpalermo/odradek-clj: a source jar (the hand-written namespaces and
+# the generated API namespace) and a pom whose dependencies are the top-level
+# :deps of deps.edn.
+#
+#   bazel build //client/clojure:clojars                      the jar and the pom
+#   bazel run //client/clojure:clojars.publish -- --dry-run   every upload, nothing sent
+#
+# NOT YET USABLE FROM CLOJARS: the client needs the Java protocol core
+# (//client/core) and protoc's Java classes of the API on the class path, and
+# neither is published to a Maven repository yet (docs/adr/0004). When they are,
+# their coordinates go into deps.edn and the pom follows.
+clj_maven_export(
+    name = "clojars",
+    srcs = _SRCS + [":odradek_clj_proto_src"],
+    artifact_id = "odradek-clj",
+    deps_edn = "deps.edn",
+    description = "Clojure client of Odradek, the server that owns an application's Kafka clients: data in, data out, on clj-grpc and clj-protobuf.",
+    group_id = "com.github.bpalermo",
+    license = (
+        "Apache-2.0",
+        "https://www.apache.org/licenses/LICENSE-2.0",
+    ),
+    resources = _RESOURCES,
+    scm_url = "https://github.com/bpalermo/odradek",
+    strip_prefix = "client/clojure/src",
+    url = "https://github.com/bpalermo/odradek",
+    version_file = "src/odradek/client/version.edn",
+)
+
+# --- Tests -------------------------------------------------------------------------
+clj_library(
+    name = "classpath_test_lib",
+    testonly = True,
+    srcs = ["test/odradek/client/classpath_test.clj"],
+    namespaces = ["odradek.client.classpath-test"],
+    strip_prefix = "client/clojure/test",
+    deps = [":client"],
+)
+
+# The class path an application of the client gets, checked for second copies
+# and for the pinned versions.
+clj_test(
+    name = "classpath_test",
+    size = "small",
+    data = [
+        "deps.edn",
+        "deps.lock.json",
+    ],
+    ns = "odradek.client.classpath-test",
+    deps = [":classpath_test_lib"],
+)
+
+clj_library(
+    name = "records_test_lib",
+    testonly = True,
+    srcs = ["test/odradek/client/records_test.clj"],
+    namespaces = ["odradek.client.records-test"],
+    strip_prefix = "client/clojure/test",
+    deps = [":client"],
+)
+
+clj_test(
+    name = "records_test",
+    size = "small",
+    ns = "odradek.client.records-test",
+    deps = [":records_test_lib"],
+)
+
+clj_library(
+    name = "client_test_lib",
+    testonly = True,
+    srcs = ["test/odradek/client_test.clj"],
+    namespaces = ["odradek.client-test"],
+    strip_prefix = "client/clojure/test",
+    deps = [
+        ":client",
+        # clj-grpc's server side, for the stand-in server: it names the health
+        # and reflection services whether or not they are switched on.
+        "@grpc-java//services:health",
+        "@grpc-java//services:reflection",
+    ],
+)
+
+# The binding against a stand-in server on a Unix socket: no Kafka, no Odradek
+# server. Streams, reconnects and the handler thread are real.
+clj_test(
+    name = "client_test",
+    size = "medium",
+    ns = "odradek.client-test",
+    deps = [":client_test_lib"],
+)
+
+# --- The lockfile ----------------------------------------------------------------
+# rules_clj's lock tool, built here because its own target cannot be analysed
+# from a module that depends on rules_clj (see MODULE.bazel). After editing
+# deps.edn, from the repository root:
+#
+#   bazel run //client/clojure:lock -- --aliases=bazel \
+#     --deps-edn=$PWD/client/clojure/deps.edn --output=$PWD/client/clojure/deps.lock.json
+clj_library(
+    name = "lock_lib",
+    srcs = ["@rules_clj//tools/lock:rules_clj/lock.clj"],
+    namespaces = ["rules-clj.lock"],
+    strip_prefix = "tools/lock",
+    # manual: tools.deps is 55 jars that nothing else in the build needs.
+    tags = ["manual"],
+    deps = ["@clj_lock_deps//:org_clojure_tools_deps"],
+)
+
+clj_binary(
+    name = "lock",
+    main = "rules-clj.lock",
+    tags = ["manual"],
+    deps = [":lock_lib"],
+)
