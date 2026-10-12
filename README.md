@@ -28,7 +28,13 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 | Lint | `bazel build --config=lint //...` (`make lint`); `--config=ci` makes violations fail |
 | Re-pin Maven dependencies | `REPIN=1 bazel run @maven//:pin` (`make repin`) after editing `maven.install` in `MODULE.bazel` |
 | Tidy the module graph | `bazel mod tidy` (`make tidy`) |
-| Proto breaking changes | `bazel run @rules_buf_toolchains//:buf -- breaking api --against '.git#branch=main'` |
+| Proto breaking changes | checked by `//api:breaking_test` inside `bazel test //...` against `api/baseline.binpb`; accept a deliberate break or cut a release baseline with `bazel run //api:update_baseline` (`make baseline`) and commit the file |
+| Build the image (linux/amd64 + linux/arm64) | `bazel build //sidecar:image_index` (`make image`) |
+| Load the image into the local Docker daemon | `bazel run //sidecar:image_load` (as `localhost/odradek:e2e`; `make image-load`) |
+| Push the image (CI) | `bazel run //sidecar:image_push` to `quay.io/odradek/odradek`, tags `dev` and `dev-<commit>`; its digest is in `bazel-bin/sidecar/image_index_digest` |
+| Verify a published image's signatures | `bazel run //bazel/cosign:verify_image -- quay.io/odradek/odradek@sha256:<digest>` (exit 0 verified, 1 failed, 2 could not check) |
+| Run cosign | `bazel run //bazel/cosign -- <args>` |
+| End-to-end tests | start two Kafka brokers, then `ODRADEK_E2E_KAFKA_A=localhost:9092 ODRADEK_E2E_KAFKA_B=localhost:9093 bazel test //e2e/... --config=e2e` (`make e2e`); excluded from plain `bazel test //...` |
 
 Formatting covers Java (google-java-format), Starlark (buildifier, including its lint) and protobuf (buf). Java is linted by Error Prone inside every `javac` action, with warnings as errors for first-party code; protos are linted by buf.
 

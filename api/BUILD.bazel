@@ -1,0 +1,37 @@
+load("@rules_buf//buf:defs.bzl", "buf_breaking_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("//bazel/proto:image.bzl", "proto_image")
+
+# The protos whose wire compatibility is guarded.
+_PROTOS = [
+    "//api/odradek/config/v1:config_proto",
+    "//api/odradek/kafka/v1:sidecar_proto",
+]
+
+# The current protos as one self-contained image (what `buf build` would make).
+proto_image(
+    name = "current_image",
+    protos = _PROTOS,
+)
+
+# Breaking-change check against the committed baseline, inside `bazel test //...`.
+# Rules: `breaking: use: PACKAGE` of //:buf.yaml.
+buf_breaking_test(
+    name = "breaking_test",
+    size = "small",
+    against = "baseline.binpb",
+    config = "//:buf.yaml",
+    targets = _PROTOS,
+)
+
+# `bazel run //api:update_baseline` overwrites api/baseline.binpb with the
+# current protos. Do it when a release is cut (or a deliberate break is
+# accepted), and commit the result.
+sh_binary(
+    name = "update_baseline",
+    srcs = ["update_baseline.sh"],
+    data = [":current_image"],
+    env = {"IMAGE": "$(rootpath :current_image)"},
+)
+
+exports_files(["baseline.binpb"])

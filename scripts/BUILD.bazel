@@ -1,0 +1,4 @@
+exports_files([
+    "registry-lib.sh",
+    "verify-image-signatures.sh",
+])

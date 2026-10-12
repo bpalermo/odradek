@@ -1,0 +1,5 @@
+# One owner today. Keep "require review from code owners" OFF in the main
+# ruleset while that is true: GitHub does not count an owner's approval of
+# their own pull request, so the rule would deadlock every PR.
+* @bpalermo
+/.github/workflows/ @bpalermo
