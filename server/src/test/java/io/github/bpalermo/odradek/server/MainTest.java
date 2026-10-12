@@ -53,12 +53,10 @@ class MainTest {
   }
 
   @Test
-  void actingAsADispatcherIsNotImplementedYet() {
-    // Even empty: the section is what makes a server a dispatcher.
+  void actingAsADispatcherIsImplemented() {
     ServerConfig config =
         ServerConfig.newBuilder().setDispatch(Dispatch.getDefaultInstance()).build();
-    assertThat(Main.notImplemented(config))
-        .containsExactly("dispatch is set, and acting as a dispatcher is not implemented yet");
+    assertThat(Main.notImplemented(config)).isEmpty();
   }
 
   @Test
@@ -79,12 +77,37 @@ class MainTest {
   }
 
   @Test
-  void bothRolesAreReportedTogether() {
+  void aDispatcherThatAlsoReceivesIsRefusedForTheReceivingOnly() {
     ServerConfig config =
         ServerConfig.newBuilder()
             .setDispatch(Dispatch.getDefaultInstance())
             .putConsumers("orders", consumer(ConsumerSource.CONSUMER_SOURCE_DISPATCHER))
             .build();
-    assertThat(Main.notImplemented(config)).hasSize(2);
+    assertThat(Main.notImplemented(config)).hasSize(1);
+  }
+
+  @Test
+  void theAppsSocketIsOpenedUnlessTheServerOnlyDispatches() {
+    ServerConfig.Builder plain = ServerConfig.newBuilder();
+    assertThat(Main.servesApp(plain.build())).isTrue();
+    ServerConfig.Builder dispatcher =
+        ServerConfig.newBuilder().setDispatch(Dispatch.getDefaultInstance());
+    assertThat(Main.servesApp(dispatcher.build())).isFalse();
+    assertThat(
+            Main.servesApp(
+                dispatcher
+                    .clone()
+                    .putConsumers("orders", consumer(ConsumerSource.CONSUMER_SOURCE_KAFKA))
+                    .build()))
+        .isTrue();
+    assertThat(
+            Main.servesApp(
+                dispatcher
+                    .clone()
+                    .putProducers(
+                        "orders",
+                        io.github.bpalermo.odradek.config.v1.Producer.getDefaultInstance())
+                    .build()))
+        .isTrue();
   }
 }

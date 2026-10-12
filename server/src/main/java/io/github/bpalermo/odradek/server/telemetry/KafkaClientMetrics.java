@@ -367,8 +367,27 @@ public final class KafkaClientMetrics {
       String cluster, String group, Collection<String> topics, Map<String, Object> properties) {
     // Kafka's fetch metrics name a topic with its dots replaced.
     Map<String, String> byTag = new HashMap<>();
-    topics.forEach(topic -> byTag.put(topic.replace('.', '_'), topic));
+    topics.forEach(topic -> byTag.put(metricTag(topic), topic));
     apply(properties, new Binding(this, cluster, group, byTag));
+  }
+
+  /**
+   * As {@link #applyToConsumer(String, String, Collection, Map)}, for a consumer whose subscription
+   * changes while it lives, as a dispatcher's does. {@code topicsByTag} maps {@link #metricTag} of
+   * each topic to the topic; it is read whenever the consumer registers a metric, from the
+   * consumer's thread, so its owner adds a topic to it before subscribing to the topic.
+   */
+  public void applyToConsumer(
+      String cluster,
+      String group,
+      Map<String, String> topicsByTag,
+      Map<String, Object> properties) {
+    apply(properties, new Binding(this, cluster, group, topicsByTag));
+  }
+
+  /** The name Kafka's fetch metrics give a topic: its dots are replaced. */
+  public static String metricTag(String topic) {
+    return topic.replace('.', '_');
   }
 
   /** Does nothing when no metric is exported: the clients then run as if this did not exist. */

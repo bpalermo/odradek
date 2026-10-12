@@ -40,14 +40,14 @@ rejected() {
   fi
 }
 
-# serves <name>: the server listens, and SIGTERM stops it (the JVM exits 143, 128 + SIGTERM,
-# after its shutdown hook, and so does the image).
-serves() {
+# runs <name> <started> <stopped>: the server logs <started>, and SIGTERM stops it (the JVM exits
+# 143, 128 + SIGTERM, after its shutdown hook, and so does the image) with <stopped> in the log.
+runs() {
   "${server}" --config "$1.yaml" >"$1.log" 2>&1 &
   local pid=$!
   local listening=0
   for _ in $(seq 1 100); do
-    if grep -q "listening on" "$1.log"; then
+    if grep -q -- "$2" "$1.log"; then
       listening=1
       break
     fi
@@ -55,7 +55,7 @@ serves() {
     sleep 0.1
   done
   if [ "${listening}" -ne 1 ]; then
-    fail "$1: never listened"
+    fail "$1: never logged '$2'"
     cat "$1.log" >&2
     kill "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
@@ -67,10 +67,15 @@ serves() {
   if [ "${status}" -ne 0 ] && [ "${status}" -ne 143 ]; then
     fail "$1: SIGTERM ended it with status ${status}"
     cat "$1.log" >&2
-  elif ! grep -q "stopped" "$1.log"; then
-    fail "$1: did not log that it stopped"
+  elif ! grep -q -- "$3" "$1.log"; then
+    fail "$1: did not log '$3'"
     cat "$1.log" >&2
   fi
+}
+
+# serves <name>: the server listens on the app's socket, and SIGTERM stops it.
+serves() {
+  runs "$1" "^.* -- listening on " " -- stopped"
 }
 
 config minimal <<'EOF'
@@ -200,8 +205,8 @@ grep -q "every producer must reference entries in clusters" violations.log ||
   fail "violations: the CEL rule on producers was not evaluated"
 grep -q "acks must be all" violations.log || fail "violations: the CEL rule on acks was not evaluated"
 
-# The dispatcher of ADR 6 has a schema and no behaviour yet: its settings load and are
-# validated, and the server then refuses to start instead of ignoring them.
+# A dispatcher (ADR 6) with neither producers nor consumers: it serves the delivery port, says
+# that its policy is not enforced yet, and does not open the socket of an app that is not there.
 config dispatch <<'EOF'
 clusters:
   main:
@@ -215,9 +220,13 @@ dispatch:
       topics: ["orders.*"]
       groups: [billing]
 EOF
-rejected dispatch "dispatch is set, and acting as a dispatcher is not implemented yet"
+runs dispatch "delivery service on port [0-9]*, advertised as " "delivery service stopped"
+grep -q "POLICY IS NOT ENFORCED" dispatch.log || fail "dispatch: no warning about the policy"
+[ ! -e dispatch.sock ] || fail "dispatch: opened the app's socket"
 
-# A server that only receives has no cluster of its own.
+# Receiving from a dispatcher has a schema and no behaviour yet: the settings load and are
+# validated, and the server then refuses to start instead of ignoring them. A server that only
+# receives has no cluster of its own.
 config dispatched-consumer <<'EOF'
 dispatcher:
   address: odradek-dispatcher.kafka.svc:9465

@@ -41,6 +41,11 @@ public final class ServerMetrics {
   private final LongUpDownCounter consumeStreams;
   private final LongCounter consumeRebalances;
   private final LongCounter consumeStreamEnds;
+  private final LongUpDownCounter dispatchReceivers;
+  private final LongCounter dispatchRecords;
+  private final LongCounter dispatchRedeliveries;
+  private final LongUpDownCounter dispatchInFlight;
+  private final LongUpDownCounter dispatchBlocked;
   private final KafkaClientMetrics kafkaClients;
 
   public ServerMetrics(Meter meter) {
@@ -103,6 +108,41 @@ public final class ServerMetrics {
                     + " acknowledging.")
             .setUnit("{stream}")
             .build();
+    dispatchReceivers =
+        meter
+            .upDownCounterBuilder("odradek.dispatch.receivers")
+            .setDescription(
+                "Open Deliver streams: the sidecars a dispatcher hands a topic's records to.")
+            .setUnit("{stream}")
+            .build();
+    dispatchRecords =
+        meter
+            .counterBuilder("odradek.dispatch.records")
+            .setDescription(
+                "Records a dispatcher sent to sidecars; a record sent again is counted again.")
+            .setUnit("{record}")
+            .build();
+    dispatchRedeliveries =
+        meter
+            .counterBuilder("odradek.dispatch.redeliveries")
+            .setDescription(
+                "Of the records sent, those that had been sent before: after a missed deadline, a"
+                    + " rejection, or a sidecar that went away.")
+            .setUnit("{record}")
+            .build();
+    dispatchInFlight =
+        meter
+            .upDownCounterBuilder("odradek.dispatch.in_flight")
+            .setDescription("Records sent to a sidecar and not acknowledged, rejected or expired.")
+            .setUnit("{record}")
+            .build();
+    dispatchBlocked =
+        meter
+            .upDownCounterBuilder("odradek.dispatch.partitions.blocked")
+            .setDescription(
+                "Partitions stopped at a record that used all its attempts (ON_EXHAUSTED_BLOCK).")
+            .setUnit("{partition}")
+            .build();
   }
 
   /** Metrics that go nowhere, for a server without telemetry and for tests. */
@@ -164,6 +204,46 @@ public final class ServerMetrics {
   /** A rebalance callback ran: {@code event} is assigned, revoked or lost. */
   public void rebalanced(String cluster, String group, String event) {
     consumeRebalances.add(1, Attributes.of(CLUSTER, cluster, GROUP, group, EVENT, event));
+  }
+
+  /**
+   * What a dispatcher reports about one topic of one group. A record sent is on the dispatcher's
+   * hot path, so the attributes are built once here.
+   */
+  public final class DispatchTopic {
+    private final Attributes attributes;
+
+    private DispatchTopic(String cluster, String group, String topic) {
+      attributes = Attributes.of(CLUSTER, cluster, GROUP, group, TOPIC, topic);
+    }
+
+    /** Deliver streams opened (positive) or ended (negative). */
+    public void receivers(long delta) {
+      dispatchReceivers.add(delta, attributes);
+    }
+
+    /** A record was sent to a sidecar; {@code again} when it had been sent before. */
+    public void sent(boolean again) {
+      dispatchRecords.add(1, attributes);
+      if (again) {
+        dispatchRedeliveries.add(1, attributes);
+      }
+    }
+
+    /** The number of records in flight changed by {@code delta}. */
+    public void inFlight(long delta) {
+      dispatchInFlight.add(delta, attributes);
+    }
+
+    /** The number of blocked partitions changed by {@code delta}. */
+    public void blocked(long delta) {
+      dispatchBlocked.add(delta, attributes);
+    }
+  }
+
+  /** The dispatcher metrics of one topic of one group on one cluster. */
+  public DispatchTopic dispatchTopic(String cluster, String group, String topic) {
+    return new DispatchTopic(cluster, group, topic);
   }
 
   /**

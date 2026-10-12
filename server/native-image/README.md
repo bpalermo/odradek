@@ -8,7 +8,7 @@ read by `//server:server_native` and checked by `NativeMetadataTest`.
 What is in it, and why:
 
 - **Generated protobuf messages** (`io.github.bpalermo.odradek.config.v1`, `odradek.kafka.v1`,
-  `build.buf.validate`, and the well-known types) with `allPublicMethods`:
+  `odradek.delivery.v1`, `build.buf.validate`, and the well-known types) with `allPublicMethods`:
   protobuf's reflective accessors look their getters, setters and builders up by name. The test
   fails when a message of the schema is missing.
 - **Kafka**: the serializers and deserializers that ship with the clients (a codec names them

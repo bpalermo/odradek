@@ -774,6 +774,138 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Accepted"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Accepted$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Ack"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Ack$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Credits"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Credits$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Declare"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Declare$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.DeliverRequest"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.DeliverRequest$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.DeliverRequest$MsgCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.DeliverResponse"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.DeliverResponse$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.DeliverResponse$MsgCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.OffsetReset"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.OnExhausted"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Ordering"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.PeerInfo"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.PeerInfo$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Record"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Record$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.RecordBatch"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.RecordBatch$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Reject"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Reject$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Released"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Released$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Replica"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Replica$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.ReplicaList"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.ReplicaList$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Settings"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Settings$Builder"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.kafka.v1.Ack"
     },
     {
@@ -1716,6 +1848,9 @@
     },
     {
       "glob": "linux/*/libzstd-jni-*.so"
+    },
+    {
+      "glob": "odradek-server.version"
     },
     {
       "glob": "net/jpountz/util/linux/*/liblz4-java.so"

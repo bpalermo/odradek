@@ -8,7 +8,8 @@ import java.time.Duration;
  *
  * @param ordering which records may be unacknowledged at the same time
  * @param maxProcessing longest a delivered record may stay unacknowledged before the attempt counts
- *     as failed; positive
+ *     as failed; positive. The value the core starts with: {@link DispatchCore#maxProcessing}
+ *     changes it
  * @param maxAttempts how many times a record is delivered before it is exhausted; zero means there
  *     is no limit and {@code onExhausted} never applies
  * @param onExhausted what happens to a record that has used all its attempts
