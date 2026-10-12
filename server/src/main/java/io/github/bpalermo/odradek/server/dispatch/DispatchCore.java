@@ -25,6 +25,7 @@ import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.Rejected;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.TimePassed;
 import io.github.bpalermo.odradek.server.dispatch.DispatchSettings.OnExhausted;
 import io.github.bpalermo.odradek.server.dispatch.DispatchSettings.Ordering;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -59,10 +60,15 @@ import java.util.TreeSet;
  *       partition with the same key bytes is unacknowledged; under {@link Ordering#PARTITION} while
  *       any earlier record of its partition is. "Unacknowledged" includes a record waiting to be
  *       delivered again or to be dead-lettered, so a redelivery always precedes what it holds back.
- *   <li><b>Failed attempts.</b> A rejection, a processing deadline that passes and a receiver that
- *       leaves each fail the attempt, and the record is delivered again. After a rejection or a
- *       deadline it goes to a different receiver if one has credit at that moment, and back to the
- *       same one otherwise: waiting for another receiver could wait for ever.
+ *   <li><b>Failed attempts.</b> A rejection and a processing deadline that passes each fail the
+ *       attempt, and the record is delivered again. It goes to a different receiver if one has
+ *       credit at that moment, and back to the same one otherwise: waiting for another receiver
+ *       could wait for ever.
+ *   <li><b>A receiver that leaves</b> fails nothing: what was in flight to it is delivered again
+ *       <em>with the same attempt number</em>. A stream that ends says something about the pod, not
+ *       about the record, and rolling the application must not use up the attempts of whatever
+ *       happened to be in flight (with a limit and {@link OnExhausted#BLOCK} it would block
+ *       partitions).
  *   <li><b>Exhaustion.</b> A record whose attempts are used up is either dead-lettered (it stays
  *       unacknowledged until {@link DeadLetterWritten}; a failed write is asked for again) or
  *       blocks its partition, see below.
@@ -115,6 +121,9 @@ import java.util.TreeSet;
  * time earlier than one already seen is taken as that one. Deadlines are checked only on {@link
  * TimePassed}; {@link #nextDeadlineNanos} says when the next one is due.
  *
+ * <p>The processing deadline is the one setting that can change while the core runs ({@link
+ * #maxProcessing}): a record keeps the deadline in force when it was sent.
+ *
  * <p>The same events at the same times give the same actions. An event costs time in proportion to
  * the records it concerns, times a logarithm; giving a partition up also walks that partition's
  * records and the receivers. Not thread-safe.
@@ -147,8 +156,17 @@ public final class DispatchCore<R> {
     ByteString key;
     R payload;
     State state = State.PENDING;
+
+    /** Deliveries that count: those not taken back because their receiver left. */
     int attempts;
+
+    /** Whether it was ever delivered, and so is no longer part of the fetch buffer. */
+    boolean delivered;
+
     long sentAt;
+
+    /** The deliveries it is in flight among: those made under the same processing deadline. */
+    Flight<R> flight;
 
     /** Where the record is in flight. */
     Receiver<R> holder;
@@ -165,6 +183,19 @@ public final class DispatchCore<R> {
       this.size = size;
       this.key = key;
       this.payload = payload;
+    }
+  }
+
+  /**
+   * The records in flight that were sent under one processing deadline, oldest delivery first, so
+   * that the first is the next to expire.
+   */
+  private static final class Flight<R> {
+    final long deadlineNanos;
+    final LinkedHashSet<Rec<R>> records = new LinkedHashSet<>();
+
+    Flight(long deadlineNanos) {
+      this.deadlineNanos = deadlineNanos;
     }
   }
 
@@ -239,7 +270,6 @@ public final class DispatchCore<R> {
   }
 
   private final DispatchSettings settings;
-  private final long maxProcessingNanos;
   private final long revokeGraceNanos;
 
   private final TreeMap<Integer, Part<R>> partitions = new TreeMap<>();
@@ -257,8 +287,13 @@ public final class DispatchCore<R> {
       new TreeSet<>(
           Comparator.<Receiver<R>>comparingInt(r -> r.load).thenComparingLong(r -> r.seq));
 
-  /** The records in flight, oldest delivery first: they share one deadline length. */
-  private final LinkedHashSet<Rec<R>> inFlight = new LinkedHashSet<>();
+  /**
+   * The records in flight, by the processing deadline they were sent under. The last is the one in
+   * force; one before it is kept only while it holds records.
+   */
+  private final ArrayDeque<Flight<R>> flights = new ArrayDeque<>();
+
+  private int inFlight;
 
   /** The partition the event being handled added records to. */
   private Part<R> fetchedInto;
@@ -269,7 +304,7 @@ public final class DispatchCore<R> {
 
   public DispatchCore(DispatchSettings settings) {
     this.settings = settings;
-    this.maxProcessingNanos = settings.maxProcessing().toNanos();
+    flights.add(new Flight<>(settings.maxProcessing().toNanos()));
     this.revokeGraceNanos = settings.revokeGrace().toNanos();
   }
 
@@ -286,7 +321,7 @@ public final class DispatchCore<R> {
       case PartitionsLost<R> e -> lost(e, out);
       case RecordsFetched<R> e -> fetched(e, out);
       case ReceiverJoined<R> e -> joined(e);
-      case ReceiverLeft<R> e -> left(e, out);
+      case ReceiverLeft<R> e -> left(e);
       case CreditsGranted<R> e -> credits(e);
       case Acknowledged<R> e -> acknowledged(e, out);
       case Rejected<R> e -> rejected(e, out);
@@ -323,7 +358,27 @@ public final class DispatchCore<R> {
 
   /** The number of records in flight, over all partitions. */
   public int inFlight() {
-    return inFlight.size();
+    return inFlight;
+  }
+
+  /**
+   * Changes the processing deadline, for the records sent from now on: it comes from the
+   * application, and so changes with its versions while the other settings stay. What is in flight
+   * keeps the deadline it was sent under.
+   */
+  public void maxProcessing(Duration maxProcessing) {
+    if (maxProcessing.isZero() || maxProcessing.isNegative()) {
+      throw new IllegalArgumentException("maxProcessing must be positive");
+    }
+    long nanos = maxProcessing.toNanos();
+    Flight<R> current = flights.getLast();
+    if (current.deadlineNanos == nanos) {
+      return;
+    }
+    if (current.records.isEmpty()) {
+      flights.removeLast();
+    }
+    flights.addLast(new Flight<>(nanos));
   }
 
   /**
@@ -333,9 +388,15 @@ public final class DispatchCore<R> {
   public OptionalLong nextDeadlineNanos() {
     boolean any = false;
     long earliest = 0;
-    if (!inFlight.isEmpty()) {
-      earliest = inFlight.getFirst().sentAt + maxProcessingNanos;
-      any = true;
+    for (Flight<R> flight : flights) {
+      if (flight.records.isEmpty()) {
+        continue;
+      }
+      long deadline = flight.records.getFirst().sentAt + flight.deadlineNanos;
+      if (!any || deadline - earliest < 0) {
+        earliest = deadline;
+        any = true;
+      }
     }
     for (Part<R> p : draining) {
       long deadline = p.drainStart + revokeGraceNanos;
@@ -448,7 +509,7 @@ public final class DispatchCore<R> {
       draining.remove(p);
       for (Rec<R> rec : p.log) {
         if (rec.state == State.IN_FLIGHT) {
-          inFlight.remove(rec);
+          land(rec);
         }
       }
     }
@@ -607,10 +668,13 @@ public final class DispatchCore<R> {
     rec.avoid = null;
     rec.sentAt = now;
     rec.attempts++;
-    inFlight.add(rec);
+    rec.flight = flights.getLast();
+    rec.flight.records.add(rec);
+    inFlight++;
     p.inFlight++;
     out.add(new Deliver<>(r.id, p.id, rec.offset, rec.payload, rec.attempts));
-    if (rec.attempts == 1) {
+    if (!rec.delivered) {
+      rec.delivered = true;
       p.buffered--;
       p.bufferedBytes -= rec.size;
       if (p.paused
@@ -630,7 +694,7 @@ public final class DispatchCore<R> {
     receivers.computeIfAbsent(e.receiver(), id -> new Receiver<>(id, receiverSeq++));
   }
 
-  private void left(ReceiverLeft<R> e, List<DispatchAction<R>> out) {
+  private void left(ReceiverLeft<R> e) {
     Receiver<R> r = receivers.remove(e.receiver());
     if (r == null) {
       return;
@@ -639,13 +703,32 @@ public final class DispatchCore<R> {
     for (TreeMap<Long, Rec<R>> records : r.held.values()) {
       for (Rec<R> rec : records.values()) {
         if (rec.holder == r) {
-          failed(rec, out);
+          returned(rec);
         } else {
           rec.former.remove(r);
         }
       }
     }
     r.held.clear();
+  }
+
+  /**
+   * The receiver a record was in flight to left. The delivery is taken back: the record is sent
+   * again under the same attempt number.
+   */
+  private void returned(Rec<R> rec) {
+    Part<R> p = rec.part;
+    land(rec);
+    p.inFlight--;
+    rec.holder = null;
+    if (p.draining) {
+      rec.state = State.DROPPED;
+      rec.payload = null;
+      return;
+    }
+    rec.attempts--;
+    ready(rec);
+    refresh(p);
   }
 
   private void credits(CreditsGranted<R> e) {
@@ -697,21 +780,35 @@ public final class DispatchCore<R> {
   }
 
   private void expire(List<DispatchAction<R>> out) {
-    for (Rec<R> rec = oldestInFlight();
-        rec != null && now - rec.sentAt >= maxProcessingNanos;
-        rec = oldestInFlight()) {
-      // The receiver keeps the record, and may still acknowledge it.
-      if (rec.former == null) {
-        rec.former = new ArrayList<>(1);
+    // A copy: a flight that empties, and is not the one in force, is removed as it does.
+    for (Flight<R> flight : List.copyOf(flights)) {
+      for (Rec<R> rec = oldest(flight);
+          rec != null && now - rec.sentAt >= flight.deadlineNanos;
+          rec = oldest(flight)) {
+        // The receiver keeps the record, and may still acknowledge it.
+        if (rec.former == null) {
+          rec.former = new ArrayList<>(1);
+        }
+        rec.former.add(rec.holder);
+        rec.avoid = rec.holder;
+        failed(rec, out);
       }
-      rec.former.add(rec.holder);
-      rec.avoid = rec.holder;
-      failed(rec, out);
     }
   }
 
-  private Rec<R> oldestInFlight() {
-    return inFlight.isEmpty() ? null : inFlight.getFirst();
+  private static <R> Rec<R> oldest(Flight<R> flight) {
+    return flight.records.isEmpty() ? null : flight.records.getFirst();
+  }
+
+  /** The record is no longer in flight. */
+  private void land(Rec<R> rec) {
+    Flight<R> flight = rec.flight;
+    flight.records.remove(rec);
+    if (flight.records.isEmpty() && flight != flights.getLast()) {
+      flights.remove(flight);
+    }
+    rec.flight = null;
+    inFlight--;
   }
 
   private void deadLetterWritten(DeadLetterWritten<R> e, List<DispatchAction<R>> out) {
@@ -741,7 +838,7 @@ public final class DispatchCore<R> {
    */
   private void failed(Rec<R> rec, List<DispatchAction<R>> out) {
     Part<R> p = rec.part;
-    inFlight.remove(rec);
+    land(rec);
     p.inFlight--;
     rec.holder = null;
     if (p.draining) {
@@ -771,7 +868,7 @@ public final class DispatchCore<R> {
     Part<R> p = rec.part;
     switch (rec.state) {
       case IN_FLIGHT -> {
-        inFlight.remove(rec);
+        land(rec);
         p.inFlight--;
       }
       case DEAD_LETTERING -> p.deadLettering.remove(rec.offset);

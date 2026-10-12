@@ -189,6 +189,11 @@ message Dispatch {
   // too wide gives an application topics it should not read: the dispatcher
   // reads Kafka as itself, so the brokers' ACLs cannot tell its applications
   // apart.
+  //
+  // NOT ENFORCED YET. The delivery port has no TLS so far, so a sidecar has
+  // no identity to match a rule with: the rules are validated and then
+  // ignored, and every declaration naming a cluster of this configuration is
+  // accepted. A dispatcher is for tests until that changes.
   repeated PolicyRule policy = 5;
 }
 
@@ -479,10 +484,11 @@ message Consumer {
   Ordering ordering = 10 [(buf.validate.field).enum.defined_only = true];
   // How many times a record is delivered before it is given up on, as
   // on_exhausted says. A delivery fails when the app does not acknowledge
-  // the record within the processing deadline, when the app's stream ends,
-  // or when the record cannot be decoded. At least 1. Unset means there is
-  // no limit: the record is delivered again until it is acknowledged. Only
-  // with CONSUMER_SOURCE_DISPATCHER.
+  // the record within the processing deadline, or when the record cannot be
+  // decoded. A record delivered again because the app's stream ended has not
+  // used one up. At least 1. Unset means there is no limit: the record is
+  // delivered again until it is acknowledged. Only with
+  // CONSUMER_SOURCE_DISPATCHER.
   uint32 max_attempts = 11 [(buf.validate.field).uint32.gte = 1];
   // What happens to a record that has been delivered max_attempts times
   // without being acknowledged. Needs max_attempts. Only with
@@ -770,10 +776,12 @@ message Consume {
   google.protobuf.Duration max_max_processing = 2 [(buf.validate.field).duration.gt = {}];
   // How long the server waits for RevokeDone after a Revoked event before it
   // commits and gives the partitions up anyway. Must be positive and well
-  // under the group's rebalance timeout. Default: 10s.
+  // under the group's rebalance timeout. Default: 10s. A dispatcher waits as
+  // long for the acknowledgements of the records in flight when it gives
+  // partitions up, in a rebalance and when it stops.
   google.protobuf.Duration revoke_deadline = 3 [(buf.validate.field).duration.gt = {}];
   // Interval between asynchronous commits of acked offsets. Must be positive.
-  // Default: 5s.
+  // Default: 5s. A dispatcher commits at the same interval.
   google.protobuf.Duration commit_interval = 4 [(buf.validate.field).duration.gt = {}];
   // Upper bound of the random delay before a consumer is rebuilt after a
   // configuration change, which spreads rebalances across a fleet that

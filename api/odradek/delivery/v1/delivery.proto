@@ -31,7 +31,8 @@ service DeliveryService {
   // sidecar until it is acknowledged, rejected or released, or until the
   // stream ends; a record that is unacknowledged when the stream ends, or
   // when its processing deadline passes, is delivered again, possibly to
-  // another sidecar.
+  // another sidecar. Only the second counts as a failed attempt: see
+  // Settings.max_attempts.
   //
   // A declaration is refused by ending the stream, before Accepted, with one
   // of these statuses:
@@ -50,8 +51,14 @@ service DeliveryService {
   //    settings, declared by a sidecar that is still connected. The status
   //    message says which settings are in force. The declaration is accepted
   //    once no sidecar of the group holds the topic with the old settings.
-  //  - UNAVAILABLE: the dispatcher is stopping or cannot reach the cluster.
-  //    Retry with backoff.
+  //    Settings.max_processing_ms is never a reason: see Settings.
+  //  - UNIMPLEMENTED: the declaration is well formed and asks for something
+  //    this dispatcher cannot do. Today that is ON_EXHAUSTED_DEAD_LETTER,
+  //    which is not built yet; later, whatever a newer sidecar asks of an
+  //    older dispatcher. Retrying unchanged fails until the dispatcher is
+  //    replaced.
+  //  - UNAVAILABLE: the dispatcher is starting or stopping, or cannot reach
+  //    the cluster. Retry with backoff.
   //
   // After Accepted the stream ends with INVALID_ARGUMENT when the sidecar
   // breaks the protocol (a second Declare, for example), and with UNAVAILABLE
@@ -115,6 +122,13 @@ enum OnExhausted {
 // Settings is how one consumer group consumes one topic. All sidecars of a
 // group share them: the first declaration decides, and holds for as long as
 // a sidecar of the group holds the topic.
+//
+// max_processing_ms is the exception. It comes from the application, not from
+// the configuration of its server, and changes between versions of it, so it
+// takes no part in the comparison of a declaration with the settings in
+// force: the dispatcher uses the value of the most recent declaration it
+// accepted for the group and topic, for the records it sends from then on. A
+// record already sent keeps the deadline it was sent under.
 message Settings {
   // Which records may be in flight at the same time. Unset behaves as
   // ORDERING_KEY.
@@ -122,7 +136,9 @@ message Settings {
   // Longest a delivered record may stay unacknowledged, in milliseconds,
   // before the dispatcher counts the attempt as failed and delivers the
   // record again. Required and positive in a declaration: the sidecar sends
-  // the deadline it resolved for its application's Consume stream.
+  // the deadline it resolved for its application's Consume stream. Not
+  // compared with the settings in force; the latest declaration's value
+  // applies (see Settings).
   uint32 max_processing_ms = 2;
   // Where to start a partition for which the group has no committed offset,
   // when start_timestamp_ms is unset or matches no record. Unset behaves as
@@ -134,10 +150,13 @@ message Settings {
   // Unset means offset_reset alone decides.
   int64 start_timestamp_ms = 4;
   // How many times a record is delivered before it is exhausted. An attempt
-  // fails when its processing deadline passes, when the stream it was
-  // delivered on ends, or when the sidecar rejects the record. Unset or zero
-  // means there is no limit: the record is delivered again until it is
-  // acknowledged, and on_exhausted never applies.
+  // fails when its processing deadline passes or when the sidecar rejects the
+  // record. A stream that ends fails nothing: what it held is delivered again
+  // without having used an attempt, because a sidecar going away says nothing
+  // about the record, and rolling the application must not exhaust what
+  // happened to be in flight. Unset or zero means there is no limit: the
+  // record is delivered again until it is acknowledged, and on_exhausted
+  // never applies.
   uint32 max_attempts = 5;
   // What happens to a record that has used max_attempts attempts. Unset
   // behaves as ON_EXHAUSTED_BLOCK.
@@ -182,7 +201,7 @@ message Declare {
   // How the topic is to be consumed. An unset field asks for its default.
   // The dispatcher compares the result with the settings in force for this
   // group and topic, if any, and refuses a difference with
-  // FAILED_PRECONDITION.
+  // FAILED_PRECONDITION, except in max_processing_ms (see Settings).
   Settings settings = 4;
   // The sidecar sending this stream. Optional.
   PeerInfo sidecar = 5;
@@ -219,8 +238,8 @@ message Ack {
 
 // Reject returns one record that the sidecar could not decode with the
 // topic's codec, so that it never reached the application. It counts as a
-// failed attempt: the record is delivered again, or is exhausted. A reject
-// for a record this stream does not hold is ignored.
+// failed attempt: the record is delivered again, at once, or is exhausted. A
+// reject for a record this stream does not hold is ignored.
 message Reject {
   // Partition of the record.
   int32 partition = 1;
@@ -254,7 +273,7 @@ message DeliverResponse {
 message Accepted {
   // The settings in force for this group and topic, with every default
   // filled in: those of the first declaration, which this one matched or
-  // was.
+  // was, with the max_processing_ms of this one.
   Settings settings = 1;
   // The dispatcher's replicas at the time of the handshake. The sidecar
   // opens a stream to each one it is not connected to.
@@ -309,10 +328,12 @@ message Record {
   bytes value = 4;
   // Record headers, as stored, in order.
   repeated odradek.kafka.v1.Header headers = 5;
-  // Which delivery of this record this is, starting at 1. A value above 1
+  // Which attempt at this record this is, starting at 1. A value above 1
   // means an earlier attempt failed, and the application may already have
-  // seen the record. The count is kept in the dispatcher's memory and starts
-  // again when the partition changes owner.
+  // seen the record. A delivery that ended because its stream did is not an
+  // attempt, so the record is sent again under the same number: 1 does not
+  // promise that no application has seen it. The count is kept in the
+  // dispatcher's memory and starts again when the partition changes owner.
   uint32 attempt = 6;
 }
 

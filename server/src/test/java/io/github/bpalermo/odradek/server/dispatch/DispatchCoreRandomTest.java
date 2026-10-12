@@ -143,7 +143,9 @@ class DispatchCoreRandomTest {
     /** In flight: offset to receiver. */
     final Map<Long, String> inFlight = new HashMap<>();
 
+    /** In flight: offset to when its processing deadline passes. */
     final Map<Long, Long> sentAt = new HashMap<>();
+
     final Map<Long, Integer> attempts = new HashMap<>();
     final Set<Long> deadLettering = new HashSet<>();
     final TreeSet<Long> blocked = new TreeSet<>();
@@ -205,6 +207,10 @@ class DispatchCoreRandomTest {
     final Set<Integer> lostNow = new HashSet<>();
     final Set<Integer> unblockable = new HashSet<>();
     long now;
+
+    /** The processing deadline in force for what is sent now. */
+    long deadline = DEADLINE;
+
     int step;
     int receiverNames;
     String last = "";
@@ -258,8 +264,13 @@ class DispatchCoreRandomTest {
           revoke(pick(partitions));
         } else if (dice < 96) {
           lose(pick(partitions));
-        } else {
+        } else if (dice < 99) {
           answerDeadLetter();
+        } else {
+          // A new version of the application declares another deadline: what is in flight keeps
+          // the one it was sent under.
+          deadline = DEADLINE / 2 + random.nextInt((int) DEADLINE);
+          core.maxProcessing(Duration.ofNanos(deadline));
         }
       }
     }
@@ -372,8 +383,14 @@ class DispatchCoreRandomTest {
       r.held.forEach(
           (partition, offsets) -> {
             for (long offset : offsets) {
-              if (name.equals(partitions.get(partition).inFlight.get(offset))) {
-                attemptFailed(partitions.get(partition), offset);
+              Partition p = partitions.get(partition);
+              if (name.equals(p.inFlight.get(offset))) {
+                // Taken back, not failed: the delivery does not count as an attempt.
+                p.inFlight.remove(offset);
+                p.sentAt.remove(offset);
+                if (!p.draining) {
+                  p.attempts.merge(offset, -1, Integer::sum);
+                }
               }
             }
           });
@@ -436,7 +453,7 @@ class DispatchCoreRandomTest {
     void timePassed() {
       for (Partition p : partitions) {
         for (long offset : List.copyOf(p.inFlight.keySet())) {
-          if (now - p.sentAt.get(offset) >= DEADLINE) {
+          if (now >= p.sentAt.get(offset)) {
             // The receiver keeps it, and may acknowledge it yet.
             attemptFailed(p, offset);
           }
@@ -654,7 +671,7 @@ class DispatchCoreRandomTest {
       if (ordering == Ordering.KEY && !key.isEmpty()) {
         // Deliveries of one key are in offset order, but for a record delivered again.
         Long before = p.lastDeliveredByKey.put(key, offset);
-        assertThat(before == null || before < offset || (before == offset && attempt > 1))
+        assertThat(before == null || before <= offset)
             .as("%s after %s of the same key", a, before)
             .isTrue();
         for (long inFlight : p.inFlight.keySet()) {
@@ -665,7 +682,7 @@ class DispatchCoreRandomTest {
         assertThat(p.inFlight).as("in flight with %s", a).isEmpty();
       }
       p.inFlight.put(offset, a.receiver());
-      p.sentAt.put(offset, now);
+      p.sentAt.put(offset, now + deadline);
       p.newestDelivered = Math.max(p.newestDelivered, offset);
       r.held.computeIfAbsent(p.id, id -> new TreeSet<>()).add(offset);
     }

@@ -9,6 +9,7 @@ import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
 import com.google.protobuf.util.JsonFormat;
 import io.github.bpalermo.odradek.config.v1.ConfigProto;
+import io.github.bpalermo.odradek.delivery.v1.DeliveryProto;
 import io.github.bpalermo.odradek.kafka.v1.OdradekProto;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -82,6 +83,12 @@ class NativeMetadataTest {
   @Test
   void everyApiMessageIsRegistered() {
     assertThat(PUBLIC_METHODS).containsAll(messages(OdradekProto.getDescriptor()));
+  }
+
+  @Test
+  void everyDeliveryMessageIsRegistered() {
+    // A dispatcher parses and builds them; registered like the application's API.
+    assertThat(PUBLIC_METHODS).containsAll(messages(DeliveryProto.getDescriptor()));
   }
 
   @Test

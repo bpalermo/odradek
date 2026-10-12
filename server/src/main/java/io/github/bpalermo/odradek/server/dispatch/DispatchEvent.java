@@ -61,7 +61,10 @@ public sealed interface DispatchEvent<R> {
   /** A receiver connected. It has no credit yet. */
   record ReceiverJoined<R>(String receiver) implements DispatchEvent<R> {}
 
-  /** A receiver's stream ended. Every attempt in flight to it has failed. */
+  /**
+   * A receiver's stream ended. What was in flight to it is delivered again, under the same attempt
+   * numbers: a receiver that leaves does not use up an attempt.
+   */
   record ReceiverLeft<R>(String receiver) implements DispatchEvent<R> {}
 
   /** A receiver allows {@code records} more deliveries. Grants add up. */

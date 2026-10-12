@@ -2,6 +2,7 @@ load("@rules_graalvm//graalvm:defs.bzl", "native_image")
 load("@rules_java//java:defs.bzl", "java_binary", "java_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel:registry.bzl", "IMAGE_REGISTRY", "image_repository")
+load("//bazel:version.bzl", "VERSION")
 load("//bazel/image:defs.bzl", "executable_image", "java_image")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
 load("//bazel/java:junit.bzl", "java_junit_test")
@@ -24,12 +25,14 @@ java_library(
     srcs = glob(["src/main/java/**/*.java"]),
     javacopts = JAVACOPTS,
     resource_strip_prefix = "server/src/main/resources",
-    resources = glob(["src/main/resources/**"]),
+    resources = glob(["src/main/resources/**"]) + [":version"],
     visibility = ["//e2e:__pkg__"],
     # The OTLP exporter's transport on grpc-java, found through ServiceLoader.
     runtime_deps = ["@maven//:io_opentelemetry_opentelemetry_exporter_sender_grpc_managed_channel"],
     deps = [
         "//api/odradek/config/v1:config_java_proto",
+        "//api/odradek/delivery/v1:delivery_java_grpc",
+        "//api/odradek/delivery/v1:delivery_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
         "//api/odradek/kafka/v1:odradek_java_proto",
         "//extension/java:extension",
@@ -50,6 +53,13 @@ java_library(
         "@protobuf//java/core",
         "@protobuf//java/util",
     ],
+)
+
+# What the dispatcher tells sidecars about itself, read by Version.java.
+genrule(
+    name = "version",
+    outs = ["src/main/resources/odradek-server.version"],
+    cmd = "echo -n '%s' > $@" % VERSION,
 )
 
 # Netty's epoll transport (needed for AF_UNIX) ships its native code in a
@@ -213,7 +223,8 @@ java_library(
 
 java_junit_test(
     name = "main_test",
-    size = "small",
+    # About 40 s on a fast machine: over a small test's minute on a slow one.
+    size = "medium",
     srcs = glob(
         ["src/test/java/**/*.java"],
         exclude = _TEST_PKI,
@@ -232,8 +243,11 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.config.ConfigLoaderTest",
         "io.github.bpalermo.odradek.server.consume.ConsumeServiceTest",
         "io.github.bpalermo.odradek.server.consume.PartitionStateTest",
+        "io.github.bpalermo.odradek.server.dispatch.BatchesTest",
+        "io.github.bpalermo.odradek.server.dispatch.DeclarationsTest",
         "io.github.bpalermo.odradek.server.dispatch.DispatchCoreRandomTest",
         "io.github.bpalermo.odradek.server.dispatch.DispatchCoreTest",
+        "io.github.bpalermo.odradek.server.dispatch.DispatchServiceTest",
         "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
         "io.github.bpalermo.odradek.server.telemetry.KafkaClientMetricsTest",
@@ -249,6 +263,8 @@ java_junit_test(
         ":server_lib",
         ":test_pki",
         "//api/odradek/config/v1:config_java_proto",
+        "//api/odradek/delivery/v1:delivery_java_grpc",
+        "//api/odradek/delivery/v1:delivery_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
         "//api/odradek/kafka/v1:odradek_java_proto",
         "//extension/java:extension",

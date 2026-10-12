@@ -259,7 +259,7 @@ public final class ConsumeService {
             properties(
                 cluster,
                 first.getGroupId(),
-                streamCounter.incrementAndGet(),
+                "odradek-" + first.getGroupId() + "-" + streamCounter.incrementAndGet(),
                 maxProcessingMs + revokeDeadlineMs + POLL_INTERVAL_MARGIN_MS);
         tls.apply(clusterName, properties);
         metrics.kafkaClients().applyToConsumer(clusterName, first.getGroupId(), topics, properties);
@@ -355,11 +355,15 @@ public final class ConsumeService {
   }
 
   /**
-   * The consumer configuration of a stream: the cluster's shared and consumer properties, with the
-   * settings the delivery guarantees rest on set last.
+   * The configuration of a consumer the server creates: the cluster's shared and consumer
+   * properties, with the settings the delivery guarantees rest on set last.
+   *
+   * @param clientId the client id, unless the cluster's properties set one
+   * @param minPollIntervalMs the least {@code max.poll.interval.ms} the consumer's owner can live
+   *     with: the longest it may go without polling, with a margin
    */
-  static Map<String, Object> properties(
-      Cluster cluster, String groupId, long stream, long minPollIntervalMs) {
+  public static Map<String, Object> properties(
+      Cluster cluster, String groupId, String clientId, long minPollIntervalMs) {
     Map<String, Object> properties = new HashMap<>();
     properties.putAll(cluster.getPropertiesMap());
     properties.putAll(cluster.getConsumerPropertiesMap());
@@ -380,7 +384,7 @@ public final class ConsumeService {
     properties.put(
         ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG,
         String.valueOf(Math.min(Integer.MAX_VALUE, Math.max(configured, minPollIntervalMs))));
-    properties.putIfAbsent(ConsumerConfig.CLIENT_ID_CONFIG, "odradek-" + groupId + "-" + stream);
+    properties.putIfAbsent(ConsumerConfig.CLIENT_ID_CONFIG, clientId);
     return properties;
   }
 }

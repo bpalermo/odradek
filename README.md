@@ -7,7 +7,7 @@ odradek moves the Kafka client out of the application. Its server is a Java proc
 | Path | Contents |
 | --- | --- |
 | `api/odradek/kafka/v1/` | The `OdradekService` protobuf/gRPC API |
-| `api/odradek/delivery/v1/` | The `DeliveryService` protocol between a sidecar and a dispatcher (ADR 6); only the definitions exist so far |
+| `api/odradek/delivery/v1/` | The `DeliveryService` protocol between a sidecar and a dispatcher (ADR 6). The server serves it when it is a dispatcher; receiving from one is not built yet |
 | `bazel/proto/defs.bzl` | `odradek_proto_library`: one call per `.proto` declares its `proto_library`, lint test and Java, Python and Clojure libraries |
 | `server/` | The server `java_binary` (`src/main/java`, `src/test/java`) and its GraalVM native image (`native-image/` holds the reachability metadata) |
 | `client/core/` | The client protocol without I/O, shared by the JVM clients (ADR 1) |

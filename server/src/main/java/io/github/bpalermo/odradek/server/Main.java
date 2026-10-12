@@ -15,6 +15,8 @@ import io.github.bpalermo.odradek.server.codec.Extensions;
 import io.github.bpalermo.odradek.server.config.ConfigException;
 import io.github.bpalermo.odradek.server.config.ConfigLoader;
 import io.github.bpalermo.odradek.server.consume.ConsumeService;
+import io.github.bpalermo.odradek.server.dispatch.DeliveryServer;
+import io.github.bpalermo.odradek.server.dispatch.DispatchService;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
@@ -164,18 +166,35 @@ public final class Main {
     // it must have. Waits as long as it takes; the startup probe's failure threshold bounds it.
     RequiredClusters.await(config, tls, readiness);
 
-    OdradekServer server;
+    // A dispatcher that serves no app has nobody on the Unix socket, and no volume to bind it in.
+    OdradekServer server = null;
+    DispatchService dispatch = null;
+    DeliveryServer delivery = null;
     try {
       readiness.starting("listening");
-      server = OdradekServer.start(config, new OdradekService(produce, consume), health);
+      if (servesApp(config)) {
+        server = OdradekServer.start(config, new OdradekService(produce, consume), health);
+      } else {
+        LOG.info("no producers and no consumers: not listening on the app's Unix socket");
+      }
+      if (config.hasDispatch()) {
+        dispatch = new DispatchService(config, tls, metrics);
+        delivery = DeliveryServer.start(config.getDispatch(), dispatch);
+      }
     } catch (IOException e) {
       LOG.error("could not start", e);
+      if (server != null) {
+        server.close();
+      }
       producers.close(Duration.ZERO);
       tls.close();
       codecs.close();
       System.exit(1);
       return;
     }
+    OdradekServer app = server;
+    DispatchService dispatcher = dispatch;
+    DeliveryServer sidecars = delivery;
     readiness.started(tls);
     metrics.observe(tls, readiness, Clock.systemUTC());
     LOG.info("server epoch {}", produce.serverEpoch());
@@ -185,12 +204,24 @@ public final class Main {
                 () -> {
                   // No new streams; then every record already accepted gets its broker answer,
                   // and with it its result, before the open streams are closed.
-                  // Consumers commit what was acked and leave their groups.
+                  // Consumers commit what was acked and leave their groups; a dispatcher's
+                  // first wait for what their sidecars hold.
                   readiness.stopping();
-                  server.stopAccepting();
+                  if (app != null) {
+                    app.stopAccepting();
+                  }
+                  if (sidecars != null) {
+                    sidecars.stopAccepting();
+                  }
                   producers.flush();
                   consume.shutdown(Duration.ofSeconds(15));
-                  server.close();
+                  if (dispatcher != null) {
+                    dispatcher.shutdown(dispatcher.shutdownTimeout());
+                    sidecars.close();
+                  }
+                  if (app != null) {
+                    app.close();
+                  }
                   producers.close();
                   tls.close();
                   codecs.close();
@@ -199,19 +230,31 @@ public final class Main {
                   telemetry.close();
                 },
                 "shutdown"));
-    server.awaitTermination();
+    if (app != null) {
+      app.awaitTermination();
+    } else {
+      sidecars.awaitTermination();
+    }
   }
 
   /**
-   * Returns one line for each setting that the schema accepts and the server cannot honour yet: the
-   * dispatcher of ADR 6, of which only the schema exists. Starting anyway would mean consuming
-   * nothing while looking healthy, or consuming in a way the configuration does not say.
+   * Whether the server listens on the app's Unix socket: always, unless it is a dispatcher with
+   * neither producers nor consumers. Such a server has no app next to it, and usually no volume for
+   * the socket's directory.
+   */
+  static boolean servesApp(ServerConfig config) {
+    return !config.hasDispatch()
+        || config.getProducersCount() > 0
+        || config.getConsumersCount() > 0;
+  }
+
+  /**
+   * Returns one line for each setting that the schema accepts and the server cannot honour yet:
+   * receiving from a dispatcher (ADR 6), of which only the schema exists. Starting anyway would
+   * mean consuming nothing while looking healthy.
    */
   static List<String> notImplemented(ServerConfig config) {
     List<String> problems = new ArrayList<>();
-    if (config.hasDispatch()) {
-      problems.add("dispatch is set, and acting as a dispatcher is not implemented yet");
-    }
     for (Map.Entry<String, Consumer> entry : new TreeMap<>(config.getConsumersMap()).entrySet()) {
       if (entry.getValue().getSource() == ConsumerSource.CONSUMER_SOURCE_DISPATCHER) {
         problems.add(

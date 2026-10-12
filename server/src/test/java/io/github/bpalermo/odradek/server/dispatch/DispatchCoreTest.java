@@ -416,6 +416,32 @@ class DispatchCoreTest {
   }
 
   @Test
+  void aNewProcessingDeadlineAppliesToWhatIsSentFromThenOn() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    // Shorter: a record sent later is due before one sent earlier.
+    core.maxProcessing(Duration.ofNanos(DEADLINE / 4));
+    now += DEADLINE / 2;
+    assertThat(fetch(0, "1")).containsExactly(deliver("a", 0, 1));
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(DEADLINE / 2 + DEADLINE / 4));
+    assertThat(after(DEADLINE / 4)).containsExactly(deliver("a", 0, 1, 2));
+    // 0 keeps the deadline it was sent under, and its redelivery gets the new one.
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(DEADLINE));
+    assertThat(after(DEADLINE / 4)).containsExactly(deliver("a", 0, 0, 2), deliver("a", 0, 1, 3));
+    assertThat(after(DEADLINE / 4)).containsExactly(deliver("a", 0, 0, 3), deliver("a", 0, 1, 4));
+    // Longer again.
+    core.maxProcessing(Duration.ofNanos(DEADLINE));
+    core.maxProcessing(Duration.ofNanos(DEADLINE));
+    assertThat(fetch(0, "2")).containsExactly(deliver("a", 0, 2));
+    assertThat(after(DEADLINE / 4)).containsExactly(deliver("a", 0, 0, 4), deliver("a", 0, 1, 5));
+    assertThat(ack("a", 0, 0, 2)).containsExactly(commit(0, 3));
+    assertThat(core.nextDeadlineNanos()).isEmpty();
+    assertThat(core.inFlight()).isZero();
+  }
+
+  @Test
   void whatWasInFlightToAReceiverThatLeavesIsDeliveredAgain() {
     start(Ordering.NONE);
     assign(0, 0);
@@ -426,9 +452,10 @@ class DispatchCoreTest {
     // b has no credit left: 0 and 2 wait for it.
     assertThat(on(new ReceiverLeft<>("a"))).isEmpty();
     assertThat(core.inFlight()).isEqualTo(1);
-    assertThat(credits("b", 1)).containsExactly(deliver("b", 0, 0, 2));
+    // With the same attempt number: a receiver that leaves does not use one up.
+    assertThat(credits("b", 1)).containsExactly(deliver("b", 0, 0, 1));
     on(new ReceiverJoined<>("c"));
-    assertThat(credits("c", 1)).containsExactly(deliver("c", 0, 2, 2));
+    assertThat(credits("c", 1)).containsExactly(deliver("c", 0, 2, 1));
     assertThat(on(new ReceiverLeft<>("a"))).isEmpty();
     assertThat(ack("a", 0, 0, 2)).isEmpty();
   }
@@ -454,8 +481,8 @@ class DispatchCoreTest {
     assertThat(on(new ReceiverLeft<>("a"))).isEmpty();
     on(new ReceiverJoined<>("b"));
     // 1 still waits for 0, which is being tried again.
-    assertThat(credits("b", 10)).containsExactly(deliver("b", 0, 0, 2), deliver("b", 0, 2));
-    assertThat(after(DEADLINE)).containsExactly(deliver("b", 0, 0, 3), deliver("b", 0, 2, 2));
+    assertThat(credits("b", 10)).containsExactly(deliver("b", 0, 0, 1), deliver("b", 0, 2));
+    assertThat(after(DEADLINE)).containsExactly(deliver("b", 0, 0, 2), deliver("b", 0, 2, 2));
     assertThat(ack("b", 0, 0)).containsExactly(commit(0, 1), deliver("b", 0, 1));
   }
 
@@ -547,7 +574,7 @@ class DispatchCoreTest {
   }
 
   @Test
-  void everyKindOfFailureUsesAnAttempt() {
+  void aRejectionAndADeadlineUseAnAttemptAndAReceiverLeavingDoesNot() {
     maxAttempts = 3;
     onExhausted = OnExhausted.DEAD_LETTER;
     start(Ordering.PARTITION);
@@ -555,10 +582,46 @@ class DispatchCoreTest {
     receiver("a", 10);
     assertThat(fetch(0, "0", "1")).containsExactly(deliver("a", 0, 0));
     assertThat(reject("a", 0, 0)).containsExactly(deliver("a", 0, 0, 2));
-    assertThat(after(DEADLINE)).containsExactly(deliver("a", 0, 0, 3));
-    assertThat(on(new ReceiverLeft<>("a"))).containsExactly(new DeadLetter<>(0, 0, "0/0", 3));
-    receiver("b", 10);
+    // The second attempt is taken back, not failed: it is made again.
+    assertThat(on(new ReceiverLeft<>("a"))).isEmpty();
+    on(new ReceiverJoined<>("b"));
+    assertThat(credits("b", 10)).containsExactly(deliver("b", 0, 0, 2));
+    assertThat(after(DEADLINE)).containsExactly(deliver("b", 0, 0, 3));
+    assertThat(reject("b", 0, 0)).containsExactly(new DeadLetter<>(0, 0, "0/0", 3));
     assertThat(on(new DeadLetterWritten<>(0, 0))).containsExactly(commit(0, 1), deliver("b", 0, 1));
+  }
+
+  @Test
+  void receiversLeavingNeverExhaustARecord() {
+    // A rollout of the application with a limit and BLOCK: every pod leaves holding records.
+    maxAttempts = 1;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("r0", 10);
+    assertThat(fetch(0, "0", "1")).containsExactly(deliver("r0", 0, 0), deliver("r0", 0, 1));
+    for (int i = 1; i < 20; i++) {
+      assertThat(on(new ReceiverLeft<>("r" + (i - 1)))).isEmpty();
+      assertThat(core.inFlight()).isZero();
+      on(new ReceiverJoined<>("r" + i));
+      assertThat(credits("r" + i, 10))
+          .containsExactly(deliver("r" + i, 0, 0, 1), deliver("r" + i, 0, 1, 1));
+    }
+    assertThat(core.blockedOffset(0)).isEmpty();
+    assertThat(ack("r19", 0, 0, 1)).containsExactly(commit(0, 2));
+  }
+
+  @Test
+  void aRecordTakenBackIsNotCountedTwiceAgainstTheFetchBuffer() {
+    maxBufferedRecords = 2;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 1);
+    assertThat(fetch(0, "0", "1", "2")).containsExactly(deliver("a", 0, 0), new PauseFetching<>(0));
+    assertThat(on(new ReceiverLeft<>("a"))).isEmpty();
+    on(new ReceiverJoined<>("b"));
+    // 0 again, which frees nothing in the buffer; then 1, which brings it to half.
+    assertThat(credits("b", 1)).containsExactly(deliver("b", 0, 0, 1));
+    assertThat(credits("b", 1)).containsExactly(deliver("b", 0, 1), new ResumeFetching<>(0));
   }
 
   @Test
@@ -583,17 +646,17 @@ class DispatchCoreTest {
     assertThat(reject("a", 0, 1)).containsExactly(new PartitionBlocked<>(0, 1));
     assertThat(core.blockedOffset(0)).isEqualTo(OptionalLong.of(1));
     // Nothing after it is sent, for the first time or again; other partitions go on.
-    assertThat(on(new ReceiverLeft<>("a")))
-        .containsExactly(
-            new PartitionBlocked<>(0, 0),
-            new PartitionBlocked<>(0, 2),
-            new PartitionBlocked<>(0, 3));
-    assertThat(core.blockedOffset(0)).isEqualTo(OptionalLong.of(0));
-    receiver("b", 10);
+    // What a leaves holding is taken back without using an attempt: 0, before the blocked record,
+    // goes out again; 2 and 3, after it, wait.
+    assertThat(on(new ReceiverLeft<>("a"))).isEmpty();
+    assertThat(core.blockedOffset(0)).isEqualTo(OptionalLong.of(1));
+    on(new ReceiverJoined<>("b"));
+    assertThat(credits("b", 10)).containsExactly(deliver("b", 0, 0, 1));
     assertThat(fetch(0, "5")).isEmpty();
+    assertThat(ack("b", 0, 0)).containsExactly(commit(0, 1));
     assertThat(fetch(1, "0")).containsExactly(deliver("b", 1, 0));
     assertThat(after(10 * DEADLINE)).containsExactly(new PartitionBlocked<>(1, 0));
-    assertThat(core.committable(0)).isEqualTo(OptionalLong.of(0));
+    assertThat(core.committable(0)).isEqualTo(OptionalLong.of(1));
     assertThat(core.blockedOffset(2)).isEmpty();
   }
 
