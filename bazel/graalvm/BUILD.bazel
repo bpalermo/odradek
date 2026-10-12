@@ -1,0 +1,21 @@
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["defs.bzl"])
+
+# The GraalVM distribution for the CPU being built for. GraalVM cannot
+# cross-compile, so the target CPU is also the CPU of the machine that builds.
+alias(
+    name = "distribution",
+    actual = select({
+        "@platforms//cpu:aarch64": "@graalvm_linux_aarch64//:distribution",
+        "//conditions:default": "@graalvm_linux_x86_64//:distribution",
+    }),
+)
+
+bzl_library(
+    name = "defs",
+    srcs = ["defs.bzl"],
+    visibility = ["//visibility:private"],
+)

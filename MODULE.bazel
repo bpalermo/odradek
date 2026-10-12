@@ -155,3 +155,50 @@ pull(
     registry = "gcr.io",
     repository = "distroless/java25-debian13",
 )
+
+# --- GraalVM native image (//server:server_native) ---------------------------------
+# GraalVM Community Edition for JDK 25. rules_graalvm (the BCR module) is not
+# used: its latest release, 0.11.1, targets GraalVM 21 and the Bazel 6/7 rule
+# APIs. The one rule needed here is //bazel/graalvm:defs.bzl. native-image
+# cannot cross-compile, so each architecture builds on a machine of that
+# architecture and picks its own distribution (//bazel/graalvm:distribution).
+# Bump = new version + both sha256 (published beside each archive as *.sha256).
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+_GRAALVM_BUILD = """
+filegroup(
+    name = "distribution",
+    srcs = glob(["**"]),
+    visibility = ["//visibility:public"],
+)
+"""
+
+_GRAALVM_URL = "https://github.com/graalvm/graalvm-ce-builds/releases/download/jdk-25.0.2/graalvm-community-jdk-25.0.2_linux-%s_bin.tar.gz"
+
+http_archive(
+    name = "graalvm_linux_x86_64",
+    build_file_content = _GRAALVM_BUILD,
+    sha256 = "e0be791c8fda4d03b6b0a0cb824fef3149736170057b3a515252b44419606af0",
+    strip_prefix = "graalvm-community-openjdk-25.0.2+10.1",
+    url = _GRAALVM_URL % "x64",
+)
+
+http_archive(
+    name = "graalvm_linux_aarch64",
+    build_file_content = _GRAALVM_BUILD,
+    sha256 = "b4580d9f223d0a4b3a1757e58b18ff4c1db950e67e105fc5cb741457d2384a71",
+    strip_prefix = "graalvm-community-openjdk-25.0.2+10.1",
+    url = _GRAALVM_URL % "aarch64",
+)
+
+# The base of the native image: glibc and nothing else (no libjvm, no shell, no
+# libssl), nonroot variant (user 65532). The executable links zlib in and libc
+# dynamically (--static-nolibc), so this is all it needs. Pinned by index digest
+# like the Java base above.
+pull(
+    name = "distroless_base_nossl",
+    digest = "sha256:8c563c1fb5e120606f0d85733049775faed6192e2bd2223ef283a5393eec22b9",
+    layer_handling = "lazy",
+    registry = "gcr.io",
+    repository = "distroless/base-nossl-debian13",
+)

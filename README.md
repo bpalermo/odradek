@@ -7,7 +7,7 @@ odradek moves the Kafka client out of the application. Its server is a Java proc
 | Path | Contents |
 | --- | --- |
 | `api/odradek/kafka/v1/` | The `OdradekService` protobuf/gRPC API and its generated Java targets |
-| `server/` | The server `java_binary` (`src/main/java`, `src/test/java`) |
+| `server/` | The server `java_binary` (`src/main/java`, `src/test/java`) and its GraalVM native image (`native-image/` holds the reachability metadata) |
 | `client/core/` | The client protocol without I/O, shared by the JVM clients (ADR 1) |
 | `client/java/` | Java client library for applications |
 | `conformance/` | Scenarios every client core must pass |
@@ -37,6 +37,9 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 | Push the image (CI) | `bazel run //server:image_push` to `quay.io/odradek/odradek`, tags `dev` and `dev-<commit>`; its digest is in `bazel-bin/server/image_index_digest` |
 | Verify a published image's signatures | `bazel run //bazel/cosign:verify_image -- quay.io/odradek/odradek@sha256:<digest>` (exit 0 verified, 1 failed, 2 could not check) |
 | Run cosign | `bazel run //bazel/cosign -- <args>` |
+| Build the native image (linux, this machine's CPU) | `bazel build //server:server_native` (`make native`); needs `gcc` and `zlib1g-dev`, about 4 GB of memory and 1 to 2 minutes; excluded from `//...` |
+| Test the native image | `bazel test //server:native_config_test` (no broker), and `ODRADEK_E2E_KAFKA_A=localhost:9092 ODRADEK_E2E_KAFKA_B=localhost:9093 bazel test //e2e:e2e_native_binary_test --config=e2e` (the same end-to-end suite against it) |
+| Build and load the native image | `bazel build //server:image_native_manifest` and `bazel run //server:image_native_load` (as `localhost/odradek:e2e-native`; this machine's architecture only, as GraalVM does not cross-compile); `bazel run //server:image_native_push` pushes it as `dev-<commit>-native-<arch>`, and publish.yml assembles the index `dev-native` and `dev-<commit>-native` |
 | End-to-end tests | start two Kafka brokers, then `ODRADEK_E2E_KAFKA_A=localhost:9092 ODRADEK_E2E_KAFKA_B=localhost:9093 bazel test //e2e/... --config=e2e` (`make e2e`); excluded from plain `bazel test //...` |
 
 Formatting covers Java (google-java-format), Starlark (buildifier, including its lint) and protobuf (buf). Java is linted by Error Prone inside every `javac` action, with warnings as errors for first-party code; protos are linted by buf.

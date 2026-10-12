@@ -1,4 +1,4 @@
-.PHONY: build test format format-check lint repin tidy image image-load baseline e2e
+.PHONY: build test format format-check lint repin tidy image image-load native baseline e2e
 
 build:
 	@bazel build //...
@@ -27,6 +27,10 @@ image:
 
 image-load:
 	@bazel run //server:image_load
+
+# The GraalVM native image of the server; excluded from `make build`.
+native:
+	@bazel build //server:server_native
 
 # Regenerate api/baseline.binpb from the current protos (a release, or an accepted break).
 baseline:

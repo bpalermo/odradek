@@ -177,6 +177,128 @@ jobs:
       - name: bazel test //e2e/...
         run: bazel test //e2e/... --config=ci --config=e2e
 
+  # The GraalVM native image of the server (ADR 5), on a machine of each
+  # architecture because native-image does not cross-compile: build it, check
+  # how it treats configurations, run the end-to-end suite against it, and start
+  # the image. Excluded from `bazel build //...` (tag manual) so that the jobs
+  # above need no native-image toolchain. After `build`, like e2e.
+  native:
+    name: native (${{ matrix.arch }})
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    services:
+      # Each broker is a combined broker+controller node. The listener port
+      # inside the container equals the published one, because the advertised
+      # listener is what a client is told to reconnect to.
+      kafka-a:
+        image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:19092
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:19092
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 24
+      kafka-b:
+        image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+        ports:
+          - 9093:9093
+        env:
+          KAFKA_NODE_ID: 2
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9093,CONTROLLER://:19093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9093
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 2@localhost:19093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9093"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 24
+    env:
+      ODRADEK_E2E_KAFKA_A: localhost:9092
+      ODRADEK_E2E_KAFKA_B: localhost:9093
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-native-${{ matrix.arch }}
+          repository-cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # native-image links with gcc and the static zlib; the hosted images
+      # have both, this only makes sure.
+      - name: Toolchain for native-image
+        run: dpkg -s gcc zlib1g-dev >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc zlib1g-dev; }
+
+      # Everything publish.yml's native jobs build, so they cannot be the first
+      # place these targets are built.
+      - name: Build the native image and its push target
+        run: |
+          bazel build --config=ci \
+            //server:server_native //server:image_native_manifest //server:image_native_push
+
+      # No broker needed: starts, stops on SIGTERM, accepts Kafka's codecs and
+      # rejects a class the image does not contain.
+      - name: bazel test //server:native_config_test
+        run: bazel test --config=ci //server:native_config_test
+
+      - name: bazel test //e2e:e2e_native_binary_test
+        run: bazel test --config=ci --config=e2e //e2e:e2e_native_binary_test
+
+      # Same as the JVM image's smoke test: the image reads its configuration
+      # from the mounted volume, listens on the socket and stops on SIGTERM.
+      - name: Load the image, start it and stop it
+        run: |
+          set -euo pipefail
+          bazel run --config=ci //server:image_native_load
+          mkdir smoke && cp server/testdata/minimal.yaml smoke/odradek.yaml
+          docker run -d --name odradek \
+            -v "${PWD}/smoke:/etc/odradek:ro" \
+            --tmpfs /var/run/kafka:mode=1777 \
+            localhost/odradek:e2e-native
+          for _ in $(seq 1 30); do
+            if docker logs odradek 2>&1 | grep -q "listening on /var/run/kafka/kafka.sock"; then
+              break
+            fi
+            sleep 1
+          done
+          docker stop --time 20 odradek
+          docker logs odradek 2>&1 | tee image-run.log
+          grep -q "listening on /var/run/kafka/kafka.sock" image-run.log
+          grep -q "stopped" image-run.log
+
   # The single check the main ruleset requires, and the only reason this job
   # exists.
   #
@@ -190,7 +312,7 @@ jobs:
   # nothing, and a required check that never reports blocks the pull request.
   ci:
     name: ci
-    needs: [build, image, e2e]
+    needs: [build, image, e2e, native]
     if: always()
     runs-on: ubuntu-latest
     steps:

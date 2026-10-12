@@ -1,0 +1,1654 @@
+{
+  "reflection": [
+    {
+      "type": "boolean[]"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.AnyRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.AnyRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.BoolRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.BoolRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.BytesRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.BytesRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.BytesRules$WellKnownCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.DoubleRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.DoubleRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.DoubleRules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.DoubleRules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.DurationRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.DurationRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.DurationRules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.DurationRules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.EnumRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.EnumRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldMaskRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldMaskRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldPath"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldPath$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldPathElement"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldPathElement$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldPathElement$SubscriptCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FieldRules$TypeCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Fixed32Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Fixed32Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Fixed32Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Fixed32Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Fixed64Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Fixed64Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Fixed64Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Fixed64Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FloatRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FloatRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FloatRules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.FloatRules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Ignore"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Int32Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Int32Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Int32Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Int32Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Int64Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Int64Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Int64Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Int64Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.KnownRegex"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.MapRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.MapRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.MessageOneofRule"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.MessageOneofRule$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.MessageRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.MessageRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.OneofRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.OneofRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.PredefinedRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.PredefinedRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.RepeatedRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.RepeatedRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Rule"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Rule$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SFixed32Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SFixed32Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SFixed32Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SFixed32Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SFixed64Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SFixed64Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SFixed64Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SFixed64Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SInt32Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SInt32Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SInt32Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SInt32Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SInt64Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SInt64Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SInt64Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.SInt64Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.StringRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.StringRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.StringRules$WellKnownCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.TimestampRules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.TimestampRules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.TimestampRules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.TimestampRules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.UInt32Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.UInt32Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.UInt32Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.UInt32Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.UInt64Rules"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.UInt64Rules$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.UInt64Rules$GreaterThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.UInt64Rules$LessThanCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Violation"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Violation$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Violations"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "build.buf.validate.Violations$Builder"
+    },
+    {
+      "type": "byte[]"
+    },
+    {
+      "type": "char[]"
+    },
+    {
+      "fields": [
+        {
+          "name": "dstPos"
+        },
+        {
+          "name": "srcPos"
+        }
+      ],
+      "jniAccessible": true,
+      "type": "com.github.luben.zstd.ZstdInputStreamNoFinalizer"
+    },
+    {
+      "fields": [
+        {
+          "name": "dstPos"
+        },
+        {
+          "name": "srcPos"
+        }
+      ],
+      "jniAccessible": true,
+      "type": "com.github.luben.zstd.ZstdOutputStreamNoFinalizer"
+    },
+    {
+      "fields": [
+        {
+          "name": "listenersField"
+        },
+        {
+          "name": "valueField"
+        },
+        {
+          "name": "waitersField"
+        }
+      ],
+      "type": "com.google.common.util.concurrent.AbstractFutureState"
+    },
+    {
+      "fields": [
+        {
+          "name": "next"
+        },
+        {
+          "name": "thread"
+        }
+      ],
+      "type": "com.google.common.util.concurrent.AbstractFutureState$Waiter"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.Any"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.BoolValue"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.BytesValue"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.DoubleValue"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.Duration"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.Empty"
+    },
+    {
+      "methods": [
+        {
+          "name": "getEmptyRegistry",
+          "parameterTypes": []
+        }
+      ],
+      "type": "com.google.protobuf.ExtensionRegistry"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.FieldMask"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.FloatValue"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.Int32Value"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.Int64Value"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.ListValue"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.StringValue"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.Struct"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.Timestamp"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.UInt32Value"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.UInt64Value"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "com.google.protobuf.Value"
+    },
+    {
+      "type": "double[]"
+    },
+    {
+      "type": "float[]"
+    },
+    {
+      "type": "int[]"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Admin"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Admin$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Cluster"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Cluster$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Cluster$ConsumerPropertiesDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Cluster$ProducerPropertiesDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Cluster$PropertiesDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Codec"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Codec$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Consume"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Consume$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Consumer"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Consumer$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Contracts"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Contracts$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.FileSource"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.FileSource$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Listener"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Listener$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.OffsetReset"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.OnDecodeError"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Pipeline"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Pipeline$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Pipeline$PropertiesDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Produce"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Produce$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ProduceTarget"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ProduceTarget$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Producer"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Producer$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$Builder$ClustersConverter"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$Builder$CodecsConverter"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$Builder$ConsumersConverter"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$Builder$ProducersConverter"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$ClustersDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$CodecsDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$ConsumersDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ServerConfig$ProducersDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.SpiffeSource"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.SpiffeSource$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Tls"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Tls$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Tls$SourceCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Transform"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Transform$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Transform$PropertiesDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Ack"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Ack$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Assigned"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Assigned$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ConsumeRequest"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ConsumeRequest$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ConsumeRequest$MsgCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ConsumeResponse"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ConsumeResponse$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ConsumeResponse$MsgCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ConsumedRecord"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ConsumedRecord$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Credits"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Credits$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Error"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Error$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ErrorCode"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Header"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Header$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Lost"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Lost$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.PartitionAssignment"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.PartitionAssignment$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceOpen"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceOpen$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceReady"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceReady$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceRecord"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceRecord$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceRequest"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceRequest$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceRequest$MsgCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceResponse"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceResponse$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceResponse$MsgCase"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceResult"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ProduceResult$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.RecordBatch"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.RecordBatch$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.RecordMetadata"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.RecordMetadata$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.RevokeDone"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.RevokeDone$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Revoked"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Revoked$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Subscribe"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Subscribe$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Subscribed"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.Subscribed$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.TopicPartition"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.TopicPartition$Builder"
+    },
+    {
+      "fields": [
+        {
+          "name": "fd"
+        }
+      ],
+      "jniAccessible": true,
+      "type": "java.io.FileDescriptor"
+    },
+    {
+      "jniAccessible": true,
+      "type": "java.io.IOException"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "jniAccessible": true,
+      "methods": [
+        {
+          "name": "getBoolean",
+          "parameterTypes": [
+            "java.lang.String"
+          ]
+        }
+      ],
+      "type": "java.lang.Boolean"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "type": "java.lang.Byte"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "type": "java.lang.Character"
+    },
+    {
+      "methods": [
+        {
+          "name": "getModule",
+          "parameterTypes": []
+        }
+      ],
+      "type": "java.lang.Class"
+    },
+    {
+      "type": "java.lang.Deprecated"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "type": "java.lang.Double"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "type": "java.lang.Float"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "type": "java.lang.Integer"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "type": "java.lang.Long"
+    },
+    {
+      "methods": [
+        {
+          "name": "isNativeAccessEnabled",
+          "parameterTypes": []
+        }
+      ],
+      "type": "java.lang.Module"
+    },
+    {
+      "jniAccessible": true,
+      "type": "java.lang.OutOfMemoryError"
+    },
+    {
+      "methods": [
+        {
+          "name": "current",
+          "parameterTypes": []
+        },
+        {
+          "name": "pid",
+          "parameterTypes": []
+        }
+      ],
+      "type": "java.lang.ProcessHandle"
+    },
+    {
+      "jniAccessible": true,
+      "type": "java.lang.RuntimeException"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "type": "java.lang.Short"
+    },
+    {
+      "type": "java.lang.StackTraceElement"
+    },
+    {
+      "type": "java.lang.String"
+    },
+    {
+      "type": "java.lang.String[]"
+    },
+    {
+      "methods": [
+        {
+          "name": "isVirtual",
+          "parameterTypes": []
+        }
+      ],
+      "type": "java.lang.Thread"
+    },
+    {
+      "fields": [
+        {
+          "name": "TYPE"
+        }
+      ],
+      "type": "java.lang.Void"
+    },
+    {
+      "methods": [
+        {
+          "name": "byteArrayViewVarHandle",
+          "parameterTypes": [
+            "java.lang.Class",
+            "java.nio.ByteOrder"
+          ]
+        },
+        {
+          "name": "byteBufferViewVarHandle",
+          "parameterTypes": [
+            "java.lang.Class",
+            "java.nio.ByteOrder"
+          ]
+        },
+        {
+          "name": "privateLookupIn",
+          "parameterTypes": [
+            "java.lang.Class",
+            "java.lang.invoke.MethodHandles$Lookup"
+          ]
+        }
+      ],
+      "type": "java.lang.invoke.MethodHandles"
+    },
+    {
+      "methods": [
+        {
+          "name": "findVarHandle",
+          "parameterTypes": [
+            "java.lang.Class",
+            "java.lang.String",
+            "java.lang.Class"
+          ]
+        }
+      ],
+      "type": "java.lang.invoke.MethodHandles$Lookup"
+    },
+    {
+      "methods": [
+        {
+          "name": "acquireFence",
+          "parameterTypes": []
+        }
+      ],
+      "type": "java.lang.invoke.VarHandle"
+    },
+    {
+      "type": "java.math.BigDecimal"
+    },
+    {
+      "type": "java.math.BigInteger"
+    },
+    {
+      "jniAccessible": true,
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "java.lang.String",
+            "int"
+          ]
+        }
+      ],
+      "type": "java.net.InetSocketAddress"
+    },
+    {
+      "jniAccessible": true,
+      "type": "java.net.PortUnreachableException"
+    },
+    {
+      "fields": [
+        {
+          "name": "limit"
+        },
+        {
+          "name": "position"
+        }
+      ],
+      "jniAccessible": true,
+      "methods": [
+        {
+          "name": "limit",
+          "parameterTypes": []
+        },
+        {
+          "name": "position",
+          "parameterTypes": []
+        }
+      ],
+      "type": "java.nio.Buffer"
+    },
+    {
+      "methods": [
+        {
+          "name": "alignedSlice",
+          "parameterTypes": [
+            "int"
+          ]
+        },
+        {
+          "name": "put",
+          "parameterTypes": [
+            "int",
+            "java.nio.ByteBuffer",
+            "int",
+            "int"
+          ]
+        },
+        {
+          "name": "put",
+          "parameterTypes": [
+            "int",
+            "byte[]",
+            "int",
+            "int"
+          ]
+        },
+        {
+          "name": "slice",
+          "parameterTypes": [
+            "int",
+            "int"
+          ]
+        }
+      ],
+      "type": "java.nio.ByteBuffer"
+    },
+    {
+      "type": "java.nio.DirectByteBuffer"
+    },
+    {
+      "jniAccessible": true,
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "java.nio.channels.ClosedChannelException"
+    },
+    {
+      "type": "java.nio.channels.FileChannel"
+    },
+    {
+      "type": "java.time.Instant"
+    },
+    {
+      "jniAccessible": true,
+      "methods": [
+        {
+          "name": "asList",
+          "parameterTypes": [
+            "java.lang.Object[]"
+          ]
+        }
+      ],
+      "type": "java.util.Arrays"
+    },
+    {
+      "type": "java.util.Date"
+    },
+    {
+      "methods": [
+        {
+          "name": "nextBytes",
+          "parameterTypes": [
+            "byte[]"
+          ]
+        }
+      ],
+      "type": "java.util.SplittableRandom"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        },
+        {
+          "name": "add",
+          "parameterTypes": [
+            "long"
+          ]
+        }
+      ],
+      "type": "java.util.concurrent.atomic.LongAdder"
+    },
+    {
+      "type": "long[]"
+    },
+    {
+      "fields": [
+        {
+          "name": "INSTANCE"
+        }
+      ],
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": [
+            "int"
+          ]
+        }
+      ],
+      "type": "net.jpountz.lz4.LZ4HCJNICompressor"
+    },
+    {
+      "fields": [
+        {
+          "name": "INSTANCE"
+        }
+      ],
+      "type": "net.jpountz.lz4.LZ4JNICompressor"
+    },
+    {
+      "fields": [
+        {
+          "name": "INSTANCE"
+        }
+      ],
+      "type": "net.jpountz.lz4.LZ4JNISafeDecompressor"
+    },
+    {
+      "fields": [
+        {
+          "name": "INSTANCE"
+        }
+      ],
+      "type": "net.jpountz.xxhash.StreamingXXHash32JNI$Factory"
+    },
+    {
+      "fields": [
+        {
+          "name": "INSTANCE"
+        }
+      ],
+      "type": "net.jpountz.xxhash.StreamingXXHash64JNI$Factory"
+    },
+    {
+      "fields": [
+        {
+          "name": "INSTANCE"
+        }
+      ],
+      "type": "net.jpountz.xxhash.XXHash32JNI"
+    },
+    {
+      "fields": [
+        {
+          "name": "INSTANCE"
+        }
+      ],
+      "type": "net.jpountz.xxhash.XXHash64JNI"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.clients.consumer.CooperativeStickyAssignor"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.clients.consumer.RangeAssignor"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.clients.consumer.RoundRobinAssignor"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.clients.consumer.StickyAssignor"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.metrics.JmxReporter"
+    },
+    {
+      "type": "org.apache.kafka.common.security.oauthbearer.DefaultJwtRetriever"
+    },
+    {
+      "type": "org.apache.kafka.common.security.oauthbearer.DefaultJwtValidator"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.BooleanDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.BooleanSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.ByteArrayDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.ByteArraySerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.ByteBufferDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.ByteBufferSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.BytesDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.BytesSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.DoubleDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.DoubleSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.FloatDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.FloatSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.IntegerDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.IntegerSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.LongDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.LongSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.ShortDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.ShortSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.StringDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.StringSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.UUIDDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.UUIDSerializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.VoidDeserializer"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.common.serialization.VoidSerializer"
+    },
+    {
+      "type": "org.apache.kafka.common.utils.AppInfoParser$AppInfo"
+    },
+    {
+      "type": "org.apache.kafka.common.utils.AppInfoParser$AppInfoMBean"
+    },
+    {
+      "methods": [
+        {
+          "name": "getEmptyRegistry",
+          "parameterTypes": []
+        }
+      ],
+      "type": "org.apache.kafka.shaded.com.google.protobuf.ExtensionRegistry"
+    },
+    {
+      "type": "short[]"
+    },
+    {
+      "fields": [
+        {
+          "name": "fd"
+        }
+      ],
+      "jniAccessible": true,
+      "type": "sun.nio.ch.FileChannelImpl"
+    }
+  ],
+  "resources": [
+    {
+      "glob": "META-INF/native/libnetty_transport_native_epoll_*.so"
+    },
+    {
+      "glob": "kafka/kafka-version.properties"
+    },
+    {
+      "glob": "linux/*/libzstd-jni-*.so"
+    },
+    {
+      "glob": "net/jpountz/util/linux/*/liblz4-java.so"
+    }
+  ]
+}
