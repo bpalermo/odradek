@@ -13,7 +13,9 @@
            [java.nio.file.attribute FileAttribute]
            [java.util UUID]
            [java.util.concurrent CompletableFuture ExecutionException TimeUnit]
-           [org.apache.kafka.clients.admin Admin NewTopic]))
+           [org.apache.kafka.clients.admin Admin NewTopic OffsetSpec]
+           [org.apache.kafka.common TopicPartition]
+           [org.apache.kafka.common.errors RetriableException]))
 
 (def ^:private timeout-ms 60000)
 (def ^:private partitions 4)
@@ -42,11 +44,32 @@
   (Admin/create ^java.util.Map {"bootstrap.servers" bootstrap}))
 
 (defn- create-topic!
+  "Creates a topic and waits until every partition's leader answers. Producing in
+  the gap between the two can wedge Kafka's idempotent producer until its
+  delivery timeout; see ServerHarness.createTopic in the Java suite."
   [bootstrap topic]
-  (with-open [admin (admin bootstrap)]
+  (with-open [^Admin admin (admin bootstrap)]
     (-> (.createTopics admin [(NewTopic. ^String topic (int partitions) (short 1))])
         (.all)
-        (.get))))
+        (.get))
+    (let [ends (into {}
+                     (map (fn [p] [(TopicPartition. topic (int p)) (OffsetSpec/latest)]))
+                     (range partitions))
+          deadline (+ (System/nanoTime) (* timeout-ms 1000000))]
+      (loop []
+        (let [answered? (try
+                          (-> (.listOffsets admin ^java.util.Map ends)
+                              (.all)
+                              (.get 30 TimeUnit/SECONDS))
+                          true
+                          (catch ExecutionException e
+                            (if (and (instance? RetriableException (.getCause e))
+                                     (< (System/nanoTime) deadline))
+                              false
+                              (throw e))))]
+          (when-not answered?
+            (Thread/sleep 50)
+            (recur)))))))
 
 (defn- delete-topic!
   [bootstrap topic]
