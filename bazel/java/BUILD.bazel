@@ -1,4 +1,49 @@
+load("@protobuf//bazel/toolchains:proto_lang_toolchain.bzl", "proto_lang_toolchain")
+load("@rules_java//java:defs.bzl", "java_library")
+
 exports_files([
     "defs.bzl",
     "junit.bzl",
 ])
+
+# Runtime that every generated Java proto class links against: the protobuf
+# runtime plus protovalidate-java. The protovalidate jar already contains the
+# generated build.buf.validate classes (ValidateProto, FieldRules, ...), so they
+# must come from there and nowhere else.
+java_library(
+    name = "proto_runtime",
+    exports = [
+        "@maven//:build_buf_protovalidate",
+        "@protobuf//java/core",
+    ],
+)
+
+# A copy of protobuf's Java proto_lang_toolchain whose blacklist adds
+# buf/validate/validate.proto. Without it, java_proto_library's aspect would
+# also generate build.buf.validate.* from the @protovalidate proto module and
+# the classpath would hold two copies next to protovalidate-java's. Registered
+# in MODULE.bazel ahead of protobuf's own (Bazel 9 resolves it by toolchain
+# type; the old --proto_toolchain_for_java flag is ignored).
+proto_lang_toolchain(
+    name = "proto_toolchain",
+    blacklisted_protos = [
+        "@protobuf//:java_features_proto",
+        "@protobuf//:any_proto",
+        "@protobuf//:api_proto",
+        "@protobuf//:compiler_plugin_proto",
+        "@protobuf//:descriptor_proto",
+        "@protobuf//:duration_proto",
+        "@protobuf//:empty_proto",
+        "@protobuf//:field_mask_proto",
+        "@protobuf//:source_context_proto",
+        "@protobuf//:struct_proto",
+        "@protobuf//:timestamp_proto",
+        "@protobuf//:type_proto",
+        "@protobuf//:wrappers_proto",
+        "@protovalidate//proto/protovalidate/buf/validate:validate_proto",
+    ],
+    command_line = "--java_out=$(OUT)",
+    runtime = ":proto_runtime",
+    toolchain_type = "@protobuf//bazel/private:java_toolchain_type",
+    visibility = ["//visibility:public"],
+)

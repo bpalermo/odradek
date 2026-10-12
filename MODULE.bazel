@@ -12,6 +12,9 @@ bazel_dep(name = "rules_jvm_external", version = "7.1")
 bazel_dep(name = "protobuf", version = "36.2")
 bazel_dep(name = "grpc-java", version = "1.84.0")
 
+# buf.validate protos (buf/validate/validate.proto) for protovalidate rules in config protos.
+bazel_dep(name = "protovalidate", version = "1.2.2")
+
 # grpc-java builds its protoc plugin AND protoc itself from C++ source (hundreds
 # of C++ compiles). The patch repoints its codegen at the prebuilt
 # protoc-gen-grpc-java from Maven Central (http_file repos below) and at the
@@ -31,6 +34,9 @@ single_version_override(
 bazel_dep(name = "aspect_rules_lint", version = "2.9.1")
 bazel_dep(name = "buildifier_prebuilt", version = "10.1.0")
 bazel_dep(name = "rules_buf", version = "0.5.4")
+
+# Java proto codegen skips buf/validate/validate.proto; protovalidate-java supplies it.
+register_toolchains("//bazel/java:proto_toolchain_toolchain")
 
 # --- Maven ---------------------------------------------------------------------
 # One `@maven` repository for the whole workspace. The grpc-java module installs
@@ -53,6 +59,14 @@ maven.install(
         "io.netty:netty-transport-native-epoll:jar:linux-x86_64:4.2.16.Final",
         "io.netty:netty-transport-native-epoll:jar:linux-aarch_64:4.2.16.Final",
         "io.netty:netty-transport-native-unix-common:4.2.16.Final",
+        # protovalidate (Java runtime) evaluates the buf.validate rules of the config
+        # protos. Its jar bundles the generated build.buf.validate classes; see
+        # //bazel/java:proto_toolchain for how they are kept off the classpath twice.
+        # protobuf-java-util resolves to the source-built @protobuf//java/util via
+        # grpc-java's maven.override, so there is still a single protobuf runtime.
+        "build.buf:protovalidate:1.3.0",
+        "com.google.protobuf:protobuf-java-util:4.36.2",
+        "org.snakeyaml:snakeyaml-engine:3.2",
         # Logging: the slf4j API in code, logback behind it in the sidecar binary.
         "org.slf4j:slf4j-api:2.0.20",
         "ch.qos.logback:logback-classic:1.5.38",

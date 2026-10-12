@@ -70,7 +70,7 @@ flowchart LR
 
 ### Multiple clusters
 
-The sidecar serves a set of named clusters. A stream selects one in its handshake (`ProduceOpen.cluster`, `Subscribe.cluster`); empty means the configured default. The cluster is never chosen per record: mixing clusters inside one stream would put them in one ordering domain and one window, and a slow cluster would block records bound for a healthy one.
+The sidecar serves a set of named clusters. A Produce stream selects one in its handshake (`ProduceOpen.cluster`); empty means the configured default. A Consume stream names topics; each topic is declared in the configuration, and that entry names its cluster explicitly. The cluster is never chosen per record: mixing clusters inside one stream would put them in one ordering domain and one window, and a slow cluster would block records bound for a healthy one.
 
 ```yaml
 # /etc/odradek/odradek.yaml
@@ -81,15 +81,22 @@ clusters:
     properties:
       bootstrap.servers: orders-kafka:9093
     tls:
-      source: spiffe
-      acceptedIds: ["spiffe://example.org/ns/kafka/sa/orders-broker"]
+      spiffe: {}
+      acceptedSpiffeIds: ["spiffe://example.org/ns/kafka/sa/orders-broker"]
   analytics:
     required: false
     properties:
       bootstrap.servers: analytics-kafka:9093
     tls:
-      source: files
-      dir: /etc/odradek/tls/analytics
+      files:
+        dir: /etc/odradek/tls/analytics
+consumers:                   # keyed by topic name
+  orders.created:
+    cluster: orders          # required, must name an entry in clusters
+    groupId: billing
+  orders.cancelled:
+    cluster: orders
+    groupId: billing
 ```
 
 - **Isolation**: each cluster has its own producer, `buffer.memory`, in-flight window and consumers. A cluster that is down stalls only the streams bound to it.
@@ -100,6 +107,10 @@ clusters:
 - **Credentials**: each cluster has its own credential source, trust bundle and accepted broker IDs. Clusters using `spiffe` share the pod's SVID and one Workload API watch; federated bundles cover brokers in another trust domain.
 - **Metrics and health**: every series carries a `cluster` label; the admin endpoint reports status per cluster.
 - **Hot reload**: the diff is per cluster. Only changed clusters get a producer swap or consumer rebuild. A cluster can be added at runtime. Removing one drains its streams (flush, commit) and then closes them with `UNAVAILABLE`.
+- **Consumers**: where a topic is consumed from is configuration, not an API parameter.
+  - `consumers` is keyed by topic name. Each entry fixes the cluster and consumer group for that topic. The cluster reference is mandatory; there is no fallback to the default cluster, and a reference to a missing cluster makes the configuration invalid.
+  - The app sends `Subscribe{topics: [...]}` and gets the resolved cluster and group back in `Subscribed`.
+  - One stream is one Kafka consumer, so all topics of a stream must resolve to the same cluster and group; otherwise the stream fails with `FAILED_PRECONDITION`. A topic without an entry fails it with `NOT_FOUND`.
 - **Cross-cluster flows**: consuming from one cluster and producing to another works by opening one stream on each, at-least-once. A transaction cannot span clusters.
 
 ### Configuration and hot reload
@@ -110,6 +121,18 @@ clusters:
 - Files referenced by the configuration (truststores, keystores, SASL credential files) are part of the watched set.
 - The sidecar enforces the settings the guarantees depend on: `acks=all`, `enable.idempotence=true`, `max.in.flight.requests.per.connection<=5`, `enable.auto.commit=false`, `partition.assignment.strategy=cooperative-sticky` (classic group protocol). A configuration that contradicts them is invalid. The app cannot change them over the API.
 
+**Schema and validation**
+
+- All protos in `api/` use protobuf Edition 2024. Fields have explicit presence by default, so the sidecar can tell "not set, use the default" from an explicit zero, and mandatory fields are marked `required` in protovalidate.
+- The configuration schema is a protobuf message, `odradek.config.v1.SidecarConfig` in [`api/odradek/config/v1/config.proto`](../api/odradek/config/v1/config.proto). There is no hand-written config model.
+- The file is YAML (or JSON) in the protobuf JSON mapping. YAML is converted to JSON and parsed with the protobuf JSON parser in strict mode, so an unknown or misspelled field is an error rather than silently ignored.
+- Constraints are declared in the schema with [protovalidate](https://github.com/bufbuild/protovalidate) and evaluated by `protovalidate-java`:
+  - Field rules: cluster name pattern, absolute paths, port range, positive durations, `spiffe://` prefixes.
+  - Cross-field CEL rules: `default_cluster` names an existing cluster, every consumer topic references an existing cluster, `bootstrap.servers` is set, a `spiffe` source has a peer policy, default processing deadline does not exceed the maximum.
+  - The enforced Kafka settings above are CEL rules on `Cluster`. They may be omitted (the sidecar sets them) but not set to a weaker value. `ssl.keystore.*`, `ssl.truststore.*` and `ssl.engine.factory.class` are rejected, because TLS material belongs to the `tls` block.
+- Validation reports every violation with its field path and rule id; the reload-failure log line and the admin endpoint carry them.
+- Checks that need the outside world (referenced files exist and parse, brokers reachable) run after schema validation, in code.
+
 **Watching**
 
 - `java.nio.file.WatchService`, which is inotify on Linux, on the config directory and on the parent directory of every referenced file.
@@ -119,7 +142,7 @@ clusters:
 
 **Applying a change**
 
-1. Parse and validate the complete new configuration, including the enforced settings.
+1. Parse the complete new configuration into `SidecarConfig` and validate it with protovalidate, then run the non-schema checks.
 2. If invalid: keep running on the last good configuration, log the reason, increment `config_reload_failures_total`. Liveness is not affected.
 3. If valid: diff against the running configuration and apply per the table below, then publish the new content hash and reload timestamp on the admin endpoint and as metrics.
 
@@ -131,7 +154,8 @@ At startup there is no last good configuration, so an invalid or missing one fai
 | Produce window sizes | New streams only (the window is advertised once per stream) | No |
 | mTLS key material and trust bundle | In-memory swap inside the running clients (see "mTLS credential rotation") | No |
 | Kafka producer properties, SASL credentials | Producer swap (below) | Latency blip only |
-| Kafka consumer properties, SASL credentials | Consumer rebuild (below) | `Revoked` then `Assigned` |
+| A topic's `cluster` or `groupId`; Kafka consumer properties, SASL credentials | Consumer rebuild (below) for the streams reading that topic. If the stream's topics no longer share one cluster and group, it is closed with `FAILED_PRECONDITION` after the revoke handshake | `Revoked` then `Assigned`, or stream ends |
+| A topic's entry removed | Revoke handshake, commit, close the streams reading that topic with `NOT_FOUND` | Stream ends |
 | Socket path, admin port | Not reloadable; logged and flagged in `config_restart_required` | No, until restart |
 
 **Producer swap**
@@ -173,7 +197,7 @@ The reference is [java-spiffe](https://github.com/spiffe/java-spiffe) and its `j
 | Source | How it updates | When to use |
 |---|---|---|
 | `spiffe` (default for mTLS) | `java-spiffe-core` `X509Source` watching the SPIRE agent's Workload API socket; update callback swaps the snapshot | Clusters with SPIRE. The private key never touches disk. |
-| `files` | PEM or PKCS12 files on a volume, written by `java-spiffe-helper`, `spiffe-helper`, cert-manager or similar; the directory watcher above detects the change, the new material is parsed and validated, then swapped | No Workload API access, or non-SPIFFE PKI |
+| `files` | PEM files on a volume, written by `java-spiffe-helper`, `spiffe-helper`, cert-manager or similar; the directory watcher above detects the change, the new material is parsed and validated, then swapped | No Workload API access, or non-SPIFFE PKI |
 
 - A snapshot that fails validation (key does not match the leaf, chain does not verify against the bundle, already expired) is rejected; the previous one stays in use and `credential_reload_failures_total` increments.
 - Metrics: SVID `not_after` timestamp, last successful rotation, rotation count. Alert on time-to-expiry, not on rotation events.
@@ -305,7 +329,7 @@ Each phase ends with something runnable and tested.
 
 **Phase 1 — Sidecar skeleton**
 - Cluster registry: named clusters, default cluster, required/optional startup gating, per-cluster status.
-- Configuration loading from the volume, validation and enforcement of the guarantee-bearing Kafka settings.
+- Configuration loading from the volume: YAML to `SidecarConfig`, strict parsing, protovalidate, defaults, Kafka property merging.
 - Directory watcher (`..data` swap aware), debounce, last-good fallback, reload metrics. The producer swap and consumer rebuild hooks land with phases 2 and 3.
 - `CredentialSource` (`spiffe` and `files`) and `ReloadingSslEngineFactory`; rotation test against a fake Workload API.
 - gRPC server on the Unix socket with peer-credential check.

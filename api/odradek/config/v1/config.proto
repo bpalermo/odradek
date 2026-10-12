@@ -1,0 +1,281 @@
+edition = "2024";
+
+// The configuration schema of the Odradek sidecar.
+//
+// The sidecar reads one file in this schema from a mounted volume, watches it
+// and applies changes without restarting. Constraints are declared with
+// protovalidate; a file that violates any of them is rejected as a whole and
+// the sidecar keeps its last valid configuration.
+package odradek.config.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/duration.proto";
+
+option java_outer_classname = "ConfigProto";
+option java_package = "io.github.bpalermo.odradek.config.v1";
+
+// SidecarConfig is the root of the sidecar configuration file.
+//
+// The file is YAML or JSON in the protobuf JSON mapping (field names in
+// lowerCamelCase, durations as strings such as "30s"). It is parsed strictly:
+// an unknown field is an error. Unset fields mean "use the documented
+// default" unless stated otherwise.
+message SidecarConfig {
+  option (buf.validate.message).cel = {
+    id: "sidecar_config.default_cluster_exists"
+    message: "default_cluster must name an entry in clusters"
+    expression: "this.default_cluster in this.clusters"
+  };
+  option (buf.validate.message).cel = {
+    id: "sidecar_config.consumer_cluster_exists"
+    message: "every consumer must reference an entry in clusters"
+    expression: "this.consumers.all(topic, this.consumers[topic].cluster in this.clusters)"
+  };
+
+  // Where the app-facing gRPC server listens. Not hot-reloadable: a change
+  // takes effect at the next sidecar restart.
+  Listener listener = 1;
+  // The health and metrics endpoint. Not hot-reloadable: a change takes
+  // effect at the next sidecar restart.
+  Admin admin = 2;
+
+  // Name of the cluster used by Produce streams that leave
+  // ProduceOpen.cluster empty. Must be a key of `clusters`. Required.
+  string default_cluster = 3 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.min_len = 1
+  ];
+
+  // Kafka clusters by name. The name is what apps pass in
+  // ProduceOpen.cluster and what `consumers` entries reference. Names are
+  // lowercase alphanumerics and dashes, at most 63 characters. At least one
+  // cluster is required.
+  map<string, Cluster> clusters = 4 [(buf.validate.field).map = {
+    min_pairs: 1
+    keys: {
+      string: {pattern: "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"}
+    }
+  }];
+
+  // Settings for the produce path, shared by all clusters.
+  Produce produce = 5;
+  // Settings for the consume path, shared by all consumers.
+  Consume consume = 6;
+
+  // Consumers by topic name. An app subscribes to topics (Subscribe.topics);
+  // the cluster and consumer group for each topic come from here, never from
+  // the app. A topic without an entry cannot be consumed.
+  map<string, Consumer> consumers = 7 [(buf.validate.field).map.keys.string.pattern = "^[a-zA-Z0-9._-]{1,249}$"];
+}
+
+// Consumer says where and as whom one topic is consumed. It is the value of
+// SidecarConfig.consumers, keyed by topic name.
+message Consumer {
+  // Name of an entry in SidecarConfig.clusters to read the topic from.
+  // Required; there is no fallback to default_cluster.
+  string cluster = 1 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.min_len = 1
+  ];
+  // Consumer group used to read this topic. Topics that an app subscribes to
+  // on one stream must share the same cluster and group. Required.
+  string group_id = 2 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.min_len = 1
+  ];
+}
+
+// Listener configures the Unix domain socket the app connects to.
+message Listener {
+  // Absolute path of the Unix domain socket the gRPC server binds. The
+  // directory must be a volume shared with the app container.
+  // Default: /var/run/kafka/kafka.sock.
+  string socket_path = 1 [(buf.validate.field).string.prefix = "/"];
+  // Peer user IDs (from SO_PEERCRED) allowed to connect. A peer is accepted
+  // if its UID is listed here or its GID is listed in allowed_gids. When both
+  // lists are empty, any peer that can open the socket is accepted.
+  repeated uint32 allowed_uids = 2 [(buf.validate.field).repeated.unique = true];
+  // Peer group IDs (from SO_PEERCRED) allowed to connect. See allowed_uids.
+  repeated uint32 allowed_gids = 3 [(buf.validate.field).repeated.unique = true];
+}
+
+// Admin configures the HTTP endpoint used by kubelet probes and metrics
+// scraping.
+message Admin {
+  // TCP port for the health and Prometheus metrics endpoints. Default: 9464.
+  uint32 port = 1 [(buf.validate.field).uint32.lte = 65535];
+}
+
+// Cluster describes one Kafka cluster and how to connect to it.
+//
+// The effective producer properties are `properties` overlaid with
+// `producer_properties`; the effective consumer properties are `properties`
+// overlaid with `consumer_properties`.
+message Cluster {
+  option (buf.validate.message).cel = {
+    id: "cluster.bootstrap_servers"
+    message: "properties must set bootstrap.servers"
+    expression: "'bootstrap.servers' in this.properties && this.properties['bootstrap.servers'] != ''"
+  };
+  // The settings below are what the delivery guarantees rest on. They may be
+  // omitted (the sidecar sets them) but never set to a weaker value.
+  option (buf.validate.message).cel = {
+    id: "cluster.acks_all"
+    message: "acks must be all"
+    expression: "[this.properties, this.producer_properties].all(m, !('acks' in m) || m['acks'] in ['all', '-1'])"
+  };
+  option (buf.validate.message).cel = {
+    id: "cluster.idempotence_enabled"
+    message: "enable.idempotence must be true"
+    expression: "[this.properties, this.producer_properties].all(m, !('enable.idempotence' in m) || m['enable.idempotence'] == 'true')"
+  };
+  option (buf.validate.message).cel = {
+    id: "cluster.max_in_flight"
+    message: "max.in.flight.requests.per.connection must be between 1 and 5"
+    expression: "[this.properties, this.producer_properties].all(m, !('max.in.flight.requests.per.connection' in m) || m['max.in.flight.requests.per.connection'].matches('^[1-5]$'))"
+  };
+  option (buf.validate.message).cel = {
+    id: "cluster.auto_commit_disabled"
+    message: "enable.auto.commit must be false"
+    expression: "[this.properties, this.consumer_properties].all(m, !('enable.auto.commit' in m) || m['enable.auto.commit'] == 'false')"
+  };
+  // TLS material is owned by the sidecar's engine factory, never by Kafka's
+  // keystore settings, so that rotation does not rebuild clients.
+  option (buf.validate.message).cel = {
+    id: "cluster.tls_owned_by_sidecar"
+    message: "ssl.engine.factory.class, ssl.keystore.* and ssl.truststore.* must not be set; use tls"
+    expression: "[this.properties, this.producer_properties, this.consumer_properties].all(m, m.all(k, k != 'ssl.engine.factory.class' && !k.startsWith('ssl.keystore.') && !k.startsWith('ssl.truststore.')))"
+  };
+
+  // Whether the sidecar must reach this cluster before it reports started.
+  // Required clusters gate the startup probe; optional ones connect on first
+  // use. Default: false.
+  bool required = 1;
+
+  // Kafka client properties shared by producers and consumers, in the
+  // standard Kafka property names (e.g. "bootstrap.servers"). Must set
+  // bootstrap.servers. The properties the guarantees depend on (acks,
+  // enable.idempotence, max.in.flight.requests.per.connection,
+  // enable.auto.commit) may be omitted but not weakened, and ssl.keystore.*,
+  // ssl.truststore.* and ssl.engine.factory.class are rejected in favour of
+  // `tls`.
+  map<string, string> properties = 2 [(buf.validate.field).map.keys.string.min_len = 1];
+  // Kafka properties applied to producers only, overriding `properties`.
+  // Same restrictions as `properties`.
+  map<string, string> producer_properties = 3 [(buf.validate.field).map.keys.string.min_len = 1];
+  // Kafka properties applied to consumers only, overriding `properties`.
+  // Same restrictions as `properties`.
+  map<string, string> consumer_properties = 4 [(buf.validate.field).map.keys.string.min_len = 1];
+
+  // Mutual TLS to the brokers, with credentials that rotate without
+  // rebuilding Kafka clients. Unset means the connection security is whatever
+  // `properties` configure (e.g. PLAINTEXT or SASL).
+  Tls tls = 5;
+}
+
+// Tls configures mutual TLS to the brokers of one cluster: where the client
+// certificate and trust bundle come from, and which broker identities are
+// accepted.
+message Tls {
+  option (buf.validate.message).cel = {
+    id: "tls.spiffe_peer_policy"
+    message: "a spiffe source needs accepted_spiffe_ids or accepted_trust_domain"
+    expression: "!has(this.spiffe) || size(this.accepted_spiffe_ids) > 0 || this.accepted_trust_domain != ''"
+  };
+
+  // Where the client certificate, private key and trust bundle come from.
+  // Exactly one must be set.
+  oneof source {
+    option (buf.validate.oneof).required = true;
+
+    // Take X.509 SVIDs and bundles from the SPIFFE Workload API.
+    SpiffeSource spiffe = 1;
+    // Take PEM files from a watched directory.
+    FileSource files = 2;
+  }
+
+  // Broker SPIFFE IDs accepted as peers, e.g.
+  // "spiffe://example.org/ns/kafka/sa/broker". A broker certificate whose
+  // SPIFFE ID is not listed is rejected, unless accepted_trust_domain covers
+  // it. With a `spiffe` source, at least one of accepted_spiffe_ids and
+  // accepted_trust_domain is required.
+  repeated string accepted_spiffe_ids = 3 [(buf.validate.field).repeated = {
+    unique: true
+    items: {
+      string: {prefix: "spiffe://"}
+    }
+  }];
+  // Accept any broker SPIFFE ID in this trust domain, given without scheme
+  // (e.g. "example.org").
+  string accepted_trust_domain = 4;
+}
+
+// SpiffeSource takes X.509 SVIDs and trust bundles from the SPIFFE Workload
+// API (typically a SPIRE agent). Rotations are applied in memory; the private
+// key is never written to disk.
+message SpiffeSource {
+  // Workload API address, e.g. unix:///run/spire/agent/sockets/agent.sock.
+  // Unset uses the SPIFFE_ENDPOINT_SOCKET environment variable.
+  string workload_api_socket = 1 [(buf.validate.field).string.prefix = "unix://"];
+}
+
+// FileSource takes PEM-encoded credentials from a directory, typically a
+// Secret or CSI volume. The directory is watched and a change is applied
+// without rebuilding Kafka clients.
+message FileSource {
+  // Absolute path of the directory holding the files below. Required.
+  string dir = 1 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.prefix = "/"
+  ];
+  // Name, inside `dir`, of the PEM client certificate chain, leaf first.
+  // Default: tls.crt.
+  string cert_file = 2;
+  // Name, inside `dir`, of the PEM private key (PKCS#8) matching the leaf
+  // certificate. Default: tls.key.
+  string key_file = 3;
+  // Name, inside `dir`, of the PEM bundle of CA certificates used to verify
+  // brokers. Default: ca.crt.
+  string ca_file = 4;
+}
+
+// Produce tunes the produce path. The values form the flow-control window
+// advertised to the app in ProduceReady; a change applies to new streams.
+message Produce {
+  // Maximum number of records one Produce stream may have awaiting a result.
+  // Default: 1000.
+  uint32 max_in_flight_records = 1;
+  // Maximum bytes (key, value and headers) one Produce stream may have
+  // awaiting a result. Keep it below the producer's buffer.memory.
+  // Default: 16 MiB.
+  uint64 max_in_flight_bytes = 2;
+}
+
+// Consume tunes the consume path for all consumers.
+message Consume {
+  option (buf.validate.message).cel = {
+    id: "consume.default_within_max"
+    message: "default_max_processing must not exceed max_max_processing"
+    expression: "!has(this.default_max_processing) || !has(this.max_max_processing) || this.default_max_processing <= this.max_max_processing"
+  };
+
+  // Processing deadline used when the app leaves Subscribe.max_processing_ms
+  // at zero: how long a delivered record may stay unacked before the app is
+  // considered hung. Must be positive. Default: 5m.
+  google.protobuf.Duration default_max_processing = 1 [(buf.validate.field).duration.gt = {}];
+  // Upper bound for the processing deadline an app may request; larger
+  // requests are clamped to it. Must be positive. Default: 30m.
+  google.protobuf.Duration max_max_processing = 2 [(buf.validate.field).duration.gt = {}];
+  // How long the sidecar waits for RevokeDone after a Revoked event before it
+  // commits and gives the partitions up anyway. Must be positive and well
+  // under the group's rebalance timeout. Default: 10s.
+  google.protobuf.Duration revoke_deadline = 3 [(buf.validate.field).duration.gt = {}];
+  // Interval between asynchronous commits of acked offsets. Must be positive.
+  // Default: 5s.
+  google.protobuf.Duration commit_interval = 4 [(buf.validate.field).duration.gt = {}];
+  // Upper bound of the random delay before a consumer is rebuilt after a
+  // configuration change, which spreads rebalances across a fleet that
+  // receives the change at the same time. Zero disables the delay.
+  // Default: 30s.
+  google.protobuf.Duration rebuild_jitter = 5 [(buf.validate.field).duration.gte = {}];
+}

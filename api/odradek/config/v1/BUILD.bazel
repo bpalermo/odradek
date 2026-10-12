@@ -1,0 +1,26 @@
+load("@protobuf//bazel:java_proto_library.bzl", "java_proto_library")
+load("@protobuf//bazel:proto_library.bzl", "proto_library")
+load("//bazel/lint:linters.bzl", "buf_test")
+
+package(default_visibility = ["//visibility:private"])
+
+proto_library(
+    name = "config_proto",
+    srcs = ["config.proto"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@protobuf//:duration_proto",
+        "@protovalidate//proto/protovalidate/buf/validate:validate_proto",
+    ],
+)
+
+java_proto_library(
+    name = "config_java_proto",
+    visibility = ["//sidecar:__subpackages__"],
+    deps = [":config_proto"],
+)
+
+buf_test(
+    name = "config_buf_lint_test",
+    srcs = [":config_proto"],
+)

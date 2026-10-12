@@ -45,11 +45,17 @@ java_junit_test(
     size = "small",
     srcs = glob(["src/test/java/**/*.java"]),
     javacopts = JAVACOPTS,
-    test_classes = ["io.github.bpalermo.odradek.sidecar.MainTest"],
+    test_classes = [
+        "io.github.bpalermo.odradek.sidecar.MainTest",
+        "io.github.bpalermo.odradek.sidecar.config.SidecarConfigValidationTest",
+    ],
     deps = [
         ":sidecar_lib",
+        "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/kafka/v1:sidecar_java_grpc",
+        "@maven//:build_buf_protovalidate",
         "@maven//:org_assertj_assertj_core",
         "@maven//:org_junit_jupiter_junit_jupiter_api",
+        "@protobuf//java/core",
     ],
 )
