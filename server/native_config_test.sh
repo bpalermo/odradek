@@ -21,7 +21,9 @@ fail() {
 # config <name> <yaml>: writes <name>.yaml with a listener in the test directory.
 config() {
   cat >"$1.yaml"
+  # A free admin port: another test's server may run on this machine at the same time.
   printf 'listener:\n  socketPath: %s/%s.sock\n' "${dir}" "$1" >>"$1.yaml"
+  grep -q '^admin:' "$1.yaml" || printf 'admin:\n  port: 0\n' >>"$1.yaml"
 }
 
 # rejected <name> <message>: the server exits 2 and says <message>.

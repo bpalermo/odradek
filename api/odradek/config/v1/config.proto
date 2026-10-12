@@ -328,9 +328,12 @@ message Listener {
 }
 
 // Admin configures the HTTP endpoint used by kubelet probes and metrics
-// scraping.
+// scraping: GET /healthz answers 200 while the process runs, GET /readyz
+// answers 200 once the server is listening with usable TLS credentials and 503
+// with the reasons otherwise.
 message Admin {
   // TCP port for the health and Prometheus metrics endpoints. Default: 9464.
+  // 0 picks a free port, which the server logs.
   uint32 port = 1 [(buf.validate.field).uint32.lte = 65535];
 }
 

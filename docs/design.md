@@ -67,7 +67,7 @@ flowchart LR
 ### Server internals
 
 - **Transport**: grpc-java on unshaded Netty (`grpc-netty`, never `grpc-netty-shaded`) with the epoll native transport (`netty-transport-native-epoll`, `linux-x86_64` and `linux-aarch_64`). The server binds a Unix domain socket, mode `0660`, on an `emptyDir` shared by both containers. Peer UID/GID are checked with `SO_PEERCRED` against an allow-list.
-- **Admin endpoint**: a small HTTP server on a TCP port for `startupProbe` / `livenessProbe` and Prometheus metrics. Kubelet gRPC probes cannot target a Unix socket, so probes use HTTP.
+- **Admin endpoint**: a small HTTP server on a TCP port (default 9464) for kubelet probes and, later, Prometheus metrics. Kubelet gRPC probes cannot target a Unix socket, so probes use HTTP. `GET /healthz` answers 200 while the process runs. `GET /readyz` answers 200 when the server can do its work and 503 otherwise, with one reason per line.
 - **Threading**:
   - One shared `KafkaProducer` (thread-safe) per cluster. Each Produce stream calls `send()` from its own serialized gRPC callback, with manual inbound flow control (`request(1)`), so arrival order equals `send()` order.
   - One `KafkaConsumer` per Consume stream, owned by a dedicated poll thread. gRPC control messages (`Credits`, `Ack`, `RevokeDone`) are queued to that thread; nothing else touches the consumer.
@@ -75,7 +75,8 @@ flowchart LR
 ### Lifecycle
 
 - The server runs as a native sidecar: an `initContainer` with `restartPolicy: Always`.
-- **Startup**: the `startupProbe` passes once the configuration is valid, the first credentials are loaded, the socket is listening and broker metadata has been fetched for every required cluster. The app container starts after that.
+- **Startup**: `/readyz` is the `startupProbe` and the `readinessProbe`. It is up before anything that can take time and answers 503 `starting: loading TLS credentials` while the server waits for its first credentials (with a SPIFFE source, the first SVID). It answers 200 once the credentials are loaded and the socket is listening. The app container starts after that. Not built yet: waiting for broker metadata of every required cluster.
+- **Readiness afterwards**: `/readyz` goes back to 503 when a cluster's client certificate has expired, which means whatever renews it has stopped (files not replaced, or the Workload API unreachable for an SVID's lifetime), and when shutdown begins.
 - **App readiness**: the client library reports ready only while it holds a session whose handshake has completed.
 - **Shutdown**: the server receives SIGTERM after the app container exits. It stops accepting streams, completes in-flight produce results, `flush()`es, commits acked offsets, leaves its groups and exits. `terminationGracePeriodSeconds` must cover app drain plus `delivery.timeout.ms`.
 - **Server restart with the app alive**: the app reconnects, sees a new `server_epoch`, and fails every unacknowledged send with *outcome unknown*. Consumers get a fresh assignment; unacked records are redelivered.
@@ -511,7 +512,7 @@ Each cluster's `tls` block selects one source.
 - `spiffe` is the server's own client of the Workload API, on the gRPC stack it already has, rather than `java-spiffe`: one streaming call, no second gRPC or Netty on the class path, and nothing new for the native image. The socket is `workloadApiSocket`, or the `SPIFFE_ENDPOINT_SOCKET` environment variable. Clusters naming the same socket share one stream and so one SVID. The first SVID of an update is used.
 - When the stream ends (the agent restarts), it is opened again with a pause that grows from half a second to thirty. The current SVID stays in use meanwhile, for as long as it is valid.
 - Federated bundles cover brokers in another trust domain. A broker is verified against the bundle of the trust domain its SPIFFE ID names and no other, so an authority federated with can only vouch for its own identities.
-- Metrics (with the admin endpoint, not built yet): certificate `not_after` timestamp, last successful reload, reload count, `credential_reload_failures_total`. Alert on time-to-expiry, not on rotation events. Today reloads and rejections are logged.
+- Metrics (not built yet): certificate `not_after` timestamp, last successful reload, reload count, `credential_reload_failures_total`. Alert on time-to-expiry, not on rotation events. Today reloads and rejections are logged, and an expired certificate fails `/readyz`.
 
 ### Peer verification
 

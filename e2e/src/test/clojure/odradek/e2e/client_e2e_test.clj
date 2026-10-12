@@ -143,7 +143,9 @@
   [id topic]
   (str/join
    "\n"
-   ["listener:"
+   [;; A free admin port: several suites start a server at the same time.
+    "admin: {port: 0}"
+    "listener:"
     "  socketPath: SOCKET"
     "clusters:"
     "  a:"

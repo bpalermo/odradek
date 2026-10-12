@@ -8,6 +8,7 @@ import java.io.Closeable;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -189,6 +190,23 @@ public final class TlsSources implements Closeable {
     properties.put(
         SslConfigs.SSL_ENGINE_FACTORY_CLASS_CONFIG, ReloadingSslEngineFactory.class.getName());
     properties.put(ReloadingSslEngineFactory.BINDING_CONFIG, binding);
+  }
+
+  /**
+   * Why the credentials of some cluster cannot be used at {@code now}; empty when all can. A
+   * certificate expires when whatever renews it stopped doing so: the files were not replaced, or
+   * the Workload API has been unreachable for the lifetime of an SVID.
+   */
+  public List<String> problems(Instant now) {
+    List<String> problems = new ArrayList<>();
+    for (var entry : new TreeMap<>(bindings).entrySet()) {
+      Instant notAfter = entry.getValue().source().current().notAfter();
+      if (!now.isBefore(notAfter)) {
+        problems.add(
+            "clusters." + entry.getKey() + ".tls: the client certificate expired at " + notAfter);
+      }
+    }
+    return problems;
   }
 
   private void poll() {

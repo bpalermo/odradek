@@ -203,6 +203,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.MainTest",
         "io.github.bpalermo.odradek.server.NativeMetadataTest",
         "io.github.bpalermo.odradek.server.OdradekServerTest",
+        "io.github.bpalermo.odradek.server.admin.AdminServerTest",
         "io.github.bpalermo.odradek.server.codec.CodecRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ContractRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ExtensionsTest",

@@ -15,6 +15,11 @@ import io.github.bpalermo.odradek.kafka.v1.ProduceResponse;
 import io.github.bpalermo.odradek.kafka.v1.Subscribe;
 import io.github.bpalermo.odradek.server.tls.FakeWorkloadApi;
 import io.grpc.stub.StreamObserver;
+import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -29,6 +34,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -176,6 +182,80 @@ class MtlsE2eTest {
 
     assertThat(produce(11, 20)).isEmpty();
     assertThat(consume(20)).hasSize(20);
+  }
+
+  /**
+   * The packaged server's readiness endpoint: not ready while it waits for its first SVID, ready
+   * once the agent has handed one out. Needs the server as a process; the in-process harness does
+   * not run the admin endpoint.
+   */
+  @Test
+  void readinessFollowsTheFirstSvid() throws Exception {
+    String executable = System.getenv("ODRADEK_E2E_SERVER");
+    Assumptions.assumeTrue(
+        executable != null && !executable.isBlank(), "needs the packaged server");
+    Path socket = credentials.resolve("agent.sock");
+    agent = FakeWorkloadApi.start(socket);
+    int port;
+    try (ServerSocket free = new ServerSocket(0)) {
+      port = free.getLocalPort();
+    }
+    Path file = credentials.resolve("odradek.yaml");
+    Files.writeString(
+        file,
+        "admin: {port: "
+            + port
+            + "}\n"
+            + CONFIG.formatted(
+                credentials,
+                KAFKA_TLS,
+                "spiffe: {workloadApiSocket: \"unix://" + socket + "\"}",
+                BROKER_ID,
+                topic,
+                topic,
+                id));
+    Process server =
+        new ProcessBuilder(
+                Path.of(executable).toAbsolutePath().toString(), "--config", file.toString())
+            .inheritIO()
+            .start();
+    try (HttpClient http = HttpClient.newHttpClient()) {
+      HttpRequest ready =
+          HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/readyz")).build();
+      // The agent has nothing to hand out yet.
+      HttpResponse<String> waiting = await(http, ready, 503);
+      assertThat(waiting.body()).contains("loading TLS credentials");
+      assertThat(Files.exists(credentials.resolve("kafka.sock"))).isFalse();
+
+      publish("client");
+      assertThat(await(http, ready, 200).body()).isEqualTo("ready\n");
+      assertThat(Files.exists(credentials.resolve("kafka.sock"))).isTrue();
+    } finally {
+      server.destroy();
+      if (!server.waitFor(60, TimeUnit.SECONDS)) {
+        server.destroyForcibly();
+      }
+      Files.deleteIfExists(file);
+      Files.deleteIfExists(credentials.resolve("kafka.sock"));
+    }
+  }
+
+  /** Polls until the endpoint answers with {@code status}, the server needing a moment to start. */
+  private static HttpResponse<String> await(HttpClient http, HttpRequest request, int status)
+      throws Exception {
+    long deadline = System.nanoTime() + TIMEOUT.toNanos();
+    while (true) {
+      try {
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() == status) {
+          return response;
+        }
+      } catch (java.io.IOException e) {
+        // Not listening yet.
+      }
+      assertThat(System.nanoTime()).as("answer %s within %s", status, TIMEOUT).isLessThan(deadline);
+      Thread.sleep(100);
+    }
   }
 
   private void install(String name) throws Exception {

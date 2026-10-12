@@ -29,6 +29,8 @@ _TIMEOUT = 60.0
 _PARTITIONS = 4
 
 _CONFIG = """\
+admin:
+  port: 0
 listener:
   socketPath: {dir}/kafka.sock
 clusters:
