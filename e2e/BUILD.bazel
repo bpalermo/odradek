@@ -13,7 +13,7 @@ package(default_visibility = ["//visibility:private"])
 # say they talk to something outside the build, so Bazel never caches the result
 # or sandboxes the network away.
 java_junit_test(
-    name = "broker_smoke_test",
+    name = "e2e_test",
     size = "medium",
     srcs = glob(["src/test/java/**/*.java"]),
     javacopts = JAVACOPTS,
@@ -22,11 +22,28 @@ java_junit_test(
         "external",
         "requires-network",
     ],
-    test_classes = ["io.github.bpalermo.odradek.e2e.BrokerSmokeTest"],
-    runtime_deps = ["@maven//:ch_qos_logback_logback_classic"],
+    test_classes = [
+        "io.github.bpalermo.odradek.e2e.BrokerSmokeTest",
+        "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
+    ],
+    runtime_deps = [
+        "//server:netty_epoll_native",
+        "@maven//:ch_qos_logback_logback_classic",
+    ],
     deps = [
+        "//api/odradek/config/v1:config_java_proto",
+        "//api/odradek/kafka/v1:odradek_java_grpc",
+        "//api/odradek/kafka/v1:odradek_java_proto",
+        "//server:server_lib",
+        "@grpc-java//api",
+        "@grpc-java//netty",
+        "@grpc-java//stub",
+        "@maven//:io_netty_netty_transport",
+        "@maven//:io_netty_netty_transport_classes_epoll",
+        "@maven//:io_netty_netty_transport_native_unix_common",
         "@maven//:org_apache_kafka_kafka_clients",
         "@maven//:org_assertj_assertj_core",
         "@maven//:org_junit_jupiter_junit_jupiter_api",
+        "@protobuf//java/core",
     ],
 )

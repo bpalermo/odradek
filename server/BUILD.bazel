@@ -17,6 +17,7 @@ java_library(
     javacopts = JAVACOPTS,
     resource_strip_prefix = "server/src/main/resources",
     resources = glob(["src/main/resources/**"]),
+    visibility = ["//e2e:__pkg__"],
     deps = [
         "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
@@ -41,7 +42,7 @@ java_library(
 # per-architecture classifier jar; pick the one for the target CPU.
 java_library(
     name = "netty_epoll_native",
-    visibility = ["//visibility:private"],
+    visibility = ["//e2e:__pkg__"],
     exports = ["@maven//:io_netty_netty_transport_native_unix_common"] + select({
         "@platforms//cpu:aarch64": ["@maven//:io_netty_netty_transport_native_epoll_linux_aarch_64"],
         "//conditions:default": ["@maven//:io_netty_netty_transport_native_epoll_linux_x86_64"],
@@ -84,6 +85,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.codec.ContractRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ExtensionsTest",
         "io.github.bpalermo.odradek.server.config.ConfigLoaderTest",
+        "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
     ],
     runtime_deps = [
@@ -97,6 +99,7 @@ java_junit_test(
         "//api/odradek/kafka/v1:odradek_java_proto",
         "//extension/java:extension",
         "@grpc-java//api",
+        "@grpc-java//inprocess",
         "@grpc-java//netty",
         "@grpc-java//stub",
         "@maven//:build_buf_protovalidate",
