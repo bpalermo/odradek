@@ -77,12 +77,28 @@ jobs:
             //server:image_index //server:image_push \
             //bazel/cosign //bazel/cosign:verify_image
 
-      - name: Load the image and start it
+      # The image must do what the binary does: read a configuration from the
+      # mounted volume, listen on the socket, and stop cleanly on SIGTERM. The
+      # socket directory is a tmpfs because the image runs as nonroot.
+      - name: Load the image, start it and stop it
         run: |
           set -euo pipefail
           bazel run --config=ci //server:image_load
-          docker run --rm localhost/odradek:e2e | tee image-run.log
-          grep -q "odradek server starting" image-run.log
+          mkdir smoke && cp server/testdata/minimal.yaml smoke/odradek.yaml
+          docker run -d --name odradek \
+            -v "${PWD}/smoke:/etc/odradek:ro" \
+            --tmpfs /var/run/kafka:mode=1777 \
+            localhost/odradek:e2e
+          for _ in $(seq 1 30); do
+            if docker logs odradek 2>&1 | grep -q "listening on /var/run/kafka/kafka.sock"; then
+              break
+            fi
+            sleep 1
+          done
+          docker stop --time 20 odradek
+          docker logs odradek 2>&1 | tee image-run.log
+          grep -q "listening on /var/run/kafka/kafka.sock" image-run.log
+          grep -q "stopped" image-run.log
 
   # End to end against real Kafka in KRaft mode (no ZooKeeper). Two
   # independent single-node clusters, so the multi-cluster cases run in the

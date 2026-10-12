@@ -1,0 +1,6 @@
+# The smallest configuration the server accepts. Used by the loader test and by
+# the image smoke test in CI.
+clusters:
+  main:
+    properties:
+      bootstrap.servers: localhost:9092
