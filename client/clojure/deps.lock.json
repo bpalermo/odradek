@@ -6,10 +6,10 @@
   ],
   "artifacts": [
     {
-      "coordinates": "com.github.bpalermo/clj-grpc:0.1.12",
+      "coordinates": "com.github.bpalermo/clj-grpc:0.1.14",
       "target": "com_github_bpalermo_clj_grpc",
-      "path": "com/github/bpalermo/clj-grpc/0.1.12/clj-grpc-0.1.12.jar",
-      "sha256": "4c56c9c4ada6f7b7109e162a018f67f3e3da7d99b7ef06ba20888944b8fc1548",
+      "path": "com/github/bpalermo/clj-grpc/0.1.14/clj-grpc-0.1.14.jar",
+      "sha256": "1daed9d630469f08654ec65075642b438e718113b62f0c56e4db6085e4f4cdfb",
       "deps": []
     },
     {
