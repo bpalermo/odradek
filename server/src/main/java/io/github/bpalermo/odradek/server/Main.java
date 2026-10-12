@@ -8,8 +8,12 @@ import io.github.bpalermo.odradek.server.codec.ContractRegistry;
 import io.github.bpalermo.odradek.server.codec.Extensions;
 import io.github.bpalermo.odradek.server.config.ConfigException;
 import io.github.bpalermo.odradek.server.config.ConfigLoader;
+import io.github.bpalermo.odradek.server.produce.ClusterProducers;
+import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
+import io.github.bpalermo.odradek.server.produce.ProduceService;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,21 +81,39 @@ public final class Main {
       return;
     }
 
+    ClusterProducers producers;
+    try {
+      producers = ClusterProducers.create(config);
+    } catch (RuntimeException e) {
+      LOG.error("configuration {} rejected: {}", file, e.getMessage());
+      codecs.close();
+      System.exit(2);
+      return;
+    }
+    ProduceService produce =
+        new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
+
     OdradekServer server;
     try {
-      // Produce and Consume are not implemented yet: the generated base answers UNIMPLEMENTED.
-      server = OdradekServer.start(config, new OdradekServiceGrpc.OdradekServiceImplBase() {});
+      server = OdradekServer.start(config, new OdradekService(produce));
     } catch (IOException e) {
       LOG.error("could not start", e);
+      producers.close(Duration.ZERO);
       codecs.close();
       System.exit(1);
       return;
     }
+    LOG.info("server epoch {}", produce.serverEpoch());
     Runtime.getRuntime()
         .addShutdownHook(
             new Thread(
                 () -> {
+                  // No new streams; then every record already accepted gets its broker answer,
+                  // and with it its result, before the open streams are closed.
+                  server.stopAccepting();
+                  producers.flush();
                   server.close();
+                  producers.close();
                   codecs.close();
                 },
                 "shutdown"));

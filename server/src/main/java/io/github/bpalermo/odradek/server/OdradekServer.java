@@ -105,6 +105,11 @@ public final class OdradekServer implements AutoCloseable {
     server.awaitTermination();
   }
 
+  /** Stops accepting new streams. Open ones continue. */
+  public void stopAccepting() {
+    server.shutdown();
+  }
+
   /**
    * Stops accepting streams, gives open ones a few seconds to finish, then cancels what is left and
    * removes the socket file.

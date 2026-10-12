@@ -5,9 +5,10 @@ load("//bazel/lint:linters.bzl", "buf_test")
 
 package(default_visibility = ["//visibility:private"])
 
-# The generated stubs are for the server and the client library only.
+# The generated stubs are for the server, the client library and the e2e suite only.
 _JAVA_CONSUMERS = [
     "//client:__subpackages__",
+    "//e2e:__pkg__",
     "//server:__subpackages__",
 ]
 
