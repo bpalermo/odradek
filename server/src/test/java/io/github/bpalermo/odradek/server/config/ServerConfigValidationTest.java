@@ -1,4 +1,4 @@
-package io.github.bpalermo.odradek.sidecar.config;
+package io.github.bpalermo.odradek.server.config;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -14,7 +14,7 @@ import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.Listener;
 import io.github.bpalermo.odradek.config.v1.ProduceTarget;
 import io.github.bpalermo.odradek.config.v1.Producer;
-import io.github.bpalermo.odradek.config.v1.SidecarConfig;
+import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.config.v1.SpiffeSource;
 import io.github.bpalermo.odradek.config.v1.Tls;
 import java.util.List;
@@ -22,7 +22,7 @@ import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 
 /** Exercises the protovalidate rules of config.proto; asserts on rule ids, never on messages. */
-class SidecarConfigValidationTest {
+class ServerConfigValidationTest {
   private static final Validator VALIDATOR = ValidatorFactory.newBuilder().build();
 
   private static Duration seconds(long s) {
@@ -45,8 +45,8 @@ class SidecarConfigValidationTest {
                 .setAcceptedTrustDomain("example.org"));
   }
 
-  private static SidecarConfig.Builder valid() {
-    return SidecarConfig.newBuilder()
+  private static ServerConfig.Builder valid() {
+    return ServerConfig.newBuilder()
         .setListener(
             Listener.newBuilder().setSocketPath("/var/run/kafka/kafka.sock").addAllowedUids(1000))
         .setAdmin(Admin.newBuilder().setPort(9464))
@@ -68,18 +68,18 @@ class SidecarConfigValidationTest {
   }
 
   /** Applies {@code edit} to the main cluster of a valid config. */
-  private static SidecarConfig withCluster(Consumer<Cluster.Builder> edit) {
+  private static ServerConfig withCluster(Consumer<Cluster.Builder> edit) {
     Cluster.Builder c = cluster();
     edit.accept(c);
     return valid().putClusters("main", c.build()).build();
   }
 
-  private static List<String> ruleIds(SidecarConfig config) throws ValidationException {
+  private static List<String> ruleIds(ServerConfig config) throws ValidationException {
     ValidationResult result = VALIDATOR.validate(config);
     return result.getViolations().stream().map(v -> v.toProto().getRuleId()).toList();
   }
 
-  private static void assertViolates(SidecarConfig config, String ruleId)
+  private static void assertViolates(ServerConfig config, String ruleId)
       throws ValidationException {
     assertThat(ruleIds(config)).containsExactly(ruleId);
   }
@@ -103,7 +103,7 @@ class SidecarConfigValidationTest {
 
   @Test
   void producingToSeveralClustersPasses() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putClusters("next", cluster().build())
             .putProducers("orders", producer("main", "next"))
@@ -121,7 +121,7 @@ class SidecarConfigValidationTest {
   void producerClustersMustExist() throws ValidationException {
     assertViolates(
         valid().putProducers("orders", producer("main", "missing")).build(),
-        "sidecar_config.producer_clusters_exist");
+        "server_config.producer_clusters_exist");
   }
 
   @Test
@@ -133,7 +133,7 @@ class SidecarConfigValidationTest {
 
   @Test
   void producerNeedsOneRequiredCluster() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putProducers(
                 "orders",
@@ -150,7 +150,7 @@ class SidecarConfigValidationTest {
 
   @Test
   void produceTargetClusterUnsetIsRejected() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putProducers(
                 "orders",
@@ -165,15 +165,15 @@ class SidecarConfigValidationTest {
   }
 
   @Test
-  void offsetResetIsOwnedBySidecar() throws ValidationException {
+  void offsetResetIsOwnedByServer() throws ValidationException {
     assertViolates(
         withCluster(c -> c.putConsumerProperties("auto.offset.reset", "latest")),
-        "cluster.offset_reset_owned_by_sidecar");
+        "cluster.offset_reset_owned_by_server");
   }
 
   @Test
   void consumerClusterMustExist() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putConsumers(
                 "orders",
@@ -182,12 +182,12 @@ class SidecarConfigValidationTest {
                     .setGroupId("g")
                     .build())
             .build();
-    assertViolates(config, "sidecar_config.consumer_cluster_exists");
+    assertViolates(config, "server_config.consumer_cluster_exists");
   }
 
   @Test
   void consumerClusterUnsetIsRejected() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putConsumers(
                 "orders",
@@ -195,12 +195,12 @@ class SidecarConfigValidationTest {
             .build();
     // Unset violates `required`; an unset cluster is also no entry of clusters.
     assertThat(ruleIds(config))
-        .containsExactlyInAnyOrder("required", "sidecar_config.consumer_cluster_exists");
+        .containsExactlyInAnyOrder("required", "server_config.consumer_cluster_exists");
   }
 
   @Test
   void consumerClusterEmptyIsRejected() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putConsumers(
                 "orders",
@@ -210,12 +210,12 @@ class SidecarConfigValidationTest {
                     .build())
             .build();
     assertThat(ruleIds(config))
-        .containsExactlyInAnyOrder("string.min_len", "sidecar_config.consumer_cluster_exists");
+        .containsExactlyInAnyOrder("string.min_len", "server_config.consumer_cluster_exists");
   }
 
   @Test
   void consumerGroupIdUnsetIsRejected() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putConsumers(
                 "orders",
@@ -228,7 +228,7 @@ class SidecarConfigValidationTest {
 
   @Test
   void consumerGroupIdEmptyIsRejected() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putConsumers(
                 "orders",
@@ -271,7 +271,7 @@ class SidecarConfigValidationTest {
 
   @Test
   void consumerTopicNameMustBeValid() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .putConsumers(
                 "bad topic!",
@@ -320,16 +320,16 @@ class SidecarConfigValidationTest {
   }
 
   @Test
-  void tlsMaterialIsOwnedBySidecar() throws ValidationException {
+  void tlsMaterialIsOwnedByServer() throws ValidationException {
     assertViolates(
         withCluster(c -> c.putProperties("ssl.keystore.location", "/k")),
-        "cluster.tls_owned_by_sidecar");
+        "cluster.tls_owned_by_server");
     assertViolates(
         withCluster(c -> c.putConsumerProperties("ssl.truststore.type", "PKCS12")),
-        "cluster.tls_owned_by_sidecar");
+        "cluster.tls_owned_by_server");
     assertViolates(
         withCluster(c -> c.putProducerProperties("ssl.engine.factory.class", "x.Y")),
-        "cluster.tls_owned_by_sidecar");
+        "cluster.tls_owned_by_server");
   }
 
   @Test
@@ -342,7 +342,7 @@ class SidecarConfigValidationTest {
 
   @Test
   void fileSourceNeedsNoPeerPolicy() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         withCluster(
             c -> c.setTls(Tls.newBuilder().setFiles(FileSource.newBuilder().setDir("/etc/tls"))));
     assertThat(VALIDATOR.validate(config).isSuccess()).isTrue();
@@ -357,7 +357,7 @@ class SidecarConfigValidationTest {
 
   @Test
   void defaultProcessingMustNotExceedMax() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .setConsume(
                 Consume.newBuilder()
@@ -369,7 +369,7 @@ class SidecarConfigValidationTest {
 
   @Test
   void clusterNamesMustBeDnsLabels() throws ValidationException {
-    SidecarConfig config =
+    ServerConfig config =
         valid()
             .clearClusters()
             .putClusters("Bad_Name", cluster().build())

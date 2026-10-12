@@ -1,33 +1,34 @@
 edition = "2024";
 
-// The app-facing API of Odradek, a Kafka client sidecar.
+// The app-facing API of Odradek, a server that owns the Kafka clients of an
+// application.
 //
-// An application talks to the sidecar in its own pod instead of linking a
-// Kafka client. The sidecar owns the Kafka producers and consumers; this API
+// An application talks to the server in its own pod instead of linking a
+// Kafka client. The server owns the Kafka producers and consumers; this API
 // carries records, acknowledgements, flow control and rebalance events
 // between the two.
 package odradek.kafka.v1;
 
-option java_outer_classname = "SidecarProto";
+option java_outer_classname = "OdradekProto";
 option java_package = "io.github.bpalermo.odradek.kafka.v1";
 
-// OdradekService is the app-facing API of the Kafka client sidecar. It is
-// served on a Unix domain socket shared between the app and sidecar
+// OdradekService is the app-facing API of the Odradek server. It is
+// served on a Unix domain socket shared between the app and server
 // containers.
 //
 // Both RPCs are long-lived bidirectional streams. The first message on each
-// stream must be the handshake (ProduceOpen / Subscribe); the sidecar answers
+// stream must be the handshake (ProduceOpen / Subscribe); the server answers
 // with ProduceReady / Subscribed before anything else. Sending any other
 // message first fails the stream with INVALID_ARGUMENT.
 service OdradekService {
   // Produce sends records to Kafka.
   //
   // Every ProduceRecord gets exactly one ProduceResult, emitted only after the
-  // broker has acknowledged (or definitively failed) the record; the sidecar
+  // broker has acknowledged (or definitively failed) the record; the server
   // never acknowledges on enqueue. Records on one stream are handed to the
   // Kafka producer in arrival order, so one stream is one ordering domain.
   //
-  // The app does not choose where a record goes: the sidecar configuration
+  // The app does not choose where a record goes: the server configuration
   // maps each topic to one or more Kafka clusters, and a record is written to
   // all of them.
   rpc Produce(stream ProduceRequest) returns (stream ProduceResponse);
@@ -36,7 +37,7 @@ service OdradekService {
   // revocations.
   //
   // The app names the topics; the cluster and consumer group for each topic
-  // come from the sidecar configuration. Records are delivered only against credits granted
+  // come from the server configuration. Records are delivered only against credits granted
   // by the app, and offsets are committed only for records the app has acked.
   //
   // The stream fails with NOT_FOUND for a topic that is not declared in the
@@ -70,10 +71,10 @@ message TopicPartition {
 // ErrorCode classifies why a record could not be produced. The classification
 // tells the app whether a resend is safe, pointless, or may duplicate.
 enum ErrorCode {
-  // Not set. Never sent by the sidecar.
+  // Not set. Never sent by the server.
   ERROR_CODE_UNSPECIFIED = 0;
   // The outcome is unknown: the record may or may not have been written
-  // (e.g. delivery.timeout.ms expired, or the sidecar restarted). Also used
+  // (e.g. delivery.timeout.ms expired, or the server restarted). Also used
   // when the topic is produced to several clusters and not all required ones
   // acknowledged; ProduceResult.writes lists those that did. Resending may
   // duplicate.
@@ -84,7 +85,7 @@ enum ErrorCode {
   // The topic or the requested partition does not exist. The record was not
   // written.
   ERROR_CODE_UNKNOWN_TOPIC_OR_PARTITION = 3;
-  // The sidecar's identity is not allowed to write to the topic. The record
+  // The server's identity is not allowed to write to the topic. The record
   // was not written.
   ERROR_CODE_AUTHORIZATION_FAILED = 4;
   // The underlying Kafka client was fenced and must be recreated. The record
@@ -93,9 +94,9 @@ enum ErrorCode {
   // The app violated the protocol (window exceeded, seq went backwards, ...).
   // The record was not sent to Kafka.
   ERROR_CODE_PROTOCOL_VIOLATION = 6;
-  // An unexpected failure inside the sidecar. Treat the outcome as unknown.
+  // An unexpected failure inside the server. Treat the outcome as unknown.
   ERROR_CODE_INTERNAL = 7;
-  // The topic has no entry under `producers` in the sidecar configuration.
+  // The topic has no entry under `producers` in the server configuration.
   // The record was not sent to Kafka. Only the affected record fails; the
   // stream stays open.
   ERROR_CODE_TOPIC_NOT_CONFIGURED = 8;
@@ -132,7 +133,7 @@ message ProduceRequest {
 message ProduceOpen {
   // App-chosen identifier, stable for the lifetime of the app process (a
   // random UUID is suitable). `seq` values are scoped to it. Reopening a
-  // stream with the same session_id against the same sidecar_epoch resumes
+  // stream with the same session_id against the same server_epoch resumes
   // deduplication. Required.
   string session_id = 1;
 }
@@ -141,17 +142,17 @@ message ProduceOpen {
 message ProduceRecord {
   // Sequence number, strictly increasing per session, starting at 1. A
   // resend after a stream reconnect reuses the original seq, which is how
-  // the sidecar recognizes it as a duplicate.
+  // the server recognizes it as a duplicate.
   uint64 seq = 1;
   // Lowest seq for which the app has not yet received a ProduceResult. The
-  // sidecar discards retained results below it. Equal to `seq` when nothing
+  // server discards retained results below it. Equal to `seq` when nothing
   // older is outstanding.
   uint64 low_watermark = 2;
-  // Destination topic. It must be declared under `producers` in the sidecar
+  // Destination topic. It must be declared under `producers` in the server
   // configuration, which decides the cluster or clusters it is written to.
   // Required.
   string topic = 3;
-  // Destination partition. Unset lets the sidecar's partitioner decide (by
+  // Destination partition. Unset lets the server's partitioner decide (by
   // key hash when a key is present). When the topic is produced to several
   // clusters an explicit partition is used on all of them and must exist on
   // all.
@@ -164,12 +165,12 @@ message ProduceRecord {
   // Record headers, in order.
   repeated Header headers = 7;
   // Record timestamp in milliseconds since the Unix epoch. Unset uses the
-  // sidecar's clock at send time. The same timestamp is written to every
+  // server's clock at send time. The same timestamp is written to every
   // cluster the topic is produced to.
   int64 timestamp_ms = 8;
 }
 
-// ProduceResponse is a message from the sidecar on a Produce stream.
+// ProduceResponse is a message from the server on a Produce stream.
 message ProduceResponse {
   // Exactly one is set.
   oneof msg {
@@ -183,11 +184,11 @@ message ProduceResponse {
 // ProduceReady completes the Produce handshake and announces the
 // flow-control window.
 message ProduceReady {
-  // Identifier of the running sidecar process. It changes whenever the
-  // sidecar restarts. If it differs from the one the app saw before, the
-  // sidecar has lost its deduplication state and every record without a
+  // Identifier of the running server process. It changes whenever the
+  // server restarts. If it differs from the one the app saw before, the
+  // server has lost its deduplication state and every record without a
   // result is "outcome unknown".
-  string sidecar_epoch = 1;
+  string server_epoch = 1;
   // Flow-control window in records: the app must not have more than this
   // many records awaiting a result. Each ProduceResult returns one slot.
   uint32 max_in_flight_records = 2;
@@ -216,7 +217,7 @@ message ProduceResult {
 // RecordMetadata says where one cluster wrote an acknowledged record.
 // Partition and offset are specific to that cluster.
 message RecordMetadata {
-  // Name of the cluster, as in the sidecar configuration.
+  // Name of the cluster, as in the server configuration.
   string cluster = 1;
   // Topic the record was written to.
   string topic = 2;
@@ -251,29 +252,29 @@ message ConsumeRequest {
 // Subscribe is the Consume handshake. It selects the topics to read; one
 // stream is one Kafka consumer, i.e. one member of one consumer group.
 message Subscribe {
-  // Topics to consume. Each must be declared under `consumers` in the sidecar
+  // Topics to consume. Each must be declared under `consumers` in the server
   // configuration, which fixes its cluster and consumer group; the app cannot
   // choose them. All topics of one stream must resolve to the same cluster
   // and the same group. At least one is required.
   repeated string topics = 1;
   // Longest the app may hold a delivered record without acking it, in
-  // milliseconds, before the sidecar declares the app hung, leaves the group
-  // and fails the stream with ABORTED. Zero uses the sidecar default; values
-  // above the sidecar maximum are clamped. The effective value is returned
+  // milliseconds, before the server declares the app hung, leaves the group
+  // and fails the stream with ABORTED. Zero uses the server default; values
+  // above the server maximum are clamped. The effective value is returned
   // in Subscribed.
   uint32 max_processing_ms = 2;
 }
 
-// Credits grants the sidecar permission to deliver more records. Grants are
-// additive. With no credits left the sidecar pauses fetching but stays in
+// Credits grants the server permission to deliver more records. Grants are
+// additive. With no credits left the server pauses fetching but stays in
 // the consumer group.
 message Credits {
-  // Number of additional records the sidecar may deliver.
+  // Number of additional records the server may deliver.
   uint32 records = 1;
 }
 
 // Ack marks the inclusive offset range [first_offset, last_offset] of one
-// partition as processed. Acks may arrive out of order; the sidecar commits
+// partition as processed. Acks may arrive out of order; the server commits
 // the highest contiguous acked offset.
 message Ack {
   // Topic of the acked records.
@@ -290,14 +291,14 @@ message Ack {
   int64 last_offset = 5;
 }
 
-// RevokeDone tells the sidecar that the app has stopped working on the
+// RevokeDone tells the server that the app has stopped working on the
 // partitions of a Revoked event and has sent its final Acks for them.
 message RevokeDone {
   // The revoke_id of the Revoked event being answered.
   uint64 revoke_id = 1;
 }
 
-// ConsumeResponse is a message from the sidecar on a Consume stream.
+// ConsumeResponse is a message from the server on a Consume stream.
 message ConsumeResponse {
   // Exactly one is set.
   oneof msg {
@@ -317,16 +318,16 @@ message ConsumeResponse {
 
 // Subscribed completes the Consume handshake.
 message Subscribed {
-  // Identifier of the running sidecar process; see
-  // ProduceReady.sidecar_epoch.
-  string sidecar_epoch = 1;
+  // Identifier of the running server process; see
+  // ProduceReady.server_epoch.
+  string server_epoch = 1;
   // Effective processing deadline in milliseconds, after defaults and
   // clamping.
   uint32 max_processing_ms = 2;
   // Cluster the topics are read from, as resolved from the configuration.
   // Informational.
   string cluster = 3;
-  // Consumer group the sidecar joined, as resolved from the configuration.
+  // Consumer group the server joined, as resolved from the configuration.
   // Informational.
   string group_id = 4;
 }
@@ -352,14 +353,14 @@ message Assigned {
 
 // Revoked asks the app to stop processing the listed partitions. The app
 // finishes or abandons in-flight records, sends its final Acks, then
-// RevokeDone. After deadline_ms the sidecar proceeds without it; unacked
+// RevokeDone. After deadline_ms the server proceeds without it; unacked
 // records will be redelivered to the next owner.
 message Revoked {
   // Identifies this revocation; echo it in RevokeDone.
   uint64 revoke_id = 1;
   // The partitions being taken away.
   repeated TopicPartition partitions = 2;
-  // How long the sidecar waits for RevokeDone, in milliseconds.
+  // How long the server waits for RevokeDone, in milliseconds.
   uint32 deadline_ms = 3;
 }
 

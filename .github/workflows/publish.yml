@@ -88,7 +88,7 @@ jobs:
       - name: Build the image and the tools
         run: |
           bazel build --config=ci \
-            //sidecar:image_push //bazel/cosign //bazel/cosign:verify_image
+            //server:image_push //bazel/cosign //bazel/cosign:verify_image
 
       # One login covers the push and cosign: both read the Docker config this
       # writes.
@@ -99,7 +99,7 @@ jobs:
           password: ${{ secrets.QUAY_TOKEN }}
 
       - name: Push the multi-arch image
-        run: bazel run --config=ci //sidecar:image_push
+        run: bazel run --config=ci //server:image_push
 
       # The digest comes from the build rather than from the registry:
       # re-resolving a mutable tag reintroduces a time-of-check window. The
@@ -109,7 +109,7 @@ jobs:
         id: digest
         run: |
           set -euo pipefail
-          index_file="$(bazel cquery --config=ci //sidecar:image_index --output=files 2>/dev/null \
+          index_file="$(bazel cquery --config=ci //server:image_index --output=files 2>/dev/null \
             | grep -E '_index\.json$' | head -1)"
           digest_file="${index_file%_index.json}_digest"
           if [ -z "${index_file}" ] || [ ! -s "${digest_file}" ]; then
