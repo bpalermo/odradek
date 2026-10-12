@@ -13,13 +13,16 @@ import io.github.bpalermo.odradek.kafka.v1.ProduceRecord;
 import io.github.bpalermo.odradek.kafka.v1.ProduceRequest;
 import io.github.bpalermo.odradek.kafka.v1.ProduceResponse;
 import io.github.bpalermo.odradek.kafka.v1.Subscribe;
+import io.github.bpalermo.odradek.server.admin.HealthService;
+import io.github.bpalermo.odradek.server.admin.HealthService.ServingStatus;
 import io.github.bpalermo.odradek.server.tls.FakeWorkloadApi;
+import io.grpc.CallOptions;
+import io.grpc.ManagedChannel;
+import io.grpc.StatusRuntimeException;
+import io.grpc.netty.NettyChannelBuilder;
+import io.grpc.stub.ClientCalls;
 import io.grpc.stub.StreamObserver;
 import java.net.ServerSocket;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -185,12 +188,12 @@ class MtlsE2eTest {
   }
 
   /**
-   * The packaged server's readiness endpoint: not ready while it waits for its first SVID, ready
+   * The packaged server's health service: NOT_SERVING while it waits for its first SVID, SERVING
    * once the agent has handed one out. Needs the server as a process; the in-process harness does
-   * not run the admin endpoint.
+   * not run the health service.
    */
   @Test
-  void readinessFollowsTheFirstSvid() throws Exception {
+  void healthFollowsTheFirstSvid() throws Exception {
     String executable = System.getenv("ODRADEK_E2E_SERVER");
     Assumptions.assumeTrue(
         executable != null && !executable.isBlank(), "needs the packaged server");
@@ -219,18 +222,18 @@ class MtlsE2eTest {
                 Path.of(executable).toAbsolutePath().toString(), "--config", file.toString())
             .inheritIO()
             .start();
-    try (HttpClient http = HttpClient.newHttpClient()) {
-      HttpRequest ready =
-          HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/readyz")).build();
+    ManagedChannel probe = NettyChannelBuilder.forAddress("localhost", port).usePlaintext().build();
+    try {
       // The agent has nothing to hand out yet.
-      HttpResponse<String> waiting = await(http, ready, 503);
-      assertThat(waiting.body()).contains("loading TLS credentials");
+      await(probe, "", ServingStatus.NOT_SERVING);
+      await(probe, HealthService.LIVENESS, ServingStatus.SERVING);
       assertThat(Files.exists(credentials.resolve("kafka.sock"))).isFalse();
 
       publish("client");
-      assertThat(await(http, ready, 200).body()).isEqualTo("ready\n");
+      await(probe, "", ServingStatus.SERVING);
       assertThat(Files.exists(credentials.resolve("kafka.sock"))).isTrue();
     } finally {
+      probe.shutdownNow();
       server.destroy();
       if (!server.waitFor(60, TimeUnit.SECONDS)) {
         server.destroyForcibly();
@@ -240,20 +243,24 @@ class MtlsE2eTest {
     }
   }
 
-  /** Polls until the endpoint answers with {@code status}, the server needing a moment to start. */
-  private static HttpResponse<String> await(HttpClient http, HttpRequest request, int status)
+  /** Asks until the answer is {@code expected}, the server needing a moment to start. */
+  private static void await(ManagedChannel channel, String service, ServingStatus expected)
       throws Exception {
     long deadline = System.nanoTime() + TIMEOUT.toNanos();
     while (true) {
       try {
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-        if (response.statusCode() == status) {
-          return response;
+        if (ClientCalls.blockingUnaryCall(
+                channel,
+                HealthService.CHECK,
+                CallOptions.DEFAULT.withDeadlineAfter(5, TimeUnit.SECONDS),
+                service)
+            == expected) {
+          return;
         }
-      } catch (java.io.IOException e) {
+      } catch (StatusRuntimeException e) {
         // Not listening yet.
       }
-      assertThat(System.nanoTime()).as("answer %s within %s", status, TIMEOUT).isLessThan(deadline);
+      assertThat(System.nanoTime()).as("%s within %s", expected, TIMEOUT).isLessThan(deadline);
       Thread.sleep(100);
     }
   }

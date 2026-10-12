@@ -1,17 +1,21 @@
 package io.github.bpalermo.odradek.server.admin;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.config.v1.Tls;
+import io.github.bpalermo.odradek.server.admin.HealthService.ServingStatus;
 import io.github.bpalermo.odradek.server.tls.TestPki;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import io.grpc.CallOptions;
+import io.grpc.ManagedChannel;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import io.grpc.netty.NettyChannelBuilder;
+import io.grpc.stub.ClientCalls;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
@@ -23,47 +27,49 @@ class AdminServerTest {
   @TempDir Path dir;
 
   private final Readiness readiness = new Readiness();
-  private final HttpClient http = HttpClient.newHttpClient();
   private AdminServer admin;
+  private ManagedChannel channel;
+
+  private void start(Clock clock) throws Exception {
+    stop();
+    admin = AdminServer.start(0, new HealthService(readiness, clock));
+    channel = NettyChannelBuilder.forAddress("localhost", admin.port()).usePlaintext().build();
+  }
 
   @AfterEach
   void stop() {
+    if (channel != null) {
+      channel.shutdownNow();
+    }
     if (admin != null) {
       admin.close();
     }
-    http.close();
   }
 
-  private HttpResponse<String> get(String path) throws Exception {
-    return http.send(
-        HttpRequest.newBuilder(URI.create("http://localhost:" + admin.port() + path)).build(),
-        HttpResponse.BodyHandlers.ofString());
+  private ServingStatus check(String service) {
+    return ClientCalls.blockingUnaryCall(
+        channel, HealthService.CHECK, CallOptions.DEFAULT, service);
   }
 
   @Test
-  void notReadyWhileStartingThenReadyThenNotWhileStopping() throws Exception {
-    admin = AdminServer.start(0, readiness, Clock.systemUTC());
-    assertThat(get("/healthz").statusCode()).isEqualTo(200);
-    assertThat(get("/readyz").statusCode()).isEqualTo(503);
+  void notServingWhileStartingThenServingThenNotWhileStopping() throws Exception {
+    start(Clock.systemUTC());
+    assertThat(check("")).isEqualTo(ServingStatus.NOT_SERVING);
+    assertThat(check(HealthService.LIVENESS)).isEqualTo(ServingStatus.SERVING);
 
     readiness.starting("loading TLS credentials");
-    HttpResponse<String> waiting = get("/readyz");
-    assertThat(waiting.statusCode()).isEqualTo(503);
-    assertThat(waiting.body()).isEqualTo("starting: loading TLS credentials\n");
-    assertThat(get("/healthz").statusCode()).isEqualTo(200);
+    assertThat(check("")).isEqualTo(ServingStatus.NOT_SERVING);
 
     readiness.started(TlsSources.none());
-    HttpResponse<String> ready = get("/readyz");
-    assertThat(ready.statusCode()).isEqualTo(200);
-    assertThat(ready.body()).isEqualTo("ready\n");
+    assertThat(check("")).isEqualTo(ServingStatus.SERVING);
 
     readiness.stopping();
-    assertThat(get("/readyz").statusCode()).isEqualTo(503);
-    assertThat(get("/healthz").statusCode()).isEqualTo(200);
+    assertThat(check("")).isEqualTo(ServingStatus.NOT_SERVING);
+    assertThat(check(HealthService.LIVENESS)).isEqualTo(ServingStatus.SERVING);
   }
 
   @Test
-  void notReadyOnceAClientCertificateHasExpired() throws Exception {
+  void notServingOnceAClientCertificateHasExpired() throws Exception {
     TestPki pki = new TestPki(dir, "ca");
     TestPki.write(
         dir.resolve("tls"), pki.issue("client", "uri:spiffe://example.org/app"), pki.caPem());
@@ -80,27 +86,27 @@ class AdminServerTest {
             .build();
     try (TlsSources tls = TlsSources.create(config)) {
       readiness.started(tls);
-      admin = AdminServer.start(0, readiness, Clock.systemUTC());
-      assertThat(get("/readyz").statusCode()).isEqualTo(200);
-      admin.close();
+      start(Clock.systemUTC());
+      assertThat(check("")).isEqualTo(ServingStatus.SERVING);
 
       // The certificate lasts a day; nothing renewed it.
-      admin = AdminServer.start(0, readiness, Clock.offset(Clock.systemUTC(), Duration.ofDays(3)));
-      HttpResponse<String> expired = get("/readyz");
-      assertThat(expired.statusCode()).isEqualTo(503);
-      assertThat(expired.body()).startsWith("clusters.orders.tls: the client certificate expired");
+      Clock later = Clock.offset(Clock.systemUTC(), Duration.ofDays(3));
+      assertThat(readiness.problems(later.instant()))
+          .singleElement()
+          .asString()
+          .startsWith("clusters.orders.tls: the client certificate expired");
+      start(later);
+      assertThat(check("")).isEqualTo(ServingStatus.NOT_SERVING);
+      assertThat(check(HealthService.LIVENESS)).isEqualTo(ServingStatus.SERVING);
     }
   }
 
   @Test
-  void onlyGetIsAnswered() throws Exception {
-    admin = AdminServer.start(0, readiness, Clock.systemUTC());
-    HttpResponse<String> response =
-        http.send(
-            HttpRequest.newBuilder(URI.create("http://localhost:" + admin.port() + "/readyz"))
-                .POST(HttpRequest.BodyPublishers.noBody())
-                .build(),
-            HttpResponse.BodyHandlers.ofString());
-    assertThat(response.statusCode()).isEqualTo(405);
+  void unknownServiceIsNotFound() throws Exception {
+    start(Clock.systemUTC());
+    assertThatThrownBy(() -> check("odradek.kafka.v1.OdradekService"))
+        .isInstanceOfSatisfying(
+            StatusRuntimeException.class,
+            e -> assertThat(e.getStatus().getCode()).isEqualTo(Status.Code.NOT_FOUND));
   }
 }

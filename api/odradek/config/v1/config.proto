@@ -66,8 +66,8 @@ message ServerConfig {
   // Where the app-facing gRPC server listens. Not hot-reloadable: a change
   // takes effect at the next server restart.
   Listener listener = 1;
-  // The health and metrics endpoint. Not hot-reloadable: a change takes
-  // effect at the next server restart.
+  // The health service for kubelet probes. Not hot-reloadable: a change
+  // takes effect at the next server restart.
   Admin admin = 2;
 
   reserved 3;
@@ -327,13 +327,14 @@ message Listener {
   repeated uint32 allowed_gids = 3 [(buf.validate.field).repeated.unique = true];
 }
 
-// Admin configures the HTTP endpoint used by kubelet probes and metrics
-// scraping: GET /healthz answers 200 while the process runs, GET /readyz
-// answers 200 once the server is listening with usable TLS credentials and 503
-// with the reasons otherwise.
+// Admin configures the TCP port kubelet probes. It serves the standard gRPC
+// health service (grpc.health.v1.Health/Check) and nothing else: service ""
+// is SERVING once the server is listening with usable TLS credentials and
+// NOT_SERVING otherwise; service "liveness" is SERVING while the process runs.
+// The same service is offered to the app on the listener's Unix socket.
 message Admin {
-  // TCP port for the health and Prometheus metrics endpoints. Default: 9464.
-  // 0 picks a free port, which the server logs.
+  // TCP port of the health service. Default: 9464. 0 picks a free port, which
+  // the server logs.
   uint32 port = 1 [(buf.validate.field).uint32.lte = 65535];
 }
 

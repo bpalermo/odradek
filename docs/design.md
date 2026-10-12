@@ -43,7 +43,7 @@ flowchart LR
       cs["ConsumeSession"]
       prod["KafkaProducer<br/>one per cluster"]
       cons["KafkaConsumer<br/>one per Consume stream"]
-      admin["Admin HTTP<br/>health, metrics"]
+      admin["Health gRPC<br/>TCP port"]
       grpc --> ps --> prod
       grpc --> cs --> cons
     end
@@ -67,7 +67,7 @@ flowchart LR
 ### Server internals
 
 - **Transport**: grpc-java on unshaded Netty (`grpc-netty`, never `grpc-netty-shaded`) with the epoll native transport (`netty-transport-native-epoll`, `linux-x86_64` and `linux-aarch_64`). The server binds a Unix domain socket, mode `0660`, on an `emptyDir` shared by both containers. Peer UID/GID are checked with `SO_PEERCRED` against an allow-list.
-- **Admin endpoint**: a small HTTP server on a TCP port (default 9464) for kubelet probes and, later, Prometheus metrics. Kubelet gRPC probes cannot target a Unix socket, so probes use HTTP. `GET /healthz` answers 200 while the process runs. `GET /readyz` answers 200 when the server can do its work and 503 otherwise, with one reason per line.
+- **Health service**: the standard gRPC health service (`grpc.health.v1.Health/Check`) on a TCP port of its own (default 9464), for kubelet's gRPC probes, which cannot target a Unix socket. The port serves nothing else. Service `""` is `SERVING` when the server can do its work and `NOT_SERVING` otherwise; service `liveness` is `SERVING` while the process runs. The response carries no reason, so each change of state is logged with it. The same service is offered on the app's Unix socket. `Watch` is not offered. Metrics do not need a port: they are pushed over OTLP (not built yet).
 - **Threading**:
   - One shared `KafkaProducer` (thread-safe) per cluster. Each Produce stream calls `send()` from its own serialized gRPC callback, with manual inbound flow control (`request(1)`), so arrival order equals `send()` order.
   - One `KafkaConsumer` per Consume stream, owned by a dedicated poll thread. gRPC control messages (`Credits`, `Ack`, `RevokeDone`) are queued to that thread; nothing else touches the consumer.
@@ -75,8 +75,8 @@ flowchart LR
 ### Lifecycle
 
 - The server runs as a native sidecar: an `initContainer` with `restartPolicy: Always`.
-- **Startup**: `/readyz` is the `startupProbe` and the `readinessProbe`. It is up before anything that can take time and answers 503 `starting: loading TLS credentials` while the server waits for its first credentials (with a SPIFFE source, the first SVID). It answers 200 once the credentials are loaded and the socket is listening. The app container starts after that. Not built yet: waiting for broker metadata of every required cluster.
-- **Readiness afterwards**: `/readyz` goes back to 503 when a cluster's client certificate has expired, which means whatever renews it has stopped (files not replaced, or the Workload API unreachable for an SVID's lifetime), and when shutdown begins.
+- **Startup**: health service `""` is the `startupProbe` and the `readinessProbe`. Its port is up before anything that can take time, and it answers `NOT_SERVING` while the server waits for its first credentials (with a SPIFFE source, the first SVID). It answers `SERVING` once the credentials are loaded and the socket is listening. The app container starts after that. Not built yet: waiting for broker metadata of every required cluster.
+- **Readiness afterwards**: `""` goes back to `NOT_SERVING` when a cluster's client certificate has expired, which means whatever renews it has stopped (files not replaced, or the Workload API unreachable for an SVID's lifetime), and when shutdown begins.
 - **App readiness**: the client library reports ready only while it holds a session whose handshake has completed.
 - **Shutdown**: the server receives SIGTERM after the app container exits. It stops accepting streams, completes in-flight produce results, `flush()`es, commits acked offsets, leaves its groups and exits. `terminationGracePeriodSeconds` must cover app drain plus `delivery.timeout.ms`.
 - **Server restart with the app alive**: the app reconnects, sees a new `server_epoch`, and fails every unacknowledged send with *outcome unknown*. Consumers get a fresh assignment; unacked records are redelivered.
@@ -155,7 +155,7 @@ consumers:                     # keyed by topic name
 - The name is referenced only inside the configuration. Apps never see it as a parameter; it appears to them only as information in results.
 - `required: true` clusters gate the `startupProbe`. Optional clusters connect on first use.
 - Each cluster has its own producer, `buffer.memory`, consumers and credentials, so the container memory limit scales with the number of clusters.
-- Every metric carries a `cluster` label, and the admin endpoint reports status per cluster.
+- Every metric carries a `cluster` label.
 - A cluster that is still referenced by a producer or consumer entry cannot be removed; such a configuration is invalid.
 
 ### Enforced Kafka settings
@@ -443,7 +443,7 @@ A record that cannot be reversed or deserialized cannot be delivered as the cont
 
 1. Parse the complete new configuration into `ServerConfig`, validate it with protovalidate, then run the non-schema checks.
 2. If invalid: keep running on the last good configuration, log every violation, increment `config_reload_failures_total`. Liveness is not affected.
-3. If valid: diff against the running configuration and apply per the table below, then publish the new content hash and reload timestamp on the admin endpoint and as metrics.
+3. If valid: diff against the running configuration and apply per the table below, then publish the new content hash and reload timestamp as metrics.
 
 At startup there is no last good configuration, so an invalid or missing one fails the `startupProbe`.
 
@@ -460,7 +460,7 @@ At startup there is no last good configuration, so an invalid or missing one fai
 | A topic's `startTimestamp` or `offsetReset` | Stored; used only the next time a partition has no committed offset | No |
 | A codec's classes, properties or transforms; `defaultCodec`; a topic's `codec` or contract type | Pipeline replaced at a record boundary (produce) or between batches (consume) | No |
 | A cluster added | Available immediately | No |
-| Socket path, admin port | Not reloadable; logged and flagged in `config_restart_required` | No, until restart |
+| Socket path, health port | Not reloadable; logged and flagged in `config_restart_required` | No, until restart |
 
 ### Producer swap
 
@@ -512,7 +512,7 @@ Each cluster's `tls` block selects one source.
 - `spiffe` is the server's own client of the Workload API, on the gRPC stack it already has, rather than `java-spiffe`: one streaming call, no second gRPC or Netty on the class path, and nothing new for the native image. The socket is `workloadApiSocket`, or the `SPIFFE_ENDPOINT_SOCKET` environment variable. Clusters naming the same socket share one stream and so one SVID. The first SVID of an update is used.
 - When the stream ends (the agent restarts), it is opened again with a pause that grows from half a second to thirty. The current SVID stays in use meanwhile, for as long as it is valid.
 - Federated bundles cover brokers in another trust domain. A broker is verified against the bundle of the trust domain its SPIFFE ID names and no other, so an authority federated with can only vouch for its own identities.
-- Metrics (not built yet): certificate `not_after` timestamp, last successful reload, reload count, `credential_reload_failures_total`. Alert on time-to-expiry, not on rotation events. Today reloads and rejections are logged, and an expired certificate fails `/readyz`.
+- Metrics (not built yet): certificate `not_after` timestamp, last successful reload, reload count, `credential_reload_failures_total`. Alert on time-to-expiry, not on rotation events. Today reloads and rejections are logged, and an expired certificate makes the health service answer `NOT_SERVING`.
 
 ### Peer verification
 

@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.kafka.v1.OdradekServiceGrpc;
 import io.github.bpalermo.odradek.server.admin.AdminServer;
+import io.github.bpalermo.odradek.server.admin.HealthService;
 import io.github.bpalermo.odradek.server.admin.Readiness;
 import io.github.bpalermo.odradek.server.codec.CodecConfigException;
 import io.github.bpalermo.odradek.server.codec.CodecRegistry;
@@ -89,15 +90,15 @@ public final class Main {
 
     // Up before anything that can take time, so a probe sees "starting" rather than nothing.
     Readiness readiness = new Readiness();
+    HealthService health = new HealthService(readiness, Clock.systemUTC());
     AdminServer admin;
     try {
       admin =
           AdminServer.start(
               config.getAdmin().hasPort() ? config.getAdmin().getPort() : AdminServer.DEFAULT_PORT,
-              readiness,
-              Clock.systemUTC());
+              health);
     } catch (IOException e) {
-      LOG.error("could not start the admin endpoint: {}", e.toString());
+      LOG.error("could not start the health service: {}", e.toString());
       codecs.close();
       System.exit(1);
       return;
@@ -132,7 +133,7 @@ public final class Main {
 
     OdradekServer server;
     try {
-      server = OdradekServer.start(config, new OdradekService(produce, consume));
+      server = OdradekServer.start(config, new OdradekService(produce, consume), health);
     } catch (IOException e) {
       LOG.error("could not start", e);
       producers.close(Duration.ZERO);
