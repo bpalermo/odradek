@@ -148,7 +148,8 @@ public final class ProduceService {
           () ->
               fail(
                   Status.ABORTED.withDescription(
-                      "another stream opened session " + id + "; this one is closed")));
+                      "another stream opened session " + id + "; this one is closed")),
+          this::finishIfDone);
     }
 
     private void record(ProduceRecord record) {
@@ -253,20 +254,27 @@ public final class ProduceService {
           return;
         }
         call.onNext(ProduceResponse.newBuilder().setResult(result).build());
-        if (halfClosed && session.inFlightRecords() == 0) {
-          finish();
-        }
       }
+    }
+
+    /** Completes the stream once the app has half-closed and every result has been sent. */
+    private void finishIfDone() {
+      synchronized (this) {
+        if (!halfClosed || closed || (session != null && !session.settled())) {
+          return;
+        }
+        closed = true;
+        call.onCompleted();
+      }
+      detach();
     }
 
     @Override
     public void onCompleted() {
       synchronized (this) {
         halfClosed = true;
-        if (!closed && (session == null || session.inFlightRecords() == 0)) {
-          finish();
-        }
       }
+      finishIfDone();
     }
 
     @Override
@@ -278,13 +286,6 @@ public final class ProduceService {
       synchronized (this) {
         closed = true;
       }
-      detach();
-    }
-
-    /** Completes the stream once the app has half-closed and every record has its result. */
-    private void finish() {
-      closed = true;
-      call.onCompleted();
       detach();
     }
 

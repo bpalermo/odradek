@@ -5,7 +5,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import org.apache.kafka.common.header.Headers;
 
-/** Appends "!" and adds a header on produce. Fails for the payload "boom". */
+/**
+ * Appends "!" and adds a header on produce; undoes both on consume. Fails to encode the payload
+ * "boom" and to decode anything that does not end with "!".
+ */
 public final class SuffixTransform implements RecordTransform {
   @Override
   public byte[] apply(String topic, Headers headers, byte[] data) {
@@ -20,6 +23,10 @@ public final class SuffixTransform implements RecordTransform {
 
   @Override
   public byte[] reverse(String topic, Headers headers, byte[] data) {
+    if (data.length == 0 || data[data.length - 1] != '!') {
+      throw new IllegalArgumentException("data does not end with the suffix");
+    }
+    headers.remove("suffixed");
     return Arrays.copyOf(data, data.length - 1);
   }
 }
