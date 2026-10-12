@@ -32,6 +32,36 @@ message ServerConfig {
     message: "every consumer must reference an entry in clusters"
     expression: "this.consumers.all(topic, this.consumers[topic].cluster in this.clusters)"
   };
+  option (buf.validate.message).cel = {
+    id: "server_config.default_codec_exists"
+    message: "default_codec must be passthrough or reference an entry in codecs"
+    expression: "this.default_codec == '' || this.default_codec == 'passthrough' || this.default_codec in this.codecs"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.producer_codec_exists"
+    message: "a producer's codec must be passthrough or reference an entry in codecs"
+    expression: "this.producers.all(topic, this.producers[topic].codec == '' || this.producers[topic].codec == 'passthrough' || this.producers[topic].codec in this.codecs)"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.consumer_codec_exists"
+    message: "a consumer's codec must be passthrough or reference an entry in codecs"
+    expression: "this.consumers.all(topic, this.consumers[topic].codec == '' || this.consumers[topic].codec == 'passthrough' || this.consumers[topic].codec in this.codecs)"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.passthrough_reserved"
+    message: "passthrough is a built-in codec and cannot be defined in codecs"
+    expression: "!('passthrough' in this.codecs)"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.contract_types_match"
+    message: "a topic that is both produced and consumed must declare the same key_type and value_type in both entries"
+    expression: "this.producers.all(topic, !(topic in this.consumers) || (this.producers[topic].value_type == this.consumers[topic].value_type && this.producers[topic].key_type == this.consumers[topic].key_type))"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.contracts_required"
+    message: "contracts.descriptor_sets must be set when any topic declares key_type or value_type"
+    expression: "size(this.contracts.descriptor_sets) > 0 || (this.producers.all(topic, this.producers[topic].value_type == '' && this.producers[topic].key_type == '') && this.consumers.all(topic, this.consumers[topic].value_type == '' && this.consumers[topic].key_type == ''))"
+  };
 
   // Where the app-facing gRPC server listens. Not hot-reloadable: a change
   // takes effect at the next server restart.
@@ -67,6 +97,94 @@ message ServerConfig {
   // topic is produced to. A topic without an entry cannot be produced to:
   // the record is rejected with ERROR_CODE_TOPIC_NOT_CONFIGURED.
   map<string, Producer> producers = 8 [(buf.validate.field).map.keys.string.pattern = "^[a-zA-Z0-9._-]{1,249}$"];
+
+  // Where the protobuf message types named by `key_type` and `value_type`
+  // are found.
+  Contracts contracts = 9;
+
+  // Name of the codec used by every topic whose entry does not set `codec`:
+  // an entry in `codecs`, or the built-in `passthrough`. Unset is the same
+  // as `passthrough`: bytes are stored as the app sent them.
+  string default_codec = 10;
+
+  // Codecs by name. A codec says how records are stored in Kafka: the
+  // serialization format and any transforms such as encryption. Names follow
+  // the rules of cluster names; `passthrough` is reserved for the built-in
+  // codec.
+  map<string, Codec> codecs = 11 [(buf.validate.field).map.keys.string.pattern = "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"];
+
+  // Absolute path of a directory of jar files holding the serializer,
+  // deserializer and transform classes that codecs name. Read once at
+  // startup; not hot-reloadable. Unset means only classes shipped with the
+  // server are available.
+  string extensions_dir = 12 [(buf.validate.field).string.prefix = "/"];
+}
+
+// Contracts lists the schemas of the messages apps exchange with the server.
+message Contracts {
+  // Absolute paths of files holding a serialized
+  // google.protobuf.FileDescriptorSet (for example the output of
+  // `buf build -o contracts.binpb`). Each set must contain the files it
+  // imports, or another listed set must. A message type may be defined only
+  // once across all sets.
+  repeated string descriptor_sets = 1 [
+    (buf.validate.field).repeated.unique = true,
+    (buf.validate.field).repeated.items.string.prefix = "/"
+  ];
+}
+
+// Codec is the pipeline between the bytes an app exchanges with the server
+// and the bytes stored in Kafka, for record keys and for record values.
+message Codec {
+  // How record keys are stored. Unset stores them unchanged. Kafka
+  // partitions and compacts by the stored key, so a key pipeline must be
+  // deterministic: equal keys must produce equal bytes.
+  Pipeline key = 1;
+  // How record values are stored. Unset stores them unchanged.
+  Pipeline value = 2;
+}
+
+// Pipeline is the chain applied to one side of a record (key or value). On
+// produce the serializer runs first, then the transforms in order. On
+// consume the transforms run in reverse order, then the deserializer. A null
+// key or value is never passed through the pipeline.
+message Pipeline {
+  option (buf.validate.message).cel = {
+    id: "pipeline.serializer_pair"
+    message: "serializer and deserializer must be set together"
+    expression: "(this.serializer == '') == (this.deserializer == '')"
+  };
+
+  // Fully qualified name of a class implementing
+  // org.apache.kafka.common.serialization.Serializer. It receives a
+  // com.google.protobuf.Message when the topic declares a contract type and
+  // the class does not declare that it takes byte[]; otherwise the bytes the
+  // app sent. Unset stores the app's bytes as they are.
+  string serializer = 1 [(buf.validate.field).string.pattern = "^[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*$"];
+  // Fully qualified name of a class implementing
+  // org.apache.kafka.common.serialization.Deserializer. It must return a
+  // com.google.protobuf.Message or a byte[]. Required when serializer is
+  // set.
+  string deserializer = 2 [(buf.validate.field).string.pattern = "^[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*$"];
+  // Passed to the serializer's and the deserializer's configure(), as the
+  // Kafka client passes its own configuration.
+  map<string, string> properties = 3;
+  // Byte-to-byte steps applied to the serialized form, such as encryption.
+  repeated Transform transforms = 4;
+}
+
+// Transform is one byte-to-byte step of a Pipeline.
+message Transform {
+  // Fully qualified name of a class implementing
+  // io.github.bpalermo.odradek.extension.RecordTransform. Written as `class`
+  // in the configuration file. Required.
+  string class_name = 1 [
+    json_name = "class",
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.pattern = "^[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*$"
+  ];
+  // Passed to the transform's configure().
+  map<string, string> properties = 2;
 }
 
 // Producer says which clusters a topic is produced to. With more than one
@@ -89,6 +207,20 @@ message Producer {
   // The clusters to write to. All are equal peers; the order only determines
   // the order of ProduceResult.writes. At least one is required.
   repeated ProduceTarget clusters = 1 [(buf.validate.field).repeated.min_items = 1];
+
+  // Name of the codec that stores this topic: an entry in
+  // ServerConfig.codecs, or `passthrough`. Unset uses
+  // ServerConfig.default_codec. The codec replaces the default as a whole;
+  // nothing is merged.
+  string codec = 2;
+  // Fully qualified protobuf message type the app exchanges as the record
+  // value, found in ServerConfig.contracts. Unset means the value is opaque
+  // bytes. A topic present in both `producers` and `consumers` must declare
+  // the same type in both.
+  string value_type = 3 [(buf.validate.field).string.pattern = "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"];
+  // Fully qualified protobuf message type the app exchanges as the record
+  // key. Unset means the key is opaque bytes. See value_type.
+  string key_type = 4 [(buf.validate.field).string.pattern = "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"];
 }
 
 // ProduceTarget is one cluster a topic is produced to.
@@ -134,6 +266,37 @@ message Consumer {
   // offset and start_timestamp is unset or matches no record.
   // Default: OFFSET_RESET_EARLIEST.
   OffsetReset offset_reset = 4 [(buf.validate.field).enum.defined_only = true];
+
+  // Name of the codec that stores this topic: an entry in
+  // ServerConfig.codecs, or `passthrough`. Unset uses
+  // ServerConfig.default_codec. The codec replaces the default as a whole;
+  // nothing is merged.
+  string codec = 5;
+  // Fully qualified protobuf message type the app exchanges as the record
+  // value, found in ServerConfig.contracts. Unset means the value is opaque
+  // bytes. A topic present in both `producers` and `consumers` must declare
+  // the same type in both.
+  string value_type = 6 [(buf.validate.field).string.pattern = "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"];
+  // Fully qualified protobuf message type the app exchanges as the record
+  // key. Unset means the key is opaque bytes. See value_type.
+  string key_type = 7 [(buf.validate.field).string.pattern = "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"];
+  // What happens to a record that the codec cannot decode.
+  // Default: ON_DECODE_ERROR_FAIL.
+  OnDecodeError on_decode_error = 8 [(buf.validate.field).enum.defined_only = true];
+}
+
+// OnDecodeError is the handling of a consumed record whose key or value the
+// topic's codec cannot turn back into what the app expects.
+enum OnDecodeError {
+  // Not set; behaves as ON_DECODE_ERROR_FAIL.
+  ON_DECODE_ERROR_UNSPECIFIED = 0;
+  // End the Consume stream with DATA_LOSS. The offset is not committed, so
+  // the record is met again after resubscribing, until the codec or the
+  // record's source is fixed. Nothing is skipped.
+  ON_DECODE_ERROR_FAIL = 1;
+  // Deliver the record as stored, with ConsumedRecord.decode_error set. The
+  // app acks it like any other record and decides what to do with it.
+  ON_DECODE_ERROR_DELIVER_UNDECODED = 2;
 }
 
 // OffsetReset is the position used for a partition without a committed

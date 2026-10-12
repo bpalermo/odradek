@@ -11,12 +11,16 @@ java_library(
     srcs = glob(["src/main/java/**/*.java"]),
     javacopts = JAVACOPTS,
     deps = [
+        "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
         "//api/odradek/kafka/v1:odradek_java_proto",
+        "//extension/java:extension",
         "@grpc-java//api",
         "@grpc-java//netty",
         "@grpc-java//stub",
+        "@maven//:org_apache_kafka_kafka_clients",
         "@maven//:org_slf4j_slf4j_api",
+        "@protobuf//java/core",
     ],
 )
 
@@ -59,13 +63,18 @@ java_junit_test(
     javacopts = JAVACOPTS,
     test_classes = [
         "io.github.bpalermo.odradek.server.MainTest",
+        "io.github.bpalermo.odradek.server.codec.CodecRegistryTest",
+        "io.github.bpalermo.odradek.server.codec.ContractRegistryTest",
+        "io.github.bpalermo.odradek.server.codec.ExtensionsTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
     ],
     deps = [
         ":server_lib",
         "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
+        "//extension/java:extension",
         "@maven//:build_buf_protovalidate",
+        "@maven//:org_apache_kafka_kafka_clients",
         "@maven//:org_assertj_assertj_core",
         "@maven//:org_junit_jupiter_junit_jupiter_api",
         "@protobuf//java/core",

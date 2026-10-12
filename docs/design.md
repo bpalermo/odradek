@@ -61,6 +61,7 @@ flowchart LR
 | `//api` | The two proto contracts. The only thing another language needs. |
 | `//server` | Owns all Kafka clients, topic routing, credentials and the settings the guarantees depend on. |
 | `//client/java` | Hides streams, `seq`, credits and reconnects. Exposes `send() -> CompletableFuture` and a poll/handler consumer API. |
+| `//extension/java` | The interface extension jars implement for codec transforms. Serializers use Kafka's own interfaces. |
 
 ### Server internals
 
@@ -289,8 +290,6 @@ With the cooperative-sticky assignor, `onPartitionsRevoked` runs on the poll thr
 
 A codec is the per-topic pipeline between the bytes the app exchanges with the server and the bytes stored in Kafka. It is the server's extension point: wire formats and transforms such as encryption are classes named in the configuration, loaded the way the Kafka Java client loads `value.serializer`.
 
-This section is design only; the `codecs` schema and the decode-error marker are not in the protos yet.
-
 ### What the app sees
 
 - The app's contract for a topic is a protobuf message type, never a Kafka wire format. `ProduceRecord.value` and `ConsumedRecord.value` carry that message in protobuf encoding. The Java client library exposes it as typed messages.
@@ -319,7 +318,7 @@ flowchart LR
 | Stage | Interface | Notes |
 |---|---|---|
 | Wire format | Kafka's own `org.apache.kafka.common.serialization.Serializer<T>` and `Deserializer<T>` | `T` is `com.google.protobuf.Message` when the topic declares a contract type, `byte[]` when it does not. Serializers written for the Java client against those types are usable as they are |
-| Transform | `RecordTransform`, published by Odradek in a small API artifact | Bytes to bytes, one class for both directions so encrypt and decrypt cannot be configured apart |
+| Transform | `RecordTransform`, published by Odradek in a small API artifact (`//extension/java`) | Bytes to bytes, one class for both directions so encrypt and decrypt cannot be configured apart |
 
 ```java
 public interface RecordTransform extends Closeable {
@@ -333,7 +332,7 @@ public interface RecordTransform extends Closeable {
 - A transform may add headers on produce (key id, algorithm) and is responsible for removing them on consume if the app should not see them.
 - A serializer instance is shared by all Produce streams, so it must be thread-safe, as it must be under a shared `KafkaProducer`. Deserializers and the reverse side of transforms get one instance per Consume stream.
 - Pipeline code runs on the stream's serialized callback and on the consumer poll thread. It must not block per record: key material and schemas are fetched in `configure` or cached.
-- Extension jars are read from one directory at startup, into a class loader below the server's. Adding or replacing a jar needs a restart; the image is extended or the directory is mounted.
+- Extension jars are read from one directory (`extensionsDir`) at startup, into a class loader below the server's. The server's own classes, kafka-clients and protobuf always win over a copy in an extension jar. Adding or replacing a jar needs a restart; the image is extended or the directory is mounted.
 - Extensions run inside the server process, next to the Kafka credentials. Only trusted code belongs there.
 
 ### Configuration
@@ -353,6 +352,8 @@ Resolution for a topic:
 - `passthrough` is a reserved name. Setting `codec: passthrough` on a topic is how it opts out of the default.
 - A reference to a missing codec, a type missing from the descriptor sets, or a class that cannot be loaded rejects the configuration.
 - A serializer that needs the message type (`T` is `Message`) cannot be used for a topic without a declared type; that also rejects the configuration.
+- A serializer that declares `byte[]` is handed the app's bytes even when the topic declares a type.
+- Null keys and tombstone values never enter a pipeline: null stays null in both directions.
 
 ```yaml
 contracts:
