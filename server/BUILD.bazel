@@ -1,7 +1,7 @@
+load("@rules_graalvm//graalvm:defs.bzl", "native_image")
 load("@rules_java//java:defs.bzl", "java_binary", "java_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel:registry.bzl", "IMAGE_REGISTRY", "image_repository")
-load("//bazel/graalvm:defs.bzl", "native_image")
 load("//bazel/image:defs.bzl", "executable_image", "java_image")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
 load("//bazel/java:junit.bzl", "java_junit_test")
@@ -86,23 +86,37 @@ filegroup(
 # the architecture of the machine building it: GraalVM does not cross-compile.
 native_image(
     name = "server_native",
-    binary = ":server_runtime",
-    flags = [
-        # Logback is configured while the image is built (netty, initialized at
-        # build time, creates its loggers then): logback.xml is read here, not
-        # at start.
-        "--initialize-at-build-time=ch.qos.logback,org.slf4j",
+    data = [":native_metadata"],
+    executable_name = "%target%",
+    extra_args = [
+        # The reachability metadata of :native_metadata.
+        "-H:ConfigurationFileDirectories=server/native-image",
+        # Not tuned to the machine that happens to build it: the image runs on
+        # whatever node it is scheduled to.
+        "-march=compatibility",
+        # Heap of the image builder: a ceiling, not a reservation.
+        "-J-Xmx8g",
         # zlib linked in, libc not: runs on a base that has glibc and nothing
         # else, and netty's epoll library can still be loaded.
         "--static-nolibc",
     ],
+    # Logback is configured while the image is built (netty, initialized at
+    # build time, creates its loggers then): logback.xml is read here, not at
+    # start.
+    initialize_at_build_time = [
+        "ch.qos.logback",
+        "org.slf4j",
+    ],
     main_class = "io.github.bpalermo.odradek.server.Main",
-    metadata = [":native_metadata"],
+    # Always fully optimized: without this the rule follows --compilation_mode
+    # and the default (fastbuild) asks native-image for a quick build (-Ob).
+    optimization_mode = "2",
     # Not part of //...: building it needs gcc and zlib, and a minute of 4 GB.
     # CI's `native` job builds and tests it by name.
     tags = ["manual"],
     target_compatible_with = ["@platforms//os:linux"],
     visibility = ["//visibility:public"],
+    deps = [":server_runtime"],
 )
 
 # A serializer in a jar of its own, as an extension directory would hold it.
