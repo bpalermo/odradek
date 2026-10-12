@@ -27,10 +27,32 @@ message ServerConfig {
     message: "every producer must reference entries in clusters"
     expression: "this.producers.all(topic, this.producers[topic].clusters.all(t, t.cluster in this.clusters))"
   };
+  // 2 is CONSUMER_SOURCE_DISPATCHER, here and below. The dispatcher resolves
+  // the cluster name of such a consumer.
   option (buf.validate.message).cel = {
     id: "server_config.consumer_cluster_exists"
-    message: "every consumer must reference an entry in clusters"
-    expression: "this.consumers.all(topic, this.consumers[topic].cluster in this.clusters)"
+    message: "every consumer that reads Kafka itself must reference an entry in clusters"
+    expression: "this.consumers.all(topic, this.consumers[topic].source == 2 || this.consumers[topic].cluster in this.clusters)"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.clusters_required"
+    message: "at least one cluster is required, unless a consumer receives from the dispatcher"
+    expression: "size(this.clusters) > 0 || this.consumers.exists(topic, this.consumers[topic].source == 2)"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.dispatcher_required"
+    message: "dispatcher must be set when a consumer's source is CONSUMER_SOURCE_DISPATCHER"
+    expression: "has(this.dispatcher) || this.consumers.all(topic, this.consumers[topic].source != 2)"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.dead_letter_topic_differs"
+    message: "a consumer's dead_letter_topic must not be the topic it consumes"
+    expression: "this.consumers.all(topic, this.consumers[topic].dead_letter_topic != topic)"
+  };
+  option (buf.validate.message).cel = {
+    id: "server_config.policy_clusters_exist"
+    message: "every rule of dispatch.policy must reference an entry in clusters"
+    expression: "this.dispatch.policy.all(rule, rule.cluster in this.clusters)"
   };
   option (buf.validate.message).cel = {
     id: "server_config.default_codec_exists"
@@ -73,15 +95,12 @@ message ServerConfig {
   reserved 3;
 
   // Kafka clusters by name. The name is what `producers` and `consumers`
-  // entries reference; apps never see it as a parameter. Names are
-  // lowercase alphanumerics and dashes, at most 63 characters. At least one
-  // cluster is required.
-  map<string, Cluster> clusters = 4 [(buf.validate.field).map = {
-    min_pairs: 1
-    keys: {
-      string: {pattern: "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"}
-    }
-  }];
+  // entries and the rules of `dispatch.policy` reference; apps never see it
+  // as a parameter. Names are lowercase alphanumerics and dashes, at most 63
+  // characters. At least one cluster is required, except in a server that
+  // receives what it consumes from a dispatcher and produces nothing: it
+  // talks to no broker.
+  map<string, Cluster> clusters = 4 [(buf.validate.field).map.keys.string.pattern = "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"];
 
   // Settings for the produce path, shared by all clusters.
   Produce produce = 5;
@@ -122,6 +141,134 @@ message ServerConfig {
   // Where the server's metrics are pushed. Not hot-reloadable. Unset means
   // no metrics are exported.
   Telemetry telemetry = 13;
+
+  // Makes this server a dispatcher: it joins the consumer groups that
+  // sidecars declare and hands them the records, instead of each
+  // application pod consuming for itself. Unset means the server dispatches
+  // nothing. One server may be a dispatcher and serve an app at the same
+  // time.
+  Dispatch dispatch = 14;
+
+  // The dispatcher that the consumers whose `source` is
+  // CONSUMER_SOURCE_DISPATCHER receive their records from. Required when
+  // there is such a consumer; unused otherwise.
+  Dispatcher dispatcher = 15;
+}
+
+// Dispatch configures a dispatcher: a server deployed on its own, whose
+// replicas are the consumer group, and which delivers the records it consumes
+// to the sidecars that connect to it.
+//
+// A dispatcher has no list of topics. It consumes what the connected sidecars
+// declare, on the clusters of ServerConfig.clusters, as far as `policy`
+// allows.
+message Dispatch {
+  // TCP port on which sidecars connect (odradek.delivery.v1.DeliveryService).
+  // Default: 9465. 0 picks a free port, which the server logs. Not
+  // hot-reloadable: a change takes effect at the next server restart.
+  uint32 port = 1 [(buf.validate.field).uint32.lte = 65535];
+  // The address, as host:port, at which sidecars reach this replica. The
+  // other replicas hand it to every sidecar, which connects to it as given,
+  // so it must be this replica's own address and not that of a Service in
+  // front of all of them. Default: the address of the pod's network
+  // interface, with `port`. Not hot-reloadable.
+  string advertised_address = 2 [(buf.validate.field).string.host_and_port = true];
+  // How long the dispatcher keeps consuming a topic after the last sidecar
+  // that declared it has gone. It keeps a rollout of the application, during
+  // which every sidecar disconnects once, from making the dispatcher leave
+  // the group and join it again. Zero stops at once. Default: 5m.
+  google.protobuf.Duration idle_grace = 3 [(buf.validate.field).duration.gte = {}];
+  // The largest span, in offsets, between a partition's commit position and
+  // the newest record delivered from it. A partition that reaches it is
+  // paused until its oldest unacknowledged record is acknowledged. It bounds
+  // the memory held per partition and how much is delivered again after a
+  // dispatcher restart. At least 1. Default: 1000.
+  uint32 partition_window = 4 [(buf.validate.field).uint32.gte = 1];
+  // Who may consume what. A declaration is accepted when at least one rule
+  // allows it; with no rule, every declaration is refused. A rule that is
+  // too wide gives an application topics it should not read: the dispatcher
+  // reads Kafka as itself, so the brokers' ACLs cannot tell its applications
+  // apart.
+  repeated PolicyRule policy = 5;
+}
+
+// PolicyRule allows some sidecars to consume some topics of one cluster in
+// some consumer groups. It allows a declaration when the sidecar's identity,
+// the cluster, the topic and the group all match, and, for a declaration
+// that names a dead-letter topic, that topic too.
+//
+// A topic or group pattern is either an exact name or a prefix followed by
+// one `*`, which stands for any characters, including none: `orders.*`
+// matches `orders.created` and `orders.`, and `*` alone matches every name.
+// There is no other wildcard, and `*` anywhere but at the end is rejected.
+message PolicyRule {
+  option (buf.validate.message).cel = {
+    id: "policy_rule.identity_required"
+    message: "a rule needs spiffe_ids or trust_domain"
+    expression: "size(this.spiffe_ids) > 0 || this.trust_domain != ''"
+  };
+
+  // SPIFFE IDs of the sidecars the rule applies to, e.g.
+  // "spiffe://example.org/ns/billing/sa/billing". At least one of spiffe_ids
+  // and trust_domain is required: a rule cannot apply to everybody.
+  repeated string spiffe_ids = 1 [(buf.validate.field).repeated = {
+    unique: true
+    items: {
+      string: {prefix: "spiffe://"}
+    }
+  }];
+  // The rule also applies to every sidecar whose SPIFFE ID is in this trust
+  // domain, given without scheme (e.g. "example.org").
+  string trust_domain = 2 [(buf.validate.field).string.pattern = "^[a-z0-9._-]{1,255}$"];
+  // Name of an entry in ServerConfig.clusters: the cluster the rule lets
+  // these sidecars consume from. Required.
+  string cluster = 3 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.min_len = 1
+  ];
+  // Patterns of the topics the rule allows. At least one is required.
+  repeated string topics = 4 [(buf.validate.field).repeated = {
+    min_items: 1
+    unique: true
+    items: {
+      string: {pattern: "^([a-zA-Z0-9._-]{1,249}|[a-zA-Z0-9._-]{0,248}\\*)$"}
+    }
+  }];
+  // Patterns of the consumer groups the rule allows. At least one is
+  // required. A group is the unit that shares offsets, so two applications
+  // allowed the same group and topic take records from each other.
+  repeated string groups = 5 [(buf.validate.field).repeated = {
+    min_items: 1
+    unique: true
+    items: {
+      string: {pattern: "^([^*]+|[^*]*\\*)$"}
+    }
+  }];
+  // Patterns of the topics that a declaration allowed by this rule may name
+  // as its dead-letter topic. The dispatcher writes exhausted records there
+  // as itself, so this is what stops a sidecar from having it write to a
+  // topic of the sidecar's choosing. Empty means the rule allows no
+  // dead-letter topic.
+  repeated string dead_letter_topics = 6 [(buf.validate.field).repeated = {
+    unique: true
+    items: {
+      string: {pattern: "^([a-zA-Z0-9._-]{1,249}|[a-zA-Z0-9._-]{0,248}\\*)$"}
+    }
+  }];
+}
+
+// Dispatcher says where the dispatcher is, for a server that receives topics
+// from one.
+message Dispatcher {
+  // The address of the dispatcher's Service, as host:port (e.g.
+  // "odradek-dispatcher.kafka.svc:9465"). It is used for the first
+  // connection only, and again after every connection has been lost: the
+  // replica that answers lists all replicas, and the server then connects to
+  // each of them directly. Required.
+  string address = 1 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.host_and_port = true
+  ];
 }
 
 // Telemetry configures the export of the server's metrics over OTLP/gRPC.
@@ -259,7 +406,28 @@ message ProduceTarget {
 // Consumer says where and as whom one topic is consumed. It is the value of
 // ServerConfig.consumers, keyed by topic name.
 message Consumer {
-  // Name of an entry in ServerConfig.clusters to read the topic from.
+  // 2 is CONSUMER_SOURCE_DISPATCHER.
+  option (buf.validate.message).cel = {
+    id: "consumer.dispatcher_settings"
+    message: "ordering, max_attempts, on_exhausted and dead_letter_topic need source CONSUMER_SOURCE_DISPATCHER"
+    expression: "this.source == 2 || (!has(this.ordering) && !has(this.max_attempts) && !has(this.on_exhausted) && !has(this.dead_letter_topic))"
+  };
+  option (buf.validate.message).cel = {
+    id: "consumer.on_exhausted_needs_max_attempts"
+    message: "on_exhausted has no effect without max_attempts"
+    expression: "!has(this.on_exhausted) || has(this.max_attempts)"
+  };
+  // 2 is ON_EXHAUSTED_DEAD_LETTER.
+  option (buf.validate.message).cel = {
+    id: "consumer.dead_letter_topic"
+    message: "dead_letter_topic must be set when on_exhausted is ON_EXHAUSTED_DEAD_LETTER, and only then"
+    expression: "(this.on_exhausted == 2) == has(this.dead_letter_topic)"
+  };
+
+  // The cluster to read the topic from. When this server reads Kafka itself
+  // it is the name of an entry in ServerConfig.clusters. When `source` is
+  // CONSUMER_SOURCE_DISPATCHER it is the name of a cluster in the
+  // dispatcher's configuration, and need not exist in this one.
   // Required; there is no default cluster for consuming.
   string cluster = 1 [
     (buf.validate.field).required = true,
@@ -300,6 +468,81 @@ message Consumer {
   // What happens to a record that the codec cannot decode.
   // Default: ON_DECODE_ERROR_FAIL.
   OnDecodeError on_decode_error = 8 [(buf.validate.field).enum.defined_only = true];
+
+  // Who reads the topic from Kafka: this server, or a dispatcher that hands
+  // it the records. Default: CONSUMER_SOURCE_KAFKA.
+  ConsumerSource source = 9 [(buf.validate.field).enum.defined_only = true];
+  // Which records of the topic may be with applications at the same time,
+  // now that a partition is no longer read by one process. Every server of
+  // the group must say the same. Only with CONSUMER_SOURCE_DISPATCHER.
+  // Default: ORDERING_KEY.
+  Ordering ordering = 10 [(buf.validate.field).enum.defined_only = true];
+  // How many times a record is delivered before it is given up on, as
+  // on_exhausted says. A delivery fails when the app does not acknowledge
+  // the record within the processing deadline, when the app's stream ends,
+  // or when the record cannot be decoded. At least 1. Unset means there is
+  // no limit: the record is delivered again until it is acknowledged. Only
+  // with CONSUMER_SOURCE_DISPATCHER.
+  uint32 max_attempts = 11 [(buf.validate.field).uint32.gte = 1];
+  // What happens to a record that has been delivered max_attempts times
+  // without being acknowledged. Needs max_attempts. Only with
+  // CONSUMER_SOURCE_DISPATCHER. Default: ON_EXHAUSTED_BLOCK.
+  OnExhausted on_exhausted = 12 [(buf.validate.field).enum.defined_only = true];
+  // Topic, on the same cluster, that the dispatcher writes exhausted records
+  // to. It must already exist, the dispatcher's policy must allow it, and it
+  // cannot be the topic itself. Required with ON_EXHAUSTED_DEAD_LETTER and
+  // rejected otherwise.
+  string dead_letter_topic = 13 [(buf.validate.field).string.pattern = "^[a-zA-Z0-9._-]{1,249}$"];
+}
+
+// ConsumerSource says who reads a topic from Kafka on behalf of the app.
+enum ConsumerSource {
+  // Not set; behaves as CONSUMER_SOURCE_KAFKA.
+  CONSUMER_SOURCE_UNSPECIFIED = 0;
+  // This server holds the Kafka consumer, so the application's pods are the
+  // members of the consumer group.
+  CONSUMER_SOURCE_KAFKA = 1;
+  // A dispatcher holds the Kafka consumer and delivers the records to this
+  // server, which decodes them and hands them to the app. The application's
+  // pods are not group members: scaling them rebalances nothing, and there
+  // can be more of them than the topic has partitions.
+  CONSUMER_SOURCE_DISPATCHER = 2;
+}
+
+// Ordering says which records of a topic received from a dispatcher may be
+// with applications at the same time. Order holds only while nothing is
+// delivered again: a record whose processing deadline passes is given to
+// another pod, and both may then process it.
+enum Ordering {
+  // Not set; behaves as ORDERING_KEY.
+  ORDERING_UNSPECIFIED = 0;
+  // A record is delivered only once every earlier record of its partition
+  // with the same key is acknowledged. Records of different keys are
+  // processed in parallel, by more pods than there are partitions if need
+  // be. Records without a key are delivered as under ORDERING_NONE. Keys are
+  // compared as stored in Kafka, so a codec that stores equal keys as
+  // different bytes cannot be used.
+  ORDERING_KEY = 1;
+  // A record is delivered only once every earlier record of its partition
+  // is acknowledged: one record at a time per partition.
+  ORDERING_PARTITION = 2;
+  // A record is delivered as soon as an application has asked for one. No
+  // order is kept.
+  ORDERING_NONE = 3;
+}
+
+// OnExhausted is the handling of a record that was delivered
+// Consumer.max_attempts times without being acknowledged.
+enum OnExhausted {
+  // Not set; behaves as ON_EXHAUSTED_BLOCK.
+  ON_EXHAUSTED_UNSPECIFIED = 0;
+  // The record blocks its partition: it is not skipped, nothing is committed
+  // past it and no later record of the partition is delivered. Nothing is
+  // lost, and the partition's lag grows until someone intervenes.
+  ON_EXHAUSTED_BLOCK = 1;
+  // The dispatcher writes the record, as stored, to
+  // Consumer.dead_letter_topic and moves on. The app never processes it.
+  ON_EXHAUSTED_DEAD_LETTER = 2;
 }
 
 // OnDecodeError is the handling of a consumed record whose key or value the
