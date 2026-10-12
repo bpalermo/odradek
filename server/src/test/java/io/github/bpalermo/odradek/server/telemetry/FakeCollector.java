@@ -96,6 +96,40 @@ public final class FakeCollector {
     }
   }
 
+  /**
+   * Waits until each of {@code texts} has been seen in some export, not necessarily the same one,
+   * or fails after {@code timeout} naming the ones never seen.
+   *
+   * <p>This is the check for metrics that are not all reported at once: a Kafka client's averages
+   * exist only while the client has recent samples, so one may have gone by the time another
+   * appears.
+   */
+  public void awaitEach(Duration timeout, String... texts) throws InterruptedException {
+    long deadline = System.nanoTime() + timeout.toNanos();
+    while (true) {
+      List<String> missing = new java.util.ArrayList<>();
+      for (String text : texts) {
+        if (!received(text)) {
+          missing.add(text);
+        }
+      }
+      if (missing.isEmpty()) {
+        return;
+      }
+      if (System.nanoTime() > deadline) {
+        throw new AssertionError(
+            "never exported within "
+                + timeout
+                + ": "
+                + missing
+                + "; "
+                + exports.size()
+                + " exports received");
+      }
+      Thread.sleep(100);
+    }
+  }
+
   public void close() throws InterruptedException {
     server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
   }

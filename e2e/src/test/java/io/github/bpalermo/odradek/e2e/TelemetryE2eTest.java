@@ -130,7 +130,8 @@ class TelemetryE2eTest {
     }
     assertThat(seen).isEqualTo(RECORDS);
 
-    // One export carries every metric that has a value, with the resource they belong to.
+    // The server's own metrics are all in one export once they have a value, with the resource
+    // they belong to.
     collector.await(
         TIMEOUT,
         "odradek.produce.records",
@@ -138,13 +139,16 @@ class TelemetryE2eTest {
         "odradek.consume.records",
         "odradek.consume.streams",
         "odradek.ready",
-        // The Kafka clients' own: lag once the consumer has fetched, the producer's after a send.
-        "odradek.kafka.consumer.records.lag",
-        "odradek.kafka.consumer.connections",
-        "odradek.kafka.producer.request.latency.avg",
         topic,
         "group-" + id,
         "pod-" + id);
+    // The Kafka clients' own are not all there at the same moment: the producer's averages exist
+    // only while it has recent samples, and the consumer's lag only once it has fetched.
+    collector.awaitEach(
+        TIMEOUT,
+        "odradek.kafka.consumer.records.lag",
+        "odradek.kafka.consumer.connections",
+        "odradek.kafka.producer.request.latency.avg");
     consume.onCompleted();
   }
 
