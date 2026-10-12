@@ -25,16 +25,32 @@ Deferred:
 
 ## 2. Components
 
-```
-┌────────────── pod ──────────────────────────────────────────┐
-│  app container                 sidecar container (native)   │
-│  ┌──────────────────┐   UDS    ┌─────────────────────────┐  │
-│  │ app code         │  gRPC    │ gRPC server (netty/epoll)│  │
-│  │ odradek client ──┼──────────┼─► ProduceSession ─► KafkaProducer ──► brokers
-│  │ library          │ kafka.sock│  ConsumeSession ─► KafkaConsumer ──► brokers
-│  └──────────────────┘          │ admin HTTP :9464 (health, metrics)│
-│        emptyDir (Memory) mounted at /var/run/kafka in both  │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+  subgraph pod["Pod"]
+    subgraph app["App container"]
+      code["App code"]
+      lib["Odradek client library"]
+      code --> lib
+    end
+    sock(["/var/run/kafka/kafka.sock<br/>emptyDir, medium: Memory"])
+    subgraph sidecar["Sidecar container (native sidecar)"]
+      grpc["gRPC server<br/>Netty + epoll"]
+      ps["ProduceSession"]
+      cs["ConsumeSession"]
+      prod["KafkaProducer<br/>one per cluster"]
+      cons["KafkaConsumer<br/>one per Consume stream"]
+      admin["Admin HTTP<br/>health, metrics"]
+      grpc --> ps --> prod
+      grpc --> cs --> cons
+    end
+    lib -- "gRPC over UDS" --> sock --> grpc
+  end
+  cfg[("Config volume<br/>/etc/odradek")] -. "inotify" .-> sidecar
+  spire["SPIRE agent<br/>Workload API"] -. "X.509 SVID watch" .-> sidecar
+  kubelet["kubelet"] -. "probes" .-> admin
+  prod --> brokers[("Kafka clusters")]
+  cons --> brokers
 ```
 
 | Component | Responsibility |
