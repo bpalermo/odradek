@@ -1,10 +1,8 @@
 package io.github.bpalermo.odradek.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.fail;
 
 import com.google.protobuf.ByteString;
-import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.kafka.v1.ErrorCode;
 import io.github.bpalermo.odradek.kafka.v1.OdradekServiceGrpc;
 import io.github.bpalermo.odradek.kafka.v1.ProduceOpen;
@@ -12,24 +10,8 @@ import io.github.bpalermo.odradek.kafka.v1.ProduceRecord;
 import io.github.bpalermo.odradek.kafka.v1.ProduceRequest;
 import io.github.bpalermo.odradek.kafka.v1.ProduceResponse;
 import io.github.bpalermo.odradek.kafka.v1.ProduceResult;
-import io.github.bpalermo.odradek.server.OdradekServer;
-import io.github.bpalermo.odradek.server.OdradekService;
-import io.github.bpalermo.odradek.server.codec.CodecRegistry;
-import io.github.bpalermo.odradek.server.codec.ContractRegistry;
-import io.github.bpalermo.odradek.server.config.ConfigLoader;
-import io.github.bpalermo.odradek.server.produce.ClusterProducers;
-import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
-import io.github.bpalermo.odradek.server.produce.ProduceService;
 import io.grpc.ManagedChannel;
-import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.StreamObserver;
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.MultiThreadIoEventLoopGroup;
-import io.netty.channel.epoll.EpollDomainSocketChannel;
-import io.netty.channel.epoll.EpollIoHandler;
-import io.netty.channel.unix.DomainSocketAddress;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -39,9 +21,6 @@ import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import org.apache.kafka.clients.admin.Admin;
-import org.apache.kafka.clients.admin.AdminClientConfig;
-import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -59,38 +38,24 @@ class ProduceE2eTest {
   private static final Duration TIMEOUT = Duration.ofSeconds(30);
   private static final int PARTITIONS = 3;
 
-  private final String bootstrapA = bootstrap("ODRADEK_E2E_KAFKA_A");
-  private final String bootstrapB = bootstrap("ODRADEK_E2E_KAFKA_B");
+  private final String bootstrapA = ServerHarness.KAFKA_A;
+  private final String bootstrapB = ServerHarness.KAFKA_B;
   private final String topic = "odradek-e2e-produce-" + UUID.randomUUID();
   private final String uneven = "odradek-e2e-uneven-" + UUID.randomUUID();
   private final BlockingQueue<ProduceResponse> responses = new LinkedBlockingQueue<>();
 
-  private Path dir;
-  private CodecRegistry codecs;
-  private ClusterProducers producers;
-  private OdradekServer server;
-  private EventLoopGroup group;
+  private ServerHarness harness;
   private ManagedChannel channel;
-
-  private static String bootstrap(String variable) {
-    String value = System.getenv(variable);
-    if (value == null || value.isBlank()) {
-      return fail("%s is not set; see e2e/BUILD.bazel", variable);
-    }
-    return value.trim();
-  }
 
   @BeforeEach
   void start() throws Exception {
-    createTopic(bootstrapA, topic, PARTITIONS);
-    createTopic(bootstrapB, topic, PARTITIONS);
+    ServerHarness.createTopic(bootstrapA, topic, PARTITIONS);
+    ServerHarness.createTopic(bootstrapB, topic, PARTITIONS);
     // Breaks the prerequisite of producing to several clusters: equal partition counts.
-    createTopic(bootstrapA, uneven, PARTITIONS);
-    createTopic(bootstrapB, uneven, 1);
-
-    dir = Files.createTempDirectory(Path.of("/tmp"), "odradek-e2e");
-    ServerConfig config =
-        ConfigLoader.parse(
+    ServerHarness.createTopic(bootstrapA, uneven, PARTITIONS);
+    ServerHarness.createTopic(bootstrapB, uneven, 1);
+    harness =
+        ServerHarness.start(
             """
             listener:
               socketPath: %s/kafka.sock
@@ -118,52 +83,16 @@ class ProduceE2eTest {
                 clusters:
                   - cluster: a
                   - cluster: b
-            """
-                .formatted(dir, bootstrapA, bootstrapB, topic, uneven));
-    codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
-    producers = ClusterProducers.create(config);
-    server =
-        OdradekServer.start(
-            config,
-            new OdradekService(
-                new ProduceService(config, ProduceRoutes.create(config, producers, codecs))));
-
-    group = new MultiThreadIoEventLoopGroup(1, EpollIoHandler.newFactory());
-    channel =
-        NettyChannelBuilder.forAddress(new DomainSocketAddress(server.socket().toString()))
-            .eventLoopGroup(group)
-            .channelType(EpollDomainSocketChannel.class)
-            .usePlaintext()
-            .build();
+            """,
+            bootstrapA, bootstrapB, topic, uneven);
+    channel = harness.channel;
   }
 
   @AfterEach
   void stop() throws Exception {
-    channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
-    group.shutdownGracefully();
-    server.close();
-    producers.close(Duration.ofSeconds(5));
-    codecs.close();
-    Files.deleteIfExists(dir);
-    deleteTopics(bootstrapA, List.of(topic, uneven));
-    deleteTopics(bootstrapB, List.of(topic, uneven));
-  }
-
-  private static Admin admin(String bootstrap) {
-    return Admin.create(
-        Map.<String, Object>of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap));
-  }
-
-  private static void createTopic(String bootstrap, String name, int partitions) throws Exception {
-    try (Admin admin = admin(bootstrap)) {
-      admin.createTopics(List.of(new NewTopic(name, partitions, (short) 1))).all().get();
-    }
-  }
-
-  private static void deleteTopics(String bootstrap, List<String> names) throws Exception {
-    try (Admin admin = admin(bootstrap)) {
-      admin.deleteTopics(names).all().get();
-    }
+    harness.stop();
+    ServerHarness.deleteTopics(bootstrapA, List.of(topic, uneven));
+    ServerHarness.deleteTopics(bootstrapB, List.of(topic, uneven));
   }
 
   private StreamObserver<ProduceRequest> open(String session) throws InterruptedException {

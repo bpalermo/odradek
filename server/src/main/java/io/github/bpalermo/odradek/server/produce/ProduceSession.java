@@ -36,18 +36,22 @@ final class ProduceSession {
   private long inFlightBytes;
   private Consumer<ProduceResult> sink;
   private Runnable onDisplaced;
+  private Runnable afterDelivery;
+  private int delivering;
   private long detachedAtNanos = System.nanoTime();
 
   /**
    * Makes {@code sink} the stream that receives this session's results. A stream attached before is
-   * told through its {@code onDisplaced} that it has been replaced.
+   * told through its {@code onDisplaced} that it has been replaced. {@code afterDelivery} runs
+   * after each result has been handed to the sink, outside any lock of the session.
    */
-  void attach(Consumer<ProduceResult> sink, Runnable onDisplaced) {
+  void attach(Consumer<ProduceResult> sink, Runnable onDisplaced, Runnable afterDelivery) {
     Runnable displaced;
     synchronized (this) {
       displaced = this.onDisplaced;
       this.sink = sink;
       this.onDisplaced = onDisplaced;
+      this.afterDelivery = afterDelivery;
     }
     if (displaced != null) {
       displaced.run();
@@ -59,6 +63,7 @@ final class ProduceSession {
     if (this.sink == sink) {
       this.sink = null;
       this.onDisplaced = null;
+      this.afterDelivery = null;
       this.detachedAtNanos = System.nanoTime();
     }
   }
@@ -113,6 +118,7 @@ final class ProduceSession {
    */
   void complete(ProduceResult result) {
     Consumer<ProduceResult> to;
+    Runnable after;
     synchronized (this) {
       Entry entry = table.get(result.getSeq());
       if (entry == null) {
@@ -125,13 +131,29 @@ final class ProduceSession {
       }
       entry.result = result;
       to = sink;
+      after = afterDelivery;
+      if (to != null) {
+        delivering++;
+      }
     }
     if (to != null) {
-      to.accept(result);
+      try {
+        to.accept(result);
+      } finally {
+        synchronized (this) {
+          delivering--;
+        }
+      }
+      after.run();
     }
   }
 
-  synchronized int inFlightRecords() {
-    return inFlightRecords;
+  /**
+   * Whether every record handed to Kafka has its result and every such result has been given to the
+   * attached stream. A record can be out of flight while its result is still on its way to the
+   * stream on another thread; the stream must not complete in between.
+   */
+  synchronized boolean settled() {
+    return inFlightRecords == 0 && delivering == 0;
   }
 }

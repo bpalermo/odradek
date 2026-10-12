@@ -85,6 +85,8 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.codec.ContractRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ExtensionsTest",
         "io.github.bpalermo.odradek.server.config.ConfigLoaderTest",
+        "io.github.bpalermo.odradek.server.consume.ConsumeServiceTest",
+        "io.github.bpalermo.odradek.server.consume.PartitionStateTest",
         "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
     ],
@@ -110,5 +112,6 @@ java_junit_test(
         "@maven//:org_assertj_assertj_core",
         "@maven//:org_junit_jupiter_junit_jupiter_api",
         "@protobuf//java/core",
+        "@protobuf//java/util",
     ],
 )

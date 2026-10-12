@@ -8,6 +8,7 @@ import io.github.bpalermo.odradek.server.codec.ContractRegistry;
 import io.github.bpalermo.odradek.server.codec.Extensions;
 import io.github.bpalermo.odradek.server.config.ConfigException;
 import io.github.bpalermo.odradek.server.config.ConfigLoader;
+import io.github.bpalermo.odradek.server.consume.ConsumeService;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
@@ -93,9 +94,11 @@ public final class Main {
     ProduceService produce =
         new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
 
+    ConsumeService consume = new ConsumeService(config, codecs, produce.serverEpoch());
+
     OdradekServer server;
     try {
-      server = OdradekServer.start(config, new OdradekService(produce));
+      server = OdradekServer.start(config, new OdradekService(produce, consume));
     } catch (IOException e) {
       LOG.error("could not start", e);
       producers.close(Duration.ZERO);
@@ -110,8 +113,10 @@ public final class Main {
                 () -> {
                   // No new streams; then every record already accepted gets its broker answer,
                   // and with it its result, before the open streams are closed.
+                  // Consumers commit what was acked and leave their groups.
                   server.stopAccepting();
                   producers.flush();
+                  consume.shutdown(Duration.ofSeconds(15));
                   server.close();
                   producers.close();
                   codecs.close();

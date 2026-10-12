@@ -23,6 +23,7 @@ import io.github.bpalermo.odradek.kafka.v1.ProduceResult;
 import io.github.bpalermo.odradek.server.OdradekService;
 import io.github.bpalermo.odradek.server.codec.CodecRegistry;
 import io.github.bpalermo.odradek.server.codec.ContractRegistry;
+import io.github.bpalermo.odradek.server.consume.ConsumeService;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
@@ -132,7 +133,9 @@ class ProduceServiceTest {
     String name = InProcessServerBuilder.generateName();
     server =
         InProcessServerBuilder.forName(name)
-            .addService(new OdradekService(service))
+            .addService(
+                new OdradekService(
+                    service, new ConsumeService(config, codecs, service.serverEpoch())))
             .build()
             .start();
     channel = InProcessChannelBuilder.forName(name).build();

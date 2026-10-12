@@ -24,6 +24,7 @@ java_junit_test(
     ],
     test_classes = [
         "io.github.bpalermo.odradek.e2e.BrokerSmokeTest",
+        "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
     ],
     runtime_deps = [
