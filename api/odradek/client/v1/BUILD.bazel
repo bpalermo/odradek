@@ -1,28 +1,13 @@
-load("@protobuf//bazel:java_proto_library.bzl", "java_proto_library")
-load("@protobuf//bazel:proto_library.bzl", "proto_library")
-load("//bazel/lint:linters.bzl", "buf_test")
+load("//api:defs.bzl", "odradek_proto_library")
 
 package(default_visibility = ["//visibility:private"])
 
 # The client protocol core as data: events, actions and conformance scenarios.
-proto_library(
-    name = "core_proto",
-    srcs = ["core.proto"],
-    strip_import_prefix = "/api",
-    visibility = ["//visibility:public"],
-    deps = ["//api/odradek/kafka/v1:odradek_proto"],
-)
-
-java_proto_library(
-    name = "core_java_proto",
+odradek_proto_library(
+    name = "core",
     visibility = [
         "//client:__subpackages__",
-        "//e2e:__pkg__",
+        "//e2e:__subpackages__",
     ],
-    deps = [":core_proto"],
-)
-
-buf_test(
-    name = "core_buf_lint_test",
-    srcs = [":core_proto"],
+    deps = ["//api/odradek/kafka/v1:odradek_proto"],
 )

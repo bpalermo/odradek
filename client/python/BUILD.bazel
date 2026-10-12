@@ -2,7 +2,7 @@ load("@rules_python//python:packaging.bzl", "py_package", "py_wheel")
 load("@rules_python//python:py_library.bzl", "py_library")
 load("@rules_python//python:py_test.bzl", "py_test")
 load("//bazel:version.bzl", "VERSION")
-load(":proto.bzl", "py_proto_gen")
+load(":proto.bzl", "py_proto_package")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -15,26 +15,20 @@ exports_files([
 # development value spelled the way PyPI accepts it (PEP 440).
 _VERSION = "0.0.0.dev0" if VERSION == "0.0.0-dev" else VERSION
 
-# The API as Python modules, generated into this package so that they are part
-# of the `odradek` package: odradek.kafka.v1.odradek_pb2 (+ _pb2_grpc) and
-# odradek.client.v1.core_pb2. Nothing generated is checked in.
-py_proto_gen(
-    name = "kafka_py",
-    grpc = True,
-    proto = "//api/odradek/kafka/v1:odradek_proto",
-)
-
-py_proto_gen(
-    name = "core_py",
-    proto = "//api/odradek/client/v1:core_proto",
+# The API as Python modules, placed in this package so that they are part of
+# the `odradek` package: odradek.kafka.v1.odradek_pb2 (+ _pb2_grpc) and
+# odradek.client.v1.core_pb2. Generated next to the protos, never checked in.
+py_proto_package(
+    name = "api_py",
+    protos = [
+        "//api/odradek/client/v1:core_py_proto",
+        "//api/odradek/kafka/v1:odradek_py_proto",
+    ],
 )
 
 filegroup(
     name = "pyi",
-    srcs = [
-        ":core_py",
-        ":kafka_py",
-    ],
+    srcs = [":api_py"],
     output_group = "pyi",
 )
 
@@ -42,10 +36,7 @@ filegroup(
 # to grpcio's asyncio API.
 py_library(
     name = "odradek",
-    srcs = glob(["odradek/**/*.py"]) + [
-        ":core_py",
-        ":kafka_py",
-    ],
+    srcs = glob(["odradek/**/*.py"]) + [":api_py"],
     data = ["odradek/py.typed"],
     imports = ["."],
     pyi_srcs = [":pyi"],

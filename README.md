@@ -6,7 +6,8 @@ odradek moves the Kafka client out of the application. Its server is a Java proc
 
 | Path | Contents |
 | --- | --- |
-| `api/odradek/kafka/v1/` | The `OdradekService` protobuf/gRPC API and its generated Java targets |
+| `api/odradek/kafka/v1/` | The `OdradekService` protobuf/gRPC API |
+| `api/defs.bzl` | `odradek_proto_library`: one call per `.proto` declares its `proto_library`, lint test and Java, Python and Clojure libraries |
 | `server/` | The server `java_binary` (`src/main/java`, `src/test/java`) and its GraalVM native image (`native-image/` holds the reachability metadata) |
 | `client/core/` | The client protocol without I/O, shared by the JVM clients (ADR 1) |
 | `client/java/` | Java client library for applications |
