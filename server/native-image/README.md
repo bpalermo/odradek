@@ -32,7 +32,7 @@ the README) and the GraalVM that the build uses:
 
 1. `bazel build //server:server_native //server:server_deploy.jar` fetches GraalVM and the jars.
 2. Write a script `server.sh` that runs
-   `<output_base>/external/+http_archive+graalvm_linux_x86_64/bin/java
+   `<output_base>/external/rules_graalvm++graalvm+graalvm/bin/java
    -agentlib:native-image-agent=config-merge-dir=<dir> -jar bazel-bin/server/server_deploy.jar "$@"`.
    Add a temporary copy of `//e2e:e2e_jvm_binary_test` to `e2e/BUILD.bazel` whose `env` sets
    `ODRADEK_E2E_SERVER` to the script's absolute path, and run it with
@@ -58,14 +58,19 @@ build the image yourself with your classes in it, for example (a sketch: this re
 do not build such an image):
 
 ```starlark
-load("//bazel/graalvm:defs.bzl", "native_image")
+load("@rules_graalvm//graalvm:defs.bzl", "native_image")
 
 native_image(
     name = "my_server_native",
-    binary = ":my_server_runtime",   # a java_library with runtime_deps = ["//server:server_runtime", ":my_codecs"]
+    data = ["//server:native_metadata", "my-metadata/reachability-metadata.json"],  # + your classes
+    executable_name = "%target%",
+    extra_args = [
+        "-H:ConfigurationFileDirectories=server/native-image,my-metadata",
+        "--static-nolibc",
+    ],
+    initialize_at_build_time = ["ch.qos.logback", "org.slf4j"],
     main_class = "io.github.bpalermo.odradek.server.Main",
-    metadata = ["//server:native_metadata", "my-metadata/reachability-metadata.json"],  # + your classes
-    flags = ["--initialize-at-build-time=ch.qos.logback,org.slf4j", "--static-nolibc"],
+    deps = [":my_server_runtime"],   # a java_library with runtime_deps = ["//server:server_runtime", ":my_codecs"]
 )
 ```
 
