@@ -1,7 +1,7 @@
 """py_proto_gen and py_proto_package: Python code for a proto_library.
 
 py_proto_gen generates the modules next to the proto (odradek_proto_library of
-//api:defs.bzl declares one per .proto). py_proto_package places them in the
+//bazel/proto:defs.bzl declares one per .proto). py_proto_package places them in the
 package that ships them.
 
 protobuf's own py_proto_library is not used for two reasons. Its runtime is

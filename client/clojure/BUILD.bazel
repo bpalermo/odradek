@@ -35,7 +35,7 @@ java_library(
 )
 
 # --- The API as Clojure ------------------------------------------------------------
-# Generated next to the proto (odradek_proto_library of //api:defs.bzl), never
+# Generated next to the proto (odradek_proto_library of //bazel/proto:defs.bzl), never
 # checked in. The copy puts the file under src/, next to the hand-written
 # namespaces, because the Clojars jar strips one prefix.
 genrule(
