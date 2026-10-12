@@ -2,7 +2,7 @@
 ;;
 ;; 1. The top-level :deps are what an application gets from Clojars: the pom of
 ;;    com.github.bpalermo/odradek-clj is these entries, verbatim
-;;    (//client/clojure:clojars). clj-grpc names gRPC 1.83.1 and protobuf-java
+;;    (//client/clojure:clojars). clj-grpc names gRPC 1.84.2 and protobuf-java
 ;;    4.36.1 in its own pom; the pins below move both to the versions this
 ;;    repository builds and tests against (MODULE.bazel: grpc-java 1.84.0,
 ;;    protobuf 36.2). A top-level entry beats a transitive one in tools.deps and
@@ -26,7 +26,7 @@
         ;; client calls through interop. Same release, same version
         ;; (scripts/set-version.sh). In the Bazel build they are //client/core.
         io.github.bpalermo/odradek-client {:mvn/version "0.0.0-dev"}
-        com.github.bpalermo/clj-grpc {:mvn/version "0.1.12"}
+        com.github.bpalermo/clj-grpc {:mvn/version "0.1.14"}
         com.github.bpalermo/clj-protobuf {:mvn/version "0.4.0"}
 
         com.google.protobuf/protobuf-java {:mvn/version "4.36.2"}
@@ -42,7 +42,7 @@
  {:bazel
   {:replace-deps
    {com.github.bpalermo/clj-grpc
-    {:mvn/version "0.1.12"
+    {:mvn/version "0.1.14"
      :exclusions [org.clojure/clojure
                   com.github.bpalermo/clj-protobuf
                   com.google.protobuf/protobuf-java-util
