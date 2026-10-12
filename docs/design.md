@@ -502,13 +502,15 @@ Each cluster's `tls` block selects one source.
 | Source | How it updates | When to use | Status |
 |---|---|---|---|
 | `files` | PEM files in a directory, written by `spiffe-helper`, cert-manager or similar. The server re-reads them every 5 seconds; changed content is parsed and validated, then swapped | No Workload API access, or non-SPIFFE PKI | Implemented |
-| `spiffe` | The server holds a watch on the SPIRE agent's Workload API socket; each update swaps the snapshot. The private key never touches disk | Clusters with SPIRE | Not implemented: a configuration that uses it is rejected |
+| `spiffe` | The server holds one stream open on the SPIRE agent's Workload API socket (`FetchX509SVID`); each update the agent pushes is validated, then swapped. The private key never touches disk | Clusters with SPIRE | Implemented |
 
 - `files` is polled, not watched: a Kubernetes volume is updated by swapping a symlink, which a watch on the files does not see.
 - A snapshot is rejected if the key does not belong to the leaf certificate, or the leaf is expired or not yet valid. The previous one stays in use and the next poll tries again. This is what makes a writer that replaces the certificate and the key at different moments safe.
 - The certificate chain is not checked against the trust bundle: with a non-SPIFFE PKI the client's issuer and the brokers' issuer may differ.
-- If the first set cannot be loaded, the server does not start.
-- `spiffe` will be the server's own client of the Workload API, on the gRPC stack it already has, rather than `java-spiffe`: one streaming call, no second gRPC or Netty on the class path, and nothing new for the native image. Clusters using it share the pod's SVID and one watch; federated bundles cover brokers in another trust domain. At startup the server will block, bounded by the `startupProbe`, until the first SVID is received.
+- If the first set cannot be loaded, the server does not start. For `spiffe` it waits up to two minutes for the first SVID, then exits; the pod's restart policy takes it from there.
+- `spiffe` is the server's own client of the Workload API, on the gRPC stack it already has, rather than `java-spiffe`: one streaming call, no second gRPC or Netty on the class path, and nothing new for the native image. The socket is `workloadApiSocket`, or the `SPIFFE_ENDPOINT_SOCKET` environment variable. Clusters naming the same socket share one stream and so one SVID. The first SVID of an update is used.
+- When the stream ends (the agent restarts), it is opened again with a pause that grows from half a second to thirty. The current SVID stays in use meanwhile, for as long as it is valid.
+- Federated bundles cover brokers in another trust domain. A broker is verified against the bundle of the trust domain its SPIFFE ID names and no other, so an authority federated with can only vouch for its own identities.
 - Metrics (with the admin endpoint, not built yet): certificate `not_after` timestamp, last successful reload, reload count, `credential_reload_failures_total`. Alert on time-to-expiry, not on rotation events. Today reloads and rejections are logged.
 
 ### Peer verification

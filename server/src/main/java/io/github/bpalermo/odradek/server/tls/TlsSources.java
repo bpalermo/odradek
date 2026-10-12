@@ -34,13 +34,26 @@ public final class TlsSources implements Closeable {
 
   private static final Set<String> TLS_PROTOCOLS = Set.of("SSL", "SASL_SSL");
 
+  /** How long the server waits at startup for the first SVID of a Workload API. */
+  public static final Duration FIRST_SVID_TIMEOUT = Duration.ofMinutes(2);
+
+  /** Names the Workload API socket when a cluster's {@code tls.spiffe} does not. */
+  static final String SOCKET_VARIABLE = "SPIFFE_ENDPOINT_SOCKET";
+
+  private static final String UNIX = "unix://";
+
   private final Map<String, TlsBinding> bindings;
   private final List<FileCredentialSource> files;
+  private final List<WorkloadApiSource> watches;
   private final ScheduledExecutorService poller;
 
-  private TlsSources(Map<String, TlsBinding> bindings, List<FileCredentialSource> files) {
+  private TlsSources(
+      Map<String, TlsBinding> bindings,
+      List<FileCredentialSource> files,
+      List<WorkloadApiSource> watches) {
     this.bindings = bindings;
     this.files = files;
+    this.watches = watches;
     if (files.isEmpty()) {
       this.poller = null;
     } else {
@@ -58,18 +71,44 @@ public final class TlsSources implements Closeable {
 
   /** No cluster uses TLS credentials. */
   public static TlsSources none() {
-    return new TlsSources(Map.of(), List.of());
+    return new TlsSources(Map.of(), List.of(), List.of());
   }
 
   /**
    * Loads the credentials of every cluster with {@code tls}.
    *
-   * @throws CredentialException if a cluster's credentials cannot be loaded, its source is not
-   *     supported, or its properties ask for a connection without TLS
+   * <p>Clusters that name the same Workload API socket share one watch and so one SVID.
+   *
+   * @throws CredentialException if a cluster's credentials cannot be loaded or its properties ask
+   *     for a connection without TLS
    */
-  public static TlsSources create(ServerConfig config) throws CredentialException {
+  public static TlsSources create(ServerConfig config)
+      throws CredentialException, InterruptedException {
+    return create(config, System.getenv(SOCKET_VARIABLE), FIRST_SVID_TIMEOUT);
+  }
+
+  static TlsSources create(ServerConfig config, String defaultSocket, Duration firstSvidTimeout)
+      throws CredentialException, InterruptedException {
     Map<String, TlsBinding> bindings = new HashMap<>();
     List<FileCredentialSource> files = new ArrayList<>();
+    Map<String, WorkloadApiSource> watches = new TreeMap<>();
+    try {
+      load(config, defaultSocket, firstSvidTimeout, bindings, files, watches);
+    } catch (CredentialException | InterruptedException | RuntimeException e) {
+      watches.values().forEach(WorkloadApiSource::close);
+      throw e;
+    }
+    return new TlsSources(Map.copyOf(bindings), List.copyOf(files), List.copyOf(watches.values()));
+  }
+
+  private static void load(
+      ServerConfig config,
+      String defaultSocket,
+      Duration firstSvidTimeout,
+      Map<String, TlsBinding> bindings,
+      List<FileCredentialSource> files,
+      Map<String, WorkloadApiSource> watches)
+      throws CredentialException, InterruptedException {
     for (var entry : new TreeMap<>(config.getClustersMap()).entrySet()) {
       String name = entry.getKey();
       Cluster cluster = entry.getValue();
@@ -92,9 +131,31 @@ public final class TlsSources implements Closeable {
                   + " but tls is set; use SSL or SASL_SSL, or leave it out");
         }
       }
-      if (!tls.hasFiles()) {
-        throw new CredentialException(
-            "clusters." + name + ".tls.spiffe is not implemented yet; use tls.files");
+      if (tls.hasSpiffe()) {
+        String address =
+            tls.getSpiffe().getWorkloadApiSocket().isEmpty()
+                ? defaultSocket
+                : tls.getSpiffe().getWorkloadApiSocket();
+        if (address == null || !address.startsWith(UNIX)) {
+          throw new CredentialException(
+              "clusters."
+                  + name
+                  + ".tls.spiffe: no Workload API socket; set workloadApiSocket or "
+                  + SOCKET_VARIABLE
+                  + " to unix:///path");
+        }
+        String socket = address.substring(UNIX.length());
+        WorkloadApiSource watch = watches.get(socket);
+        if (watch == null) {
+          try {
+            watch = new WorkloadApiSource(socket, Clock.systemUTC(), firstSvidTimeout);
+          } catch (CredentialException e) {
+            throw new CredentialException("clusters." + name + ".tls: " + e.getMessage(), e);
+          }
+          watches.put(socket, watch);
+        }
+        bindings.put(name, new TlsBinding(watch, PeerPolicy.of(tls)));
+        continue;
       }
       FileSource source = tls.getFiles();
       Path dir = Path.of(source.getDir());
@@ -113,7 +174,6 @@ public final class TlsSources implements Closeable {
       files.add(credentials);
       bindings.put(name, new TlsBinding(credentials, PeerPolicy.of(tls)));
     }
-    return new TlsSources(Map.copyOf(bindings), List.copyOf(files));
   }
 
   /**
@@ -146,5 +206,6 @@ public final class TlsSources implements Closeable {
     if (poller != null) {
       poller.shutdownNow();
     }
+    watches.forEach(WorkloadApiSource::close);
   }
 }

@@ -88,9 +88,9 @@ public final class Main {
     try {
       tls = TlsSources.create(config);
     } catch (CredentialException e) {
-      LOG.error("configuration {} rejected: {}", file, e.getMessage());
+      LOG.error("TLS credentials unavailable: {}", e.getMessage());
       codecs.close();
-      System.exit(2);
+      System.exit(1);
       return;
     }
 

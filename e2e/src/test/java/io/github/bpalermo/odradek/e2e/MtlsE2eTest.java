@@ -13,6 +13,7 @@ import io.github.bpalermo.odradek.kafka.v1.ProduceRecord;
 import io.github.bpalermo.odradek.kafka.v1.ProduceRequest;
 import io.github.bpalermo.odradek.kafka.v1.ProduceResponse;
 import io.github.bpalermo.odradek.kafka.v1.Subscribe;
+import io.github.bpalermo.odradek.server.tls.FakeWorkloadApi;
 import io.grpc.stub.StreamObserver;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,6 +21,7 @@ import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
@@ -32,8 +34,8 @@ import org.junit.jupiter.api.Test;
 
 /**
  * The server against a broker that only accepts mutual TLS (e2e/tls/broker.sh): it presents a
- * client certificate read from files, accepts the broker by its SPIFFE ID, and picks up replaced
- * files without a restart.
+ * client certificate read from files or received from a Workload API, accepts the broker by its
+ * SPIFFE ID, and picks up a replaced certificate without a restart.
  */
 class MtlsE2eTest {
   private static final Duration TIMEOUT = Duration.ofSeconds(60);
@@ -63,8 +65,7 @@ class MtlsE2eTest {
             delivery.timeout.ms: 5000
             request.timeout.ms: 2000
           tls:
-            files:
-              dir: %s
+            %s
             acceptedSpiffeIds: ["%s"]
       producers:
         %s:
@@ -80,6 +81,7 @@ class MtlsE2eTest {
 
   private Path credentials;
   private ServerHarness harness;
+  private FakeWorkloadApi agent;
 
   @BeforeEach
   void prepare() throws Exception {
@@ -94,6 +96,9 @@ class MtlsE2eTest {
     if (harness != null) {
       harness.stop();
     }
+    if (agent != null) {
+      agent.close();
+    }
     ServerHarness.deleteTopics(KAFKA_TLS_ADMIN, List.of(topic));
     try (var files = Files.list(credentials)) {
       for (Path file : files.toList()) {
@@ -103,16 +108,46 @@ class MtlsE2eTest {
     Files.delete(credentials);
   }
 
+  private ServerHarness startWithFiles(String brokerId) throws Exception {
+    return ServerHarness.start(
+        CONFIG, KAFKA_TLS, "files: {dir: " + credentials + "}", brokerId, topic, topic, id);
+  }
+
+  /** Starts a stand-in SPIRE agent that hands out the client certificate, and the server on it. */
+  private ServerHarness startWithWorkloadApi() throws Exception {
+    Path socket = credentials.resolve("agent.sock");
+    agent = FakeWorkloadApi.start(socket);
+    publish("client");
+    return ServerHarness.start(
+        CONFIG,
+        KAFKA_TLS,
+        "spiffe: {workloadApiSocket: \"unix://" + socket + "\"}",
+        BROKER_ID,
+        topic,
+        topic,
+        id);
+  }
+
+  private void publish(String name) throws Exception {
+    Path dir = CERTIFICATES.resolve(name);
+    agent.publish(
+        "spiffe://e2e.test/odradek",
+        Files.readString(dir.resolve("tls.crt")),
+        Files.readString(dir.resolve("tls.key")),
+        Files.readString(dir.resolve("ca.crt")),
+        Map.of());
+  }
+
   @Test
   void producesAndConsumesOverMutualTls() throws Exception {
-    harness = ServerHarness.start(CONFIG, KAFKA_TLS, credentials, BROKER_ID, topic, topic, id);
+    harness = startWithFiles(BROKER_ID);
     assertThat(produce(1, 20)).isEmpty();
     assertThat(consume(20)).hasSize(20);
   }
 
   @Test
   void replacedCredentialFilesAreUsedWithoutARestart() throws Exception {
-    harness = ServerHarness.start(CONFIG, KAFKA_TLS, credentials, BROKER_ID, topic, topic, id);
+    harness = startWithFiles(BROKER_ID);
     assertThat(produce(1, 10)).isEmpty();
 
     install("client-next");
@@ -126,10 +161,21 @@ class MtlsE2eTest {
 
   @Test
   void brokerWithAnotherSpiffeIdIsNotTalkedTo() throws Exception {
-    harness =
-        ServerHarness.start(
-            CONFIG, KAFKA_TLS, credentials, "spiffe://e2e.test/another-broker", topic, topic, id);
+    harness = startWithFiles("spiffe://e2e.test/another-broker");
     assertThat(produce(1, 1)).hasSize(1);
+  }
+
+  @Test
+  void producesAndConsumesWithAnSvidFromTheWorkloadApi() throws Exception {
+    harness = startWithWorkloadApi();
+    assertThat(produce(1, 10)).isEmpty();
+
+    // A rotation, pushed by the agent.
+    publish("client-next");
+    Thread.sleep(2_000);
+
+    assertThat(produce(11, 20)).isEmpty();
+    assertThat(consume(20)).hasSize(20);
   }
 
   private void install(String name) throws Exception {

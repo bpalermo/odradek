@@ -26,6 +26,7 @@ _DEPS = [
     "//api/odradek/kafka/v1:odradek_java_proto",
     "//client/java:client",
     "//server:server_lib",
+    "//server:test_pki",
     "@grpc-java//api",
     "@grpc-java//netty",
     "@grpc-java//stub",

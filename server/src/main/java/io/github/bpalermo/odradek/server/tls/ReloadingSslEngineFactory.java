@@ -5,7 +5,9 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import javax.net.ssl.KeyManagerFactory;
@@ -131,32 +133,38 @@ public final class ReloadingSslEngineFactory implements SslEngineFactory {
         KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
     keyManagers.init(keys, PASSWORD);
 
-    KeyStore trust = KeyStore.getInstance("PKCS12");
-    trust.load(null, null);
-    int n = 0;
-    for (X509Certificate certificate : credentials.trust()) {
-      trust.setCertificateEntry("ca-" + n++, certificate);
-    }
-    TrustManagerFactory trustManagers =
-        TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-    trustManagers.init(trust);
-    X509ExtendedTrustManager pkix = null;
-    for (TrustManager manager : trustManagers.getTrustManagers()) {
-      if (manager instanceof X509ExtendedTrustManager extended) {
-        pkix = extended;
-        break;
+    X509ExtendedTrustManager trust = pkix(credentials.trust());
+    if (policy.spiffe()) {
+      Map<String, X509ExtendedTrustManager> byDomain = new HashMap<>();
+      for (var bundle : credentials.bundles().entrySet()) {
+        byDomain.put(bundle.getKey().toLowerCase(Locale.ROOT), pkix(bundle.getValue()));
       }
-    }
-    if (pkix == null) {
-      throw new GeneralSecurityException("the JDK offers no X.509 trust manager");
+      trust = new SpiffeTrustManager(trust, byDomain, policy);
     }
 
     SSLContext context = SSLContext.getInstance("TLS");
-    context.init(
-        keyManagers.getKeyManagers(),
-        new TrustManager[] {policy.spiffe() ? new SpiffeTrustManager(pkix, policy) : pkix},
-        null);
+    context.init(keyManagers.getKeyManagers(), new TrustManager[] {trust}, null);
     return context;
+  }
+
+  /** The JDK's chain validation against a set of authorities. */
+  private static X509ExtendedTrustManager pkix(List<X509Certificate> authorities)
+      throws GeneralSecurityException, java.io.IOException {
+    KeyStore store = KeyStore.getInstance("PKCS12");
+    store.load(null, null);
+    int n = 0;
+    for (X509Certificate certificate : authorities) {
+      store.setCertificateEntry("ca-" + n++, certificate);
+    }
+    TrustManagerFactory factory =
+        TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+    factory.init(store);
+    for (TrustManager manager : factory.getTrustManagers()) {
+      if (manager instanceof X509ExtendedTrustManager extended) {
+        return extended;
+      }
+    }
+    throw new GeneralSecurityException("the JDK offers no X.509 trust manager");
   }
 
   private static List<String> strings(Object value) {
@@ -169,34 +177,55 @@ public final class ReloadingSslEngineFactory implements SslEngineFactory {
     return List.of();
   }
 
-  /** Chain validation by the JDK, then the SPIFFE ID of the leaf against the policy. */
+  /**
+   * Chain validation by the JDK, then the SPIFFE ID of the leaf against the policy. When the
+   * credentials carry a bundle per trust domain, the chain must verify against the bundle of the
+   * trust domain the leaf's SPIFFE ID names.
+   */
   private static final class SpiffeTrustManager extends X509ExtendedTrustManager {
     private final X509ExtendedTrustManager pkix;
+    private final Map<String, X509ExtendedTrustManager> byDomain;
     private final PeerPolicy policy;
 
-    SpiffeTrustManager(X509ExtendedTrustManager pkix, PeerPolicy policy) {
+    SpiffeTrustManager(
+        X509ExtendedTrustManager pkix,
+        Map<String, X509ExtendedTrustManager> byDomain,
+        PeerPolicy policy) {
       this.pkix = pkix;
+      this.byDomain = byDomain;
       this.policy = policy;
+    }
+
+    private X509ExtendedTrustManager authorityOf(X509Certificate leaf) throws CertificateException {
+      if (byDomain.isEmpty()) {
+        return pkix;
+      }
+      String domain = PeerPolicy.trustDomain(PeerPolicy.spiffeId(leaf));
+      X509ExtendedTrustManager manager = byDomain.get(domain);
+      if (manager == null) {
+        throw new CertificateException("no trust bundle for the broker's trust domain " + domain);
+      }
+      return manager;
     }
 
     @Override
     public void checkServerTrusted(X509Certificate[] chain, String authType, SSLEngine engine)
         throws CertificateException {
-      pkix.checkServerTrusted(chain, authType, engine);
+      authorityOf(chain[0]).checkServerTrusted(chain, authType, engine);
       policy.check(chain[0]);
     }
 
     @Override
     public void checkServerTrusted(X509Certificate[] chain, String authType, Socket socket)
         throws CertificateException {
-      pkix.checkServerTrusted(chain, authType, socket);
+      authorityOf(chain[0]).checkServerTrusted(chain, authType, socket);
       policy.check(chain[0]);
     }
 
     @Override
     public void checkServerTrusted(X509Certificate[] chain, String authType)
         throws CertificateException {
-      pkix.checkServerTrusted(chain, authType);
+      authorityOf(chain[0]).checkServerTrusted(chain, authType);
       policy.check(chain[0]);
     }
 
