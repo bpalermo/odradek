@@ -1,3 +1,4 @@
+load("@rules_clj//clojure:defs.bzl", "clj_library", "clj_test")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
 load("//bazel/java:junit.bzl", "java_junit_test")
 
@@ -107,4 +108,28 @@ java_junit_test(
         "@maven//:ch_qos_logback_logback_classic",
     ],
     deps = _DEPS,
+)
+
+# The Clojure client (//client/clojure, ADR 2) through the same list of cases as
+# ClientE2eTest, against the packaged server started as a process.
+clj_library(
+    name = "clojure_client_e2e_test_lib",
+    testonly = True,
+    srcs = ["src/test/clojure/odradek/e2e/client_e2e_test.clj"],
+    namespaces = ["odradek.e2e.client-e2e-test"],
+    strip_prefix = "e2e/src/test/clojure",
+    deps = [
+        "//client/clojure:client",
+        "@maven//:org_apache_kafka_kafka_clients",
+    ],
+)
+
+clj_test(
+    name = "clojure_client_e2e_test",
+    size = "large",
+    data = ["//server"],
+    env = {"ODRADEK_E2E_SERVER": "$(rootpath //server)"},
+    ns = "odradek.e2e.client-e2e-test",
+    tags = _TAGS,
+    deps = [":clojure_client_e2e_test_lib"],
 )

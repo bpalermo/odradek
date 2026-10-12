@@ -1,0 +1,4 @@
+;; The version of the Clojure client: what //client/clojure:clojars writes into
+;; the pom, and what the client tells the server in ClientInfo. One version for
+;; the server and every client, replaced at release time (docs/adr/0004).
+{:version "0.0.0-dev"}
