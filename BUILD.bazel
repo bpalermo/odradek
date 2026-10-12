@@ -1,6 +1,7 @@
 exports_files([
     ".bazelversion",
     "buf.yaml",
+    "ruff.toml",
 ])
 
 # `bazel run //:format` rewrites files; `bazel run //:format.check` only checks.

@@ -1,0 +1,20 @@
+# Python formatting and lint (ruff), for //client/python and //e2e/python.
+# `bazel run //:format` formats; `bazel build --config=lint //...` lints.
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # import order
+    "N",   # naming
+    "UP",  # idioms of the target Python version
+    "B",   # likely bugs
+    "ASYNC",
+    "RUF",
+]
+
+[lint.isort]
+known-first-party = ["odradek"]

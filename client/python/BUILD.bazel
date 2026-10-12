@@ -1,0 +1,127 @@
+load("@rules_python//python:packaging.bzl", "py_package", "py_wheel")
+load("@rules_python//python:py_library.bzl", "py_library")
+load("@rules_python//python:py_test.bzl", "py_test")
+load(":proto.bzl", "py_proto_gen")
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files(["requirements_lock.txt"])
+
+# The version of the wheel: Version.VERSION of the Java client in the form
+# PyPI accepts (PEP 440). Replaced at release time; see docs/adr/0004.
+_VERSION = "0.0.0.dev0"
+
+# The API as Python modules, generated into this package so that they are part
+# of the `odradek` package: odradek.kafka.v1.odradek_pb2 (+ _pb2_grpc) and
+# odradek.client.v1.core_pb2. Nothing generated is checked in.
+py_proto_gen(
+    name = "kafka_py",
+    grpc = True,
+    proto = "//api/odradek/kafka/v1:odradek_proto",
+)
+
+py_proto_gen(
+    name = "core_py",
+    proto = "//api/odradek/client/v1:core_proto",
+)
+
+filegroup(
+    name = "pyi",
+    srcs = [
+        ":core_py",
+        ":kafka_py",
+    ],
+    output_group = "pyi",
+)
+
+# The Python client (ADR 3): a port of the protocol core (odradek.core) bound
+# to grpcio's asyncio API.
+py_library(
+    name = "odradek",
+    srcs = glob(["odradek/**/*.py"]) + [
+        ":core_py",
+        ":kafka_py",
+    ],
+    data = ["odradek/py.typed"],
+    imports = ["."],
+    pyi_srcs = [":pyi"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@odradek_pypi//grpcio",
+        "@odradek_pypi//protobuf",
+    ],
+)
+
+# Every conformance scenario against the Python core.
+py_test(
+    name = "conformance_test",
+    size = "small",
+    srcs = ["tests/conformance_test.py"],
+    data = ["//conformance:scenarios"],
+    deps = [
+        ":odradek",
+        "@odradek_pypi//protobuf",
+        "@odradek_pypi//pyyaml",
+    ],
+)
+
+# The binding against a scripted gRPC server on a Unix socket, in process.
+py_test(
+    name = "client_test",
+    size = "small",
+    srcs = ["tests/client_test.py"],
+    deps = [
+        ":odradek",
+        "@odradek_pypi//grpcio",
+    ],
+)
+
+py_test(
+    name = "fork_test",
+    size = "small",
+    srcs = ["tests/fork_test.py"],
+    deps = [":odradek"],
+)
+
+# The pure Python wheel that goes to PyPI: the client and the generated API
+# code. `bazel build //client/python:wheel`; nothing here uploads it.
+py_package(
+    name = "package",
+    packages = ["client.python.odradek"],
+    deps = [":odradek"],
+)
+
+py_wheel(
+    name = "wheel",
+    classifiers = [
+        "Framework :: AsyncIO",
+        "License :: OSI Approved :: Apache Software License",
+        "Programming Language :: Python :: 3",
+        "Typing :: Typed",
+    ],
+    description_content_type = "text/markdown",
+    description_file = "README.md",
+    distribution = "odradek",
+    homepage = "https://github.com/bpalermo/odradek",
+    license = "Apache-2.0",
+    python_requires = ">=3.11",
+    python_tag = "py3",
+    requires = [
+        # The generated code refuses to load on a runtime older than the
+        # compiler that made it, or on another major version.
+        "grpcio>=1.84.0",
+        "protobuf>=7.36.2,<8",
+    ],
+    strip_path_prefixes = ["client/python/"],
+    summary = "Client for the Odradek server: Kafka over gRPC on a Unix domain socket",
+    version = _VERSION,
+    deps = [":package"],
+)
+
+py_test(
+    name = "wheel_test",
+    size = "small",
+    srcs = ["tests/wheel_test.py"],
+    args = ["$(rootpath :wheel)"],
+    data = [":wheel"],
+)

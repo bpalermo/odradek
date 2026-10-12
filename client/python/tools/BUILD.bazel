@@ -1,0 +1,11 @@
+load("@rules_python//python:py_binary.bzl", "py_binary")
+
+package(default_visibility = ["//visibility:private"])
+
+# Used by py_proto_gen (//client/python:proto.bzl) to generate the gRPC stub.
+py_binary(
+    name = "grpc_protoc",
+    srcs = ["grpc_protoc.py"],
+    visibility = ["//client/python:__pkg__"],
+    deps = ["@odradek_pypi//grpcio_tools"],
+)

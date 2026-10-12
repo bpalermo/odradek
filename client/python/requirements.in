@@ -1,0 +1,13 @@
+# Python dependencies of //client/python and its tests. Locked, with hashes, in
+# requirements_lock.txt; re-lock with the command in the README.
+#
+# grpcio and protobuf are what the client needs at run time. protobuf tracks
+# the protoc of MODULE.bazel (protoc 36.2 generates code for protobuf 7.36.2).
+grpcio==1.84.0
+protobuf==7.36.2
+
+# Build time only: the gRPC plugin that generates the stub.
+grpcio-tools==1.84.0
+
+# Tests only: the conformance scenarios are YAML.
+pyyaml==6.0.3

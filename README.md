@@ -1,6 +1,6 @@
 # odradek
 
-odradek moves the Kafka client out of the application. Its server is a Java process, deployed today as a sidecar container next to the application in a Kubernetes pod, that owns the Kafka producer and consumer, and exposes a gRPC API to the application over a Unix domain socket. A thin Java client library for applications lives in the same repository.
+odradek moves the Kafka client out of the application. Its server is a Java process, deployed today as a sidecar container next to the application in a Kubernetes pod, that owns the Kafka producer and consumer, and exposes a gRPC API to the application over a Unix domain socket. Thin client libraries for applications, in Java and Python, live in the same repository.
 
 ## Layout
 
@@ -11,7 +11,9 @@ odradek moves the Kafka client out of the application. Its server is a Java proc
 | `client/core/` | The client protocol without I/O, shared by the JVM clients (ADR 1) |
 | `client/java/` | Java client library for applications |
 | `client/clojure/` | Clojure client library for applications (`odradek.client`): the same core on clj-grpc and clj-protobuf, built with rules_clj (ADR 2) |
+| `client/python/` | Python client library for applications (asyncio): a port of the protocol core, the generated API and the wheel (ADR 3) |
 | `conformance/` | Scenarios every client core must pass |
+| `e2e/` | End-to-end suites against real brokers: the server and the Java client (`src/`), the Python client (`python/`) |
 | `extension/java/` | Interfaces for extension jars: `RecordTransform`, the byte-to-byte codec step (encryption and similar) |
 | `bazel/` | Shared build code: formatter, linters, JUnit 6 macro, gRPC codegen shims |
 | `docs/` | The design (`design.md`) and architecture decision records (`adr/`) |
@@ -20,7 +22,7 @@ Java root package: `io.github.bpalermo.odradek`.
 
 ## Commands
 
-Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild/bazelisk)). The JDK is downloaded by Bazel; no local JDK is needed, and no C++ is compiled for Java builds (protoc and the gRPC plugin are prebuilt binaries; Bazel 9 still needs a C++ compiler to be discoverable for toolchain analysis).
+Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild/bazelisk)). The JDK is downloaded by Bazel; no local JDK is needed, and no C++ is compiled for Java builds (protoc and the gRPC plugin are prebuilt binaries; Bazel 9 still needs a C++ compiler to be discoverable for toolchain analysis). The Python interpreter and the PyPI packages (prebuilt wheels, pinned with hashes in `client/python/requirements_lock.txt`) are downloaded by Bazel as well; no local Python is used.
 
 | Task | Command |
 | --- | --- |
@@ -45,8 +47,10 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 | Test the native image | `bazel test //server:native_config_test` (no broker), and `ODRADEK_E2E_KAFKA_A=localhost:9092 ODRADEK_E2E_KAFKA_B=localhost:9093 bazel test //e2e:e2e_native_binary_test --config=e2e` (the same end-to-end suite against it) |
 | Build and load the native image | `bazel build //server:image_native_manifest` and `bazel run //server:image_native_load` (as `localhost/odradek:e2e-native`; this machine's architecture only, as GraalVM does not cross-compile); `bazel run //server:image_native_push` pushes it as `dev-<commit>-native-<arch>`, and publish.yml assembles the index `dev-native` and `dev-<commit>-native` |
 | End-to-end tests | start two Kafka brokers, then `ODRADEK_E2E_KAFKA_A=localhost:9092 ODRADEK_E2E_KAFKA_B=localhost:9093 bazel test //e2e/... --config=e2e` (`make e2e`); excluded from plain `bazel test //...` |
+| Build the Python wheel | `bazel build //client/python:wheel` (pure Python, with the generated API code; in `bazel-bin/client/python/odradek-<version>-py3-none-any.whl`). Nothing uploads it. |
+| Re-lock Python dependencies | `uv pip compile --universal --generate-hashes --python-version 3.13 --no-header client/python/requirements.in -o client/python/requirements_lock.txt` after editing `requirements.in` (needs [uv](https://docs.astral.sh/uv/)), then `bazel mod deps` to update `MODULE.bazel.lock` |
 
-Formatting covers Java (google-java-format), Starlark (buildifier, including its lint) and protobuf (buf). Java is linted by Error Prone inside every `javac` action, with warnings as errors for first-party code; protos are linted by buf.
+Formatting covers Java (google-java-format), Python (ruff), Starlark (buildifier, including its lint) and protobuf (buf). Java is linted by Error Prone inside every `javac` action, with warnings as errors for first-party code; protos are linted by buf and Python by ruff (`ruff.toml`).
 
 ## Versions and Maven artifacts
 
