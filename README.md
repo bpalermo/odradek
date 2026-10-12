@@ -31,3 +31,7 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 | Proto breaking changes | `bazel run @rules_buf_toolchains//:buf -- breaking api --against '.git#branch=main'` |
 
 Formatting covers Java (google-java-format), Starlark (buildifier, including its lint) and protobuf (buf). Java is linted by Error Prone inside every `javac` action, with warnings as errors for first-party code; protos are linted by buf.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
