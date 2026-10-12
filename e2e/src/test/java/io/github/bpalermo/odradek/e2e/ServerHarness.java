@@ -30,37 +30,74 @@ import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.NewTopic;
 
 /**
- * A server assembled the way {@code Main} assembles it, listening on a Unix socket in a temporary
- * directory, with a gRPC channel to it. The configuration is YAML with two placeholders, in this
- * order: the socket directory, then whatever the test passes.
+ * A running server and a gRPC channel to its Unix socket, in a temporary directory.
+ *
+ * <p>By default the server is assembled in this JVM the way {@code Main} assembles it. When {@code
+ * ODRADEK_E2E_SERVER} names an executable, that executable is started instead with {@code
+ * --config}: this is how the suite runs against the packaged server, JVM or native.
+ *
+ * <p>The configuration is YAML with placeholders: first the socket directory, then whatever the
+ * test passes.
  */
 final class ServerHarness {
   static final String KAFKA_A = bootstrap("ODRADEK_E2E_KAFKA_A");
   static final String KAFKA_B = bootstrap("ODRADEK_E2E_KAFKA_B");
 
+  private static final Duration START_TIMEOUT = Duration.ofSeconds(60);
+
   private final Path dir;
-  private final CodecRegistry codecs;
-  private final ClusterProducers producers;
-  private final ConsumeService consume;
-  private final OdradekServer server;
   private final EventLoopGroup group;
   final ManagedChannel channel;
+
+  // In-process server.
+  private CodecRegistry codecs;
+  private ClusterProducers producers;
+  private ConsumeService consume;
+  private OdradekServer server;
+
+  // External server.
+  private Process process;
 
   private ServerHarness(String yamlTemplate, Object... arguments) throws Exception {
     dir = Files.createTempDirectory(Path.of("/tmp"), "odradek-e2e");
     Object[] all = new Object[arguments.length + 1];
     all[0] = dir;
     System.arraycopy(arguments, 0, all, 1, arguments.length);
-    ServerConfig config = ConfigLoader.parse(yamlTemplate.formatted(all));
-    codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
-    producers = ClusterProducers.create(config);
-    ProduceService produce =
-        new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
-    consume = new ConsumeService(config, codecs, produce.serverEpoch());
-    server = OdradekServer.start(config, new OdradekService(produce, consume));
+    String yaml = yamlTemplate.formatted(all);
+    ServerConfig config = ConfigLoader.parse(yaml);
+    Path socket = Path.of(config.getListener().getSocketPath());
+
+    String executable = System.getenv("ODRADEK_E2E_SERVER");
+    if (executable == null || executable.isBlank()) {
+      codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
+      producers = ClusterProducers.create(config);
+      ProduceService produce =
+          new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
+      consume = new ConsumeService(config, codecs, produce.serverEpoch());
+      server = OdradekServer.start(config, new OdradekService(produce, consume));
+    } else {
+      Path file = dir.resolve("odradek.yaml");
+      Files.writeString(file, yaml);
+      process =
+          new ProcessBuilder(
+                  Path.of(executable).toAbsolutePath().toString(), "--config", file.toString())
+              .inheritIO()
+              .start();
+      long deadline = System.nanoTime() + START_TIMEOUT.toNanos();
+      while (!Files.exists(socket)) {
+        if (!process.isAlive()) {
+          fail("%s exited with status %s before listening", executable, process.exitValue());
+        }
+        if (System.nanoTime() > deadline) {
+          process.destroyForcibly();
+          fail("%s did not listen on %s within %s", executable, socket, START_TIMEOUT);
+        }
+        Thread.sleep(50);
+      }
+    }
     group = new MultiThreadIoEventLoopGroup(1, EpollIoHandler.newFactory());
     channel =
-        NettyChannelBuilder.forAddress(new DomainSocketAddress(server.socket().toString()))
+        NettyChannelBuilder.forAddress(new DomainSocketAddress(socket.toString()))
             .eventLoopGroup(group)
             .channelType(EpollDomainSocketChannel.class)
             .usePlaintext()
@@ -71,17 +108,31 @@ final class ServerHarness {
     return new ServerHarness(yamlTemplate, arguments);
   }
 
-  /** Stops the server the way its shutdown hook does. */
+  /** Stops the server: in process the way its shutdown hook does, otherwise with SIGTERM. */
   void stop() throws Exception {
-    server.stopAccepting();
-    producers.flush();
-    consume.shutdown(Duration.ofSeconds(15));
-    channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
-    group.shutdownGracefully();
-    server.close();
-    producers.close(Duration.ofSeconds(5));
-    codecs.close();
-    Files.deleteIfExists(dir);
+    if (process != null) {
+      process.destroy();
+      if (!process.waitFor(60, TimeUnit.SECONDS)) {
+        process.destroyForcibly();
+        fail("the server did not stop within 60s of SIGTERM");
+      }
+      channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+      group.shutdownGracefully();
+    } else {
+      server.stopAccepting();
+      producers.flush();
+      consume.shutdown(Duration.ofSeconds(15));
+      channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+      group.shutdownGracefully();
+      server.close();
+      producers.close(Duration.ofSeconds(5));
+      codecs.close();
+    }
+    try (var files = Files.walk(dir)) {
+      for (Path file : files.sorted(java.util.Comparator.reverseOrder()).toList()) {
+        Files.deleteIfExists(file);
+      }
+    }
   }
 
   private static String bootstrap(String variable) {
