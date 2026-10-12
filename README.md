@@ -29,7 +29,7 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 | --- | --- |
 | Build | `bazel build //...` (`make build`) |
 | Test | `bazel test //...` (`make test`) |
-| Run the server | `bazel run //server -- --config $PWD/server/testdata/minimal.yaml` (the default is `/etc/odradek/odradek.yaml`; the socket directory `/var/run/kafka` must exist, or set `listener.socketPath`; kubelet probes use the gRPC health service on port 9464, or `admin.port`: service `""` for startup and readiness, `liveness` for liveness) |
+| Run the server | `bazel run //server -- --config $PWD/server/testdata/minimal.yaml` (the default is `/etc/odradek/odradek.yaml`; the socket directory `/var/run/kafka` must exist, or set `listener.socketPath`; kubelet probes use the gRPC health service on port 9464, or `admin.port`: service `""` for startup and readiness, `liveness` for liveness; metrics are pushed over OTLP/gRPC when `telemetry.endpoint` is set) |
 | Format (rewrites files) | `bazel run //:format` (`make format`) |
 | Check formatting | `bazel run //:format.check` (`make format-check`) |
 | Lint | `bazel build --config=lint //...` (`make lint`); `--config=ci` makes violations fail |

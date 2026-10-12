@@ -15,6 +15,8 @@ import io.github.bpalermo.odradek.server.consume.ConsumeService;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
+import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
+import io.github.bpalermo.odradek.server.telemetry.Telemetry;
 import io.github.bpalermo.odradek.server.tls.CredentialException;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import java.io.IOException;
@@ -88,6 +90,17 @@ public final class Main {
       return;
     }
 
+    Telemetry telemetry;
+    try {
+      telemetry = Telemetry.create(config);
+    } catch (IllegalArgumentException e) {
+      LOG.error("configuration {} rejected: {}", file, e.getMessage());
+      codecs.close();
+      System.exit(2);
+      return;
+    }
+    ServerMetrics metrics = telemetry.metrics();
+
     // Up before anything that can take time, so a probe sees "starting" rather than nothing.
     Readiness readiness = new Readiness();
     HealthService health = new HealthService(readiness, Clock.systemUTC());
@@ -127,9 +140,10 @@ public final class Main {
       return;
     }
     ProduceService produce =
-        new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
+        new ProduceService(config, ProduceRoutes.create(config, producers, codecs), metrics);
 
-    ConsumeService consume = new ConsumeService(config, codecs, tls, produce.serverEpoch());
+    ConsumeService consume =
+        new ConsumeService(config, codecs, tls, produce.serverEpoch(), metrics);
 
     OdradekServer server;
     try {
@@ -143,6 +157,7 @@ public final class Main {
       return;
     }
     readiness.started(tls);
+    metrics.observe(tls, readiness, Clock.systemUTC());
     LOG.info("server epoch {}", produce.serverEpoch());
     Runtime.getRuntime()
         .addShutdownHook(
@@ -160,6 +175,8 @@ public final class Main {
                   tls.close();
                   codecs.close();
                   admin.close();
+                  // Last, so that what the shutdown itself counted is pushed too.
+                  telemetry.close();
                 },
                 "shutdown"));
     server.awaitTermination();

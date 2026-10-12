@@ -118,6 +118,23 @@ message ServerConfig {
   // startup; not hot-reloadable. Unset means only classes shipped with the
   // server are available.
   string extensions_dir = 12 [(buf.validate.field).string.prefix = "/"];
+
+  // Where the server's metrics are pushed. Not hot-reloadable. Unset means
+  // no metrics are exported.
+  Telemetry telemetry = 13;
+}
+
+// Telemetry configures the export of the server's metrics over OTLP/gRPC.
+message Telemetry {
+  // The OTLP/gRPC endpoint of a collector, as http://host:port or
+  // https://host:port (4317 is the usual port). https verifies the collector
+  // against the JVM's default trust store. Unset means nothing is exported.
+  string endpoint = 1 [(buf.validate.field).string.pattern = "^https?://[^/:]+:[0-9]{1,5}/?$"];
+  // How often metrics are pushed. Default: 30s. At least 1s.
+  google.protobuf.Duration export_interval = 2 [(buf.validate.field).duration.gte = {seconds: 1}];
+  // Resource attributes added to every metric, next to service.name, which
+  // is "odradek" unless set here (e.g. k8s.pod.name, deployment.environment).
+  map<string, string> resource_attributes = 3 [(buf.validate.field).map.keys.string.min_len = 1];
 }
 
 // Contracts lists the schemas of the messages apps exchange with the server.

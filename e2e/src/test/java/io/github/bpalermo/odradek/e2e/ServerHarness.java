@@ -12,6 +12,7 @@ import io.github.bpalermo.odradek.server.consume.ConsumeService;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
+import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.ManagedChannel;
 import io.grpc.netty.NettyChannelBuilder;
@@ -101,8 +102,10 @@ final class ServerHarness {
       tls = TlsSources.create(config);
       producers = ClusterProducers.create(config, tls);
       ProduceService produce =
-          new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
-      consume = new ConsumeService(config, codecs, tls, produce.serverEpoch());
+          new ProduceService(
+              config, ProduceRoutes.create(config, producers, codecs), ServerMetrics.noop());
+      consume =
+          new ConsumeService(config, codecs, tls, produce.serverEpoch(), ServerMetrics.noop());
       server = OdradekServer.start(config, new OdradekService(produce, consume));
       return;
     }

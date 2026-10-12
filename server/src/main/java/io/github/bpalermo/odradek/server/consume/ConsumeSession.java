@@ -95,6 +95,37 @@ final class ConsumeSession implements ConsumerRebalanceListener {
   /** Set when a command that ends the stream arrives while a revocation is being handled. */
   private Status exit;
 
+  private Events events = Events.NONE;
+
+  /** What the session reports as it happens, for metrics. Called on the session's thread. */
+  interface Events {
+    Events NONE =
+        new Events() {
+          @Override
+          public void delivered(String topic, long records, long undecodable) {}
+
+          @Override
+          public void rebalanced(String event) {}
+
+          @Override
+          public void ended(String reason) {}
+        };
+
+    /** Records of a topic were sent to the app, {@code undecodable} of them with a decode error. */
+    void delivered(String topic, long records, long undecodable);
+
+    /** A rebalance callback ran: assigned, revoked or lost. */
+    void rebalanced(String event);
+
+    /** The stream ended with this gRPC status code. */
+    void ended(String reason);
+  }
+
+  /** Sets who is told what happens. Before {@link #start}. */
+  void events(Events events) {
+    this.events = events;
+  }
+
   ConsumeSession(
       ServerCallStreamObserver<ConsumeResponse> call,
       org.apache.kafka.clients.consumer.Consumer<byte[], byte[]> consumer,
@@ -255,6 +286,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
               .setPartition(partition.partition())
               .setAssignmentEpoch(state.epoch);
       Status failure = null;
+      long undecodable = 0;
       long now = nanoClock.getAsLong();
       for (ConsumerRecord<byte[], byte[]> record : fetched) {
         if (credits == 0) {
@@ -280,6 +312,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
           }
           fill(out, record.key(), record.value(), record.headers());
           out.setDecodeError(e.getMessage());
+          undecodable++;
         }
         batch.addRecords(out);
         state.delivered(record.offset(), now);
@@ -287,6 +320,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
       }
       if (batch.getRecordsCount() > 0) {
         send(ConsumeResponse.newBuilder().setRecords(batch).build());
+        events.delivered(partition.topic(), batch.getRecordsCount(), undecodable);
       }
       if (failure != null) {
         return failure;
@@ -317,6 +351,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
     if (partitions.isEmpty()) {
       return;
     }
+    events.rebalanced("assigned");
     Assigned.Builder assigned = Assigned.newBuilder();
     for (TopicPartition partition : partitions) {
       PartitionState state = new PartitionState(partition, ++epochCounter);
@@ -362,6 +397,9 @@ final class ConsumeSession implements ConsumerRebalanceListener {
 
   @Override
   public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+    if (!partitions.isEmpty()) {
+      events.rebalanced("revoked");
+    }
     List<PartitionState> owned = new ArrayList<>();
     for (TopicPartition partition : partitions) {
       PartitionState state = states.get(partition);
@@ -403,6 +441,9 @@ final class ConsumeSession implements ConsumerRebalanceListener {
 
   @Override
   public void onPartitionsLost(Collection<TopicPartition> partitions) {
+    if (!partitions.isEmpty()) {
+      events.rebalanced("lost");
+    }
     Lost.Builder lost = Lost.newBuilder();
     for (TopicPartition partition : partitions) {
       if (states.remove(partition) != null) {
@@ -490,6 +531,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
     }
     decoders.values().forEach(RecordDecoder::close);
     onEnd.accept(this);
+    events.ended(cancelled ? Status.Code.CANCELLED.name() : end.getCode().name());
     if (cancelled) {
       return;
     }
