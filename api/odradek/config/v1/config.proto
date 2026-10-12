@@ -402,9 +402,13 @@ message Cluster {
     expression: "[this.properties, this.producer_properties, this.consumer_properties].all(m, m.all(k, k != 'ssl.engine.factory.class' && !k.startsWith('ssl.keystore.') && !k.startsWith('ssl.truststore.')))"
   };
 
-  // Whether the server must reach this cluster before it reports started.
-  // Required clusters gate the startup probe; optional ones connect on first
-  // use. Default: false.
+  // Whether the server must reach this cluster before it starts. At startup
+  // the server asks every required cluster for its metadata, with the shared
+  // `properties` and `tls`, and retries until it answers; until then it does
+  // not listen on its socket and the startup probe fails. Optional clusters
+  // are not asked: they connect on first use. This gates startup only: a
+  // required cluster that becomes unreachable later does not change
+  // readiness. Unrelated to ProduceTarget.best_effort. Default: false.
   bool required = 1;
 
   // Kafka client properties shared by producers and consumers, in the

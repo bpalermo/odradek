@@ -75,7 +75,13 @@ flowchart LR
 ### Lifecycle
 
 - The server runs as a native sidecar: an `initContainer` with `restartPolicy: Always`.
-- **Startup**: health service `""` is the `startupProbe` and the `readinessProbe`. Its port is up before anything that can take time, and it answers `NOT_SERVING` while the server waits for its first credentials (with a SPIFFE source, the first SVID). It answers `SERVING` once the credentials are loaded and the socket is listening. The app container starts after that. Not built yet: waiting for broker metadata of every required cluster.
+- **Startup**: health service `""` is the `startupProbe` and the `readinessProbe`. Its port is up before anything that can take time, and it answers `NOT_SERVING` while the server starts. In order, the server:
+  1. loads its first credentials (with a SPIFFE source, it waits for the first SVID);
+  2. asks every cluster with `required: true` for its metadata (an Admin client's `describeCluster`, built from the cluster's shared `properties` and its `tls`), one cluster at a time in name order, retrying until each answers;
+  3. listens on the Unix socket;
+  4. answers `SERVING`. The app container starts after that.
+- **Waiting for a required cluster**: the socket does not exist until every required cluster has answered, so an app never talks to a server that has not reached the clusters it must have. While waiting, the reason for `NOT_SERVING` names the cluster (`starting: waiting for cluster orders`). An attempt times out after 10 seconds and the next follows a second later. The reason for a failure is logged when it differs from the previous one, and the wait itself every 30 seconds. The server neither gives up nor exits: the `startupProbe`'s `failureThreshold` is what bounds the wait, and kubelet restarts the container when it is exceeded. Clusters that are not required are not contacted at startup.
+- **Startup only**: a required cluster that becomes unreachable later does not change readiness. Producing and consuming report their own errors, and taking the pod out of service for a broker blip would turn a partial failure into a full one.
 - **Readiness afterwards**: `""` goes back to `NOT_SERVING` when a cluster's client certificate has expired, which means whatever renews it has stopped (files not replaced, or the Workload API unreachable for an SVID's lifetime), and when shutdown begins.
 - **App readiness**: the client library reports ready only while it holds a session whose handshake has completed.
 - **Shutdown**: the server receives SIGTERM after the app container exits. It stops accepting streams, completes in-flight produce results, `flush()`es, commits acked offsets, leaves its groups and exits. `terminationGracePeriodSeconds` must cover app drain plus `delivery.timeout.ms`.
@@ -204,7 +210,7 @@ consumers:                     # keyed by topic name
 
 - Each cluster has a name, Kafka client properties (shared, plus producer-only and consumer-only overrides) and an optional `tls` block.
 - The name is referenced only inside the configuration. Apps never see it as a parameter; it appears to them only as information in results.
-- `required: true` clusters gate the `startupProbe`. Optional clusters connect on first use.
+- `required: true` clusters gate startup: the server fetches their metadata before it listens and before the `startupProbe` passes (see Lifecycle). Optional clusters connect on first use. The gate is not re-evaluated after startup.
 - Each cluster has its own producer, `buffer.memory`, consumers and credentials, so the container memory limit scales with the number of clusters.
 - Every metric carries a `cluster` label.
 - A cluster that is still referenced by a producer or consumer entry cannot be removed; such a configuration is invalid.

@@ -67,6 +67,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
         "io.github.bpalermo.odradek.e2e.MtlsE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
+        "io.github.bpalermo.odradek.e2e.StartupE2eTest",
         "io.github.bpalermo.odradek.e2e.TelemetryE2eTest",
     ],
     runtime_deps = [
@@ -92,6 +93,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
         "io.github.bpalermo.odradek.e2e.MtlsE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
+        "io.github.bpalermo.odradek.e2e.StartupE2eTest",
         "io.github.bpalermo.odradek.e2e.TelemetryE2eTest",
     ],
     runtime_deps = [
@@ -120,6 +122,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
         "io.github.bpalermo.odradek.e2e.MtlsE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
+        "io.github.bpalermo.odradek.e2e.StartupE2eTest",
         "io.github.bpalermo.odradek.e2e.TelemetryE2eTest",
     ],
     runtime_deps = [

@@ -5,6 +5,7 @@ import io.github.bpalermo.odradek.kafka.v1.OdradekServiceGrpc;
 import io.github.bpalermo.odradek.server.admin.AdminServer;
 import io.github.bpalermo.odradek.server.admin.HealthService;
 import io.github.bpalermo.odradek.server.admin.Readiness;
+import io.github.bpalermo.odradek.server.admin.RequiredClusters;
 import io.github.bpalermo.odradek.server.codec.CodecConfigException;
 import io.github.bpalermo.odradek.server.codec.CodecRegistry;
 import io.github.bpalermo.odradek.server.codec.ContractRegistry;
@@ -145,8 +146,13 @@ public final class Main {
     ConsumeService consume =
         new ConsumeService(config, codecs, tls, produce.serverEpoch(), metrics);
 
+    // Before the socket exists: an app never talks to a server that has not reached the clusters
+    // it must have. Waits as long as it takes; the startup probe's failure threshold bounds it.
+    RequiredClusters.await(config, tls, readiness);
+
     OdradekServer server;
     try {
+      readiness.starting("listening");
       server = OdradekServer.start(config, new OdradekService(produce, consume), health);
     } catch (IOException e) {
       LOG.error("could not start", e);
