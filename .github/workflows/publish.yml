@@ -85,10 +85,13 @@ jobs:
       # `bazel run` steps below then only execute what this step produced.
       # cosign is part of that: the release binary pinned by the
       # rules_img_signer_cosign bazel_dep (//bazel/cosign).
+      # The index digest is in an output group of its own, not in the default
+      # outputs, so it is asked for by name; the digest step below reads it.
       - name: Build the image and the tools
         run: |
-          bazel build --config=ci \
-            //server:image_push //bazel/cosign //bazel/cosign:verify_image
+          bazel build --config=ci --output_groups=+digest \
+            //server:image_index //server:image_push \
+            //bazel/cosign //bazel/cosign:verify_image
 
       # One login covers the push and cosign: both read the Docker config this
       # writes.
