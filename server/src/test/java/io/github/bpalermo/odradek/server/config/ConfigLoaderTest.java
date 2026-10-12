@@ -4,8 +4,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
+import io.github.bpalermo.odradek.config.v1.ConsumerSource;
+import io.github.bpalermo.odradek.config.v1.Dispatch;
 import io.github.bpalermo.odradek.config.v1.OffsetReset;
 import io.github.bpalermo.odradek.config.v1.OnDecodeError;
+import io.github.bpalermo.odradek.config.v1.OnExhausted;
+import io.github.bpalermo.odradek.config.v1.Ordering;
+import io.github.bpalermo.odradek.config.v1.PolicyRule;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
@@ -77,6 +82,58 @@ class ConfigLoaderTest {
         maxMaxProcessing: 1800s
       """;
 
+  /** A dispatcher: clusters and a policy, and no topic of its own. */
+  private static final String DISPATCHER =
+      """
+      clusters:
+        orders:
+          required: true
+          properties:
+            bootstrap.servers: orders-kafka:9093
+      dispatch:
+        port: 9465
+        advertisedAddress: 10.0.0.7:9465
+        idleGrace: 600s
+        partitionWindow: 500
+        policy:
+          - spiffeIds: ["spiffe://example.org/ns/billing/sa/billing"]
+            cluster: orders
+            topics: ["orders.*", payments]
+            groups: [billing]
+            deadLetterTopics: ["billing.dlq.*"]
+          - trustDomain: example.org
+            cluster: orders
+            topics: [audit]
+            groups: ["*"]
+      """;
+
+  /** A sidecar that receives one topic from a dispatcher, reads another itself, and produces. */
+  private static final String RECEIVING =
+      """
+      clusters:
+        analytics:
+          properties:
+            bootstrap.servers: analytics-kafka:9093
+      dispatcher:
+        address: odradek-dispatcher.kafka.svc:9465
+      producers:
+        clickstream:
+          clusters:
+            - cluster: analytics
+      consumers:
+        orders.created:
+          source: CONSUMER_SOURCE_DISPATCHER
+          cluster: orders              # a name in the dispatcher's configuration
+          groupId: billing
+          ordering: ORDERING_KEY
+          maxAttempts: 5
+          onExhausted: ON_EXHAUSTED_DEAD_LETTER
+          deadLetterTopic: billing.dlq.orders
+        clickstream:
+          cluster: analytics
+          groupId: billing
+      """;
+
   private static ConfigException rejected(String yaml) {
     return catchThrowableOfType(ConfigException.class, () -> ConfigLoader.parse(yaml));
   }
@@ -105,6 +162,92 @@ class ConfigLoaderTest {
     assertThat(consumer.getOnDecodeError())
         .isEqualTo(OnDecodeError.ON_DECODE_ERROR_DELIVER_UNDECODED);
     assertThat(config.getConsume().getDefaultMaxProcessing().getSeconds()).isEqualTo(300);
+  }
+
+  @Test
+  void loadsADispatcher() throws Exception {
+    Dispatch dispatch = ConfigLoader.parse(DISPATCHER).getDispatch();
+    assertThat(dispatch.getPort()).isEqualTo(9465);
+    assertThat(dispatch.getAdvertisedAddress()).isEqualTo("10.0.0.7:9465");
+    assertThat(dispatch.getIdleGrace().getSeconds()).isEqualTo(600);
+    assertThat(dispatch.getPartitionWindow()).isEqualTo(500);
+    assertThat(dispatch.getPolicyList()).hasSize(2);
+    PolicyRule rule = dispatch.getPolicy(0);
+    assertThat(rule.getSpiffeIdsList())
+        .containsExactly("spiffe://example.org/ns/billing/sa/billing");
+    assertThat(rule.getCluster()).isEqualTo("orders");
+    assertThat(rule.getTopicsList()).containsExactly("orders.*", "payments");
+    assertThat(rule.getGroupsList()).containsExactly("billing");
+    assertThat(rule.getDeadLetterTopicsList()).containsExactly("billing.dlq.*");
+    assertThat(dispatch.getPolicy(1).getTrustDomain()).isEqualTo("example.org");
+  }
+
+  @Test
+  void loadsAServerThatReceivesFromADispatcher() throws Exception {
+    ServerConfig config = ConfigLoader.parse(RECEIVING);
+    assertThat(config.getDispatcher().getAddress()).isEqualTo("odradek-dispatcher.kafka.svc:9465");
+    var dispatched = config.getConsumersMap().get("orders.created");
+    assertThat(dispatched.getSource()).isEqualTo(ConsumerSource.CONSUMER_SOURCE_DISPATCHER);
+    assertThat(dispatched.getCluster()).isEqualTo("orders");
+    assertThat(dispatched.getOrdering()).isEqualTo(Ordering.ORDERING_KEY);
+    assertThat(dispatched.getMaxAttempts()).isEqualTo(5);
+    assertThat(dispatched.getOnExhausted()).isEqualTo(OnExhausted.ON_EXHAUSTED_DEAD_LETTER);
+    assertThat(dispatched.getDeadLetterTopic()).isEqualTo("billing.dlq.orders");
+    assertThat(config.getConsumersMap().get("clickstream").hasSource()).isFalse();
+  }
+
+  @Test
+  void loadsAServerThatOnlyReceives() throws Exception {
+    ServerConfig config =
+        ConfigLoader.parse(
+            """
+            dispatcher:
+              address: odradek-dispatcher.kafka.svc:9465
+            consumers:
+              orders.created:
+                source: CONSUMER_SOURCE_DISPATCHER
+                cluster: orders
+                groupId: billing
+            """);
+    assertThat(config.getClustersMap()).isEmpty();
+  }
+
+  @Test
+  void dispatcherViolationsNameTheirPath() {
+    ConfigException e =
+        rejected(
+            """
+            clusters:
+              main:
+                properties:
+                  bootstrap.servers: k:9092
+            dispatch:
+              policy:
+                - trustDomain: example.org
+                  cluster: main
+                  topics: ["orders.*.v1"]
+                  groups: [billing]
+            consumers:
+              orders:
+                source: CONSUMER_SOURCE_DISPATCHER
+                cluster: orders
+                groupId: billing
+                onExhausted: ON_EXHAUSTED_DEAD_LETTER
+            """);
+    assertThat(e.problems())
+        .hasSize(4)
+        .anySatisfy(
+            p ->
+                assertThat(p)
+                    .startsWith("dispatch.policy[0].topics[0]: ")
+                    .endsWith("[string.pattern]"))
+        .anySatisfy(p -> assertThat(p).contains("[server_config.dispatcher_required]"))
+        .anySatisfy(
+            p ->
+                assertThat(p)
+                    .startsWith("consumers[\"orders\"]")
+                    .contains("[consumer.dead_letter_topic]"))
+        .anySatisfy(p -> assertThat(p).contains("[consumer.on_exhausted_needs_max_attempts]"));
   }
 
   @Test

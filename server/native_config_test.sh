@@ -199,6 +199,67 @@ grep -q "every producer must reference entries in clusters" violations.log ||
   fail "violations: the CEL rule on producers was not evaluated"
 grep -q "acks must be all" violations.log || fail "violations: the CEL rule on acks was not evaluated"
 
+# The dispatcher of ADR 6 has a schema and no behaviour yet: its settings load and are
+# validated, and the server then refuses to start instead of ignoring them.
+config dispatch <<'EOF'
+clusters:
+  main:
+    properties:
+      bootstrap.servers: localhost:9092
+dispatch:
+  port: 0
+  policy:
+    - trustDomain: example.org
+      cluster: main
+      topics: ["orders.*"]
+      groups: [billing]
+EOF
+rejected dispatch "dispatch is set, and acting as a dispatcher is not implemented yet"
+
+# A server that only receives has no cluster of its own.
+config dispatched-consumer <<'EOF'
+dispatcher:
+  address: odradek-dispatcher.kafka.svc:9465
+consumers:
+  orders:
+    source: CONSUMER_SOURCE_DISPATCHER
+    cluster: main
+    groupId: billing
+    ordering: ORDERING_PARTITION
+EOF
+rejected dispatched-consumer \
+  "consumers.orders.source is CONSUMER_SOURCE_DISPATCHER, and receiving from a dispatcher is not implemented yet"
+
+# Its rules run in the image like the others.
+config dispatch-violations <<'EOF'
+clusters:
+  main:
+    properties:
+      bootstrap.servers: localhost:9092
+dispatch:
+  advertisedAddress: not-an-address
+  policy:
+    - cluster: nowhere
+      topics: ["orders.*.v1"]
+      groups: [billing]
+consumers:
+  orders:
+    source: CONSUMER_SOURCE_DISPATCHER
+    cluster: main
+    groupId: billing
+    onExhausted: ON_EXHAUSTED_DEAD_LETTER
+EOF
+rejected dispatch-violations "every rule of dispatch.policy must reference an entry in clusters"
+for message in \
+  "a rule needs spiffe_ids or trust_domain" \
+  "dispatcher must be set when a consumer's source is CONSUMER_SOURCE_DISPATCHER" \
+  "dead_letter_topic must be set when on_exhausted is ON_EXHAUSTED_DEAD_LETTER" \
+  "dispatch.advertised_address: " \
+  'dispatch.policy\[0\].topics\[0\]: '; do
+  grep -q -- "${message}" dispatch-violations.log ||
+    fail "dispatch-violations: expected '${message}' in the log"
+done
+
 printf 'clusters: [unterminated\n' >yaml-error.yaml
 rejected yaml-error "not valid YAML"
 

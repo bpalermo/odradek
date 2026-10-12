@@ -162,7 +162,7 @@ Not built yet: latency histograms, and configuration reload metrics.
 - The file is YAML (or JSON) in the protobuf JSON mapping: field names in lowerCamelCase, durations as `"30s"`, timestamps as RFC 3339. YAML is converted to JSON and parsed with the protobuf JSON parser in strict mode, so an unknown or misspelled field is an error rather than silently ignored.
 - Constraints are declared in the schema with [protovalidate](https://github.com/bufbuild/protovalidate) and evaluated by `protovalidate-java`:
   - Field rules: name patterns for clusters and topics, absolute paths, port range, positive durations, `spiffe://` prefixes, mandatory fields marked `required`.
-  - Cross-field CEL rules: every producer and consumer entry references an existing cluster; a producer lists each cluster once and has at least one that is not best effort; `bootstrap.servers` is set; a `spiffe` source has a peer policy; the default processing deadline does not exceed the maximum.
+  - Cross-field CEL rules: every producer entry, every consumer entry that reads Kafka itself and every rule of the dispatcher's policy references an existing cluster; a producer lists each cluster once and has at least one that is not best effort; `bootstrap.servers` is set; a `spiffe` source has a peer policy; the default processing deadline does not exceed the maximum; the settings of a dispatched consumer are consistent (see Dispatcher).
   - The enforced Kafka settings (below) are CEL rules on `Cluster`.
 - Validation reports every violation with its field path and rule id. Each rule id has a test.
 - Checks that need the outside world (referenced files exist and parse, brokers reachable) run after schema validation, in code.
@@ -245,6 +245,65 @@ The server owns the settings the guarantees rest on. They may be omitted from `p
 - **Start position**: for a partition where the group has no committed offset, the server positions the consumer itself:
   - `startTimestamp`, if set: the first record at or after that instant.
   - otherwise `offsetReset`: `EARLIEST` (default, never skips) or `LATEST`.
+
+### Dispatcher
+
+[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. **Only the schema and the `odradek.delivery.v1` protocol exist so far.** The fields below load and are validated, and the server then refuses to start (exit status 2) if the configuration has a `dispatch` section or a consumer whose `source` is the dispatcher. The ADR describes the behaviour they will have.
+
+A server that acts as a dispatcher has a `dispatch` section:
+
+| Field | Meaning | Default |
+|---|---|---|
+| `port` | TCP port of `DeliveryService`, which sidecars connect to | 9465 |
+| `advertisedAddress` | `host:port` at which sidecars reach this replica | The pod's interface address and `port` |
+| `idleGrace` | How long a topic is still consumed after the last sidecar that declared it has gone | 5m |
+| `partitionWindow` | Largest span, in offsets, between a partition's commit position and its newest delivered record | 1000 |
+| `policy` | Rules saying who may consume what; a declaration that no rule allows is refused | No rule: everything is refused |
+
+A rule of `policy` names the sidecars it applies to (`spiffeIds`, `trustDomain`, at least one of the two), one `cluster` of `clusters`, and patterns for the `topics`, the `groups` and, optionally, the `deadLetterTopics` it allows. A pattern is an exact name, or a prefix followed by one `*`; `*` alone matches every name.
+
+A server that receives from a dispatcher has a `dispatcher` section with the `address` (`host:port`) of the dispatcher's Service, and on each `consumers` entry concerned:
+
+| Field | Meaning | Default |
+|---|---|---|
+| `source` | `CONSUMER_SOURCE_KAFKA`: the server reads Kafka itself. `CONSUMER_SOURCE_DISPATCHER`: a dispatcher hands it the records | `CONSUMER_SOURCE_KAFKA` |
+| `ordering` | `ORDERING_KEY`, `ORDERING_PARTITION` or `ORDERING_NONE` | `ORDERING_KEY` |
+| `maxAttempts` | Deliveries of a record before it is given up on | No limit |
+| `onExhausted` | `ON_EXHAUSTED_BLOCK` or `ON_EXHAUSTED_DEAD_LETTER`; needs `maxAttempts` | `ON_EXHAUSTED_BLOCK` |
+| `deadLetterTopic` | Where exhausted records are written; set exactly when dead-lettering | — |
+
+- The last four are rejected on a consumer that reads Kafka itself.
+- `cluster` and `groupId` stay mandatory. On a dispatched consumer `cluster` is a name in the dispatcher's configuration and need not exist under `clusters`.
+- `clusters` needs at least one entry, except in a server with a dispatched consumer: one that receives everything it consumes and produces nothing talks to no broker.
+
+```yaml
+# The dispatcher
+clusters:
+  orders:
+    properties:
+      bootstrap.servers: orders-kafka:9093
+dispatch:
+  policy:
+    - spiffeIds: ["spiffe://example.org/ns/billing/sa/billing"]
+      cluster: orders
+      topics: ["orders.*"]
+      groups: [billing]
+      deadLetterTopics: ["billing.dlq.*"]
+```
+
+```yaml
+# The sidecar of an application pod
+dispatcher:
+  address: odradek-dispatcher.kafka.svc:9465
+consumers:
+  orders.created:
+    source: CONSUMER_SOURCE_DISPATCHER
+    cluster: orders            # resolved by the dispatcher
+    groupId: billing
+    maxAttempts: 5
+    onExhausted: ON_EXHAUSTED_DEAD_LETTER
+    deadLetterTopic: billing.dlq.orders
+```
 
 ## 5. Produce path
 

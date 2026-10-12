@@ -1,0 +1,326 @@
+edition = "2024";
+
+// The protocol between a sidecar and a dispatcher.
+//
+// A dispatcher is an Odradek server deployed on its own, whose replicas are
+// the members of a consumer group. It hands the records it consumes to the
+// sidecars of the application's pods, which are not group members. This
+// protocol carries what a sidecar wants to consume, the records, their
+// acknowledgements, flow control and the list of dispatcher replicas. Both
+// ends are the Odradek server; an application never speaks it.
+package odradek.delivery.v1;
+
+import "odradek/kafka/v1/odradek.proto";
+
+option java_outer_classname = "DeliveryProto";
+option java_package = "io.github.bpalermo.odradek.delivery.v1";
+
+// DeliveryService is served by a dispatcher on a TCP port. Sidecars are its
+// clients: a dispatcher never opens a connection to a sidecar.
+service DeliveryService {
+  // Deliver hands the records of one topic to one sidecar.
+  //
+  // One stream carries one topic of one consumer group. A sidecar opens a
+  // stream to every dispatcher replica for each topic its application
+  // consumes, because each replica owns some of the topic's partitions, and
+  // closes them when the application stops consuming.
+  //
+  // The first message from the sidecar must be Declare; the dispatcher
+  // answers with Accepted before anything else. Records are then delivered
+  // only against credits granted by the sidecar. A record stays with the
+  // sidecar until it is acknowledged, rejected or released, or until the
+  // stream ends; a record that is unacknowledged when the stream ends, or
+  // when its processing deadline passes, is delivered again, possibly to
+  // another sidecar.
+  //
+  // A declaration is refused by ending the stream, before Accepted, with one
+  // of these statuses:
+  //
+  //  - INVALID_ARGUMENT: the first message is not Declare, or the declaration
+  //    is malformed (a required field is missing, or the settings contradict
+  //    each other). Retrying unchanged fails again.
+  //  - UNAUTHENTICATED: the sidecar presented no identity the dispatcher can
+  //    check.
+  //  - PERMISSION_DENIED: the dispatcher's policy has no rule allowing this
+  //    identity to consume this topic in this group on this cluster, or to
+  //    use the dead-letter topic it names. A cluster the dispatcher does not
+  //    have is refused the same way, so that a sidecar cannot probe for
+  //    cluster names. Retrying unchanged fails until the policy changes.
+  //  - FAILED_PRECONDITION: the group already consumes the topic with other
+  //    settings, declared by a sidecar that is still connected. The status
+  //    message says which settings are in force. The declaration is accepted
+  //    once no sidecar of the group holds the topic with the old settings.
+  //  - UNAVAILABLE: the dispatcher is stopping or cannot reach the cluster.
+  //    Retry with backoff.
+  //
+  // After Accepted the stream ends with INVALID_ARGUMENT when the sidecar
+  // breaks the protocol (a second Declare, for example), and with UNAVAILABLE
+  // when the dispatcher stops. In both cases everything unacknowledged is
+  // delivered again.
+  rpc Deliver(stream DeliverRequest) returns (stream DeliverResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Common
+// ---------------------------------------------------------------------------
+
+// PeerInfo identifies the Odradek server on the other end of a stream. It is
+// informational: it is reported in logs and metrics and never changes
+// behaviour.
+message PeerInfo {
+  // Version of the Odradek server.
+  string version = 1;
+}
+
+// Ordering says which records of a topic may be in flight at the same time.
+// A record is in flight from the moment it is sent to a sidecar until it is
+// acknowledged, dead-lettered or given up for redelivery.
+enum Ordering {
+  // Not set; behaves as ORDERING_KEY.
+  ORDERING_UNSPECIFIED = 0;
+  // A record is sent only when no earlier record of its partition with the
+  // same key is in flight. Records without a key are sent as under
+  // ORDERING_NONE. Keys are compared as the bytes stored in Kafka.
+  ORDERING_KEY = 1;
+  // A record is sent only when no earlier record of its partition is in
+  // flight: at most one record in flight per partition.
+  ORDERING_PARTITION = 2;
+  // A record is sent as soon as a sidecar has credit.
+  ORDERING_NONE = 3;
+}
+
+// OffsetReset is the position used for a partition for which the group has
+// no committed offset.
+enum OffsetReset {
+  // Not set; behaves as OFFSET_RESET_EARLIEST.
+  OFFSET_RESET_UNSPECIFIED = 0;
+  // Start at the oldest retained record.
+  OFFSET_RESET_EARLIEST = 1;
+  // Start at the end of the partition.
+  OFFSET_RESET_LATEST = 2;
+}
+
+// OnExhausted says what happens to a record that has used all its attempts.
+enum OnExhausted {
+  // Not set; behaves as ON_EXHAUSTED_BLOCK.
+  ON_EXHAUSTED_UNSPECIFIED = 0;
+  // The record blocks its partition: it is not skipped, the commit position
+  // stays below it, and no later record of the partition is delivered.
+  ON_EXHAUSTED_BLOCK = 1;
+  // The record is written to Settings.dead_letter_topic by the dispatcher
+  // and then counts as acknowledged.
+  ON_EXHAUSTED_DEAD_LETTER = 2;
+}
+
+// Settings is how one consumer group consumes one topic. All sidecars of a
+// group share them: the first declaration decides, and holds for as long as
+// a sidecar of the group holds the topic.
+message Settings {
+  // Which records may be in flight at the same time. Unset behaves as
+  // ORDERING_KEY.
+  Ordering ordering = 1;
+  // Longest a delivered record may stay unacknowledged, in milliseconds,
+  // before the dispatcher counts the attempt as failed and delivers the
+  // record again. Required and positive in a declaration: the sidecar sends
+  // the deadline it resolved for its application's Consume stream.
+  uint32 max_processing_ms = 2;
+  // Where to start a partition for which the group has no committed offset,
+  // when start_timestamp_ms is unset or matches no record. Unset behaves as
+  // OFFSET_RESET_EARLIEST.
+  OffsetReset offset_reset = 3;
+  // Where to start a partition for which the group has no committed offset:
+  // at the first record whose timestamp, in milliseconds since the Unix
+  // epoch, is at or after this instant. Takes precedence over offset_reset.
+  // Unset means offset_reset alone decides.
+  int64 start_timestamp_ms = 4;
+  // How many times a record is delivered before it is exhausted. An attempt
+  // fails when its processing deadline passes, when the stream it was
+  // delivered on ends, or when the sidecar rejects the record. Unset or zero
+  // means there is no limit: the record is delivered again until it is
+  // acknowledged, and on_exhausted never applies.
+  uint32 max_attempts = 5;
+  // What happens to a record that has used max_attempts attempts. Unset
+  // behaves as ON_EXHAUSTED_BLOCK.
+  OnExhausted on_exhausted = 6;
+  // Topic, on the same cluster, that exhausted records are written to. Set
+  // exactly when on_exhausted is ON_EXHAUSTED_DEAD_LETTER.
+  string dead_letter_topic = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar to dispatcher
+// ---------------------------------------------------------------------------
+
+// DeliverRequest is a message from the sidecar on a Deliver stream.
+message DeliverRequest {
+  // Exactly one must be set.
+  oneof msg {
+    // Handshake. Must be the first message on the stream, and sent only once.
+    Declare declare = 1;
+    // Grants delivery credits.
+    Credits credits = 2;
+    // Marks records as processed.
+    Ack ack = 3;
+    // Returns one record the sidecar could not hand to its application.
+    Reject reject = 4;
+  }
+}
+
+// Declare is the Deliver handshake: what the sidecar wants to consume, as
+// whom and how. The dispatcher consumes what its connected sidecars declare
+// and nothing else, so the declaration is also what makes the dispatcher's
+// replicas join the group and subscribe to the topic.
+message Declare {
+  // Name of the Kafka cluster to read from, as the dispatcher's
+  // configuration names it. A declaration cannot describe a cluster:
+  // addresses and credentials are the dispatcher's. Required.
+  string cluster = 1;
+  // Consumer group the dispatcher's replicas join for this topic. Required.
+  string group_id = 2;
+  // Topic to consume. Required.
+  string topic = 3;
+  // How the topic is to be consumed. An unset field asks for its default.
+  // The dispatcher compares the result with the settings in force for this
+  // group and topic, if any, and refuses a difference with
+  // FAILED_PRECONDITION.
+  Settings settings = 4;
+  // The sidecar sending this stream. Optional.
+  PeerInfo sidecar = 5;
+}
+
+// Credits grants the dispatcher permission to deliver more records on this
+// stream. Grants are additive. A sidecar grants only while its application
+// has granted credits itself, and spreads them over the replicas it is
+// connected to. A record that is released, or delivered again elsewhere,
+// does not return its credit.
+message Credits {
+  // Number of additional records the dispatcher may deliver.
+  uint32 records = 1;
+}
+
+// Ack marks records of one partition as processed: every record that was
+// delivered on this stream, is still unacknowledged, and has an offset in
+// the inclusive range [first_offset, last_offset].
+//
+// A sidecar receives only some of a partition's records, so the offsets it
+// holds have gaps. The range may span them: offsets in it that this stream
+// did not deliver are not affected, whoever holds them. Acks may arrive in
+// any order; the dispatcher commits, per partition, the offset below which
+// every record is acknowledged.
+message Ack {
+  // Partition of the acknowledged records.
+  int32 partition = 1;
+  // First offset of the range, inclusive.
+  int64 first_offset = 2;
+  // Last offset of the range, inclusive. Equal to first_offset for a single
+  // record.
+  int64 last_offset = 3;
+}
+
+// Reject returns one record that the sidecar could not decode with the
+// topic's codec, so that it never reached the application. It counts as a
+// failed attempt: the record is delivered again, or is exhausted. A reject
+// for a record this stream does not hold is ignored.
+message Reject {
+  // Partition of the record.
+  int32 partition = 1;
+  // Offset of the record.
+  int64 offset = 2;
+  // Why the record was rejected, for the dispatcher's logs. Not stable; do
+  // not match on it.
+  string reason = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher to sidecar
+// ---------------------------------------------------------------------------
+
+// DeliverResponse is a message from the dispatcher on a Deliver stream.
+message DeliverResponse {
+  // Exactly one is set.
+  oneof msg {
+    // Handshake reply. Always the first message on the stream.
+    Accepted accepted = 1;
+    // The dispatcher's replicas changed.
+    ReplicaList replicas = 2;
+    // Records from one partition.
+    RecordBatch records = 3;
+    // The dispatcher no longer owns some partitions.
+    Released released = 4;
+  }
+}
+
+// Accepted completes the Deliver handshake.
+message Accepted {
+  // The settings in force for this group and topic, with every default
+  // filled in: those of the first declaration, which this one matched or
+  // was.
+  Settings settings = 1;
+  // The dispatcher's replicas at the time of the handshake. The sidecar
+  // opens a stream to each one it is not connected to.
+  ReplicaList replicas = 2;
+  // The dispatcher replica answering this stream.
+  PeerInfo dispatcher = 3;
+}
+
+// ReplicaList is every dispatcher replica that consumes for the stream's
+// consumer group. A list is complete: it replaces the one before it. Every
+// replica pushes the new list on every stream it holds whenever the group's
+// membership changes, and a sidecar opens and closes streams to match.
+message ReplicaList {
+  // Orders the lists of one consumer group: it grows every time the group's
+  // membership changes, and every replica sends the same list under the same
+  // generation. A sidecar ignores a list whose generation is lower than that
+  // of the list it is acting on. A sidecar that has lost every stream forgets
+  // the generation it knew and starts again from the bootstrap address.
+  uint64 generation = 1;
+  // The replicas, in no particular order.
+  repeated Replica replicas = 2;
+}
+
+// Replica is one dispatcher replica.
+message Replica {
+  // Where the replica serves DeliveryService, as host:port. It is an address
+  // to connect to as given: the host is normally the replica's pod IP, and a
+  // sidecar does not resolve it again later.
+  string address = 1;
+}
+
+// RecordBatch carries records of one partition, in offset order. Each record
+// consumes one credit. The offsets are not consecutive: the records between
+// them went to other sidecars, or are held back by the ordering.
+message RecordBatch {
+  // Partition the records were read from.
+  int32 partition = 1;
+  // The records, in offset order.
+  repeated Record records = 2;
+}
+
+// Record is one record as stored in Kafka. The dispatcher applies no codec:
+// the sidecar decodes key and value, as it does when it consumes directly.
+message Record {
+  // Offset of the record in its partition.
+  int64 offset = 1;
+  // Record timestamp in milliseconds since the Unix epoch.
+  int64 timestamp_ms = 2;
+  // Record key, as stored. Unset is a null key.
+  bytes key = 3;
+  // Record value, as stored. Unset is a null value (a tombstone).
+  bytes value = 4;
+  // Record headers, as stored, in order.
+  repeated odradek.kafka.v1.Header headers = 5;
+  // Which delivery of this record this is, starting at 1. A value above 1
+  // means an earlier attempt failed, and the application may already have
+  // seen the record. The count is kept in the dispatcher's memory and starts
+  // again when the partition changes owner.
+  uint32 attempt = 6;
+}
+
+// Released tells the sidecar that the dispatcher replica no longer owns the
+// listed partitions. The sidecar drops every record of them it holds
+// unacknowledged: the new owner delivers them again, and an acknowledgement
+// sent to this replica for them is ignored.
+message Released {
+  // The partitions the replica gave up.
+  repeated int32 partitions = 1;
+}

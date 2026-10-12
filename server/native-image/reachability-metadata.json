@@ -590,11 +590,31 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ConsumerSource"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.config.v1.Contracts"
     },
     {
       "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.config.v1.Contracts$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Dispatch"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Dispatch$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Dispatcher"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Dispatcher$Builder"
     },
     {
       "allPublicMethods": true,
@@ -622,6 +642,14 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.OnExhausted"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Ordering"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.config.v1.Pipeline"
     },
     {
@@ -631,6 +659,14 @@
     {
       "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.config.v1.Pipeline$PropertiesDefaultEntryHolder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.PolicyRule"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.PolicyRule$Builder"
     },
     {
       "allPublicMethods": true,

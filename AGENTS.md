@@ -29,6 +29,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 | --- | --- |
 | `api/odradek/kafka/v1/` | The gRPC API between an application and the server |
 | `api/odradek/config/v1/` | The server's configuration schema, validated with protovalidate |
+| `api/odradek/delivery/v1/` | The gRPC protocol between a sidecar and a dispatcher (ADR 6); only the definitions exist so far |
 | `api/odradek/client/v1/` | The client protocol as data: events, actions, conformance scenarios |
 | `server/` | The server: `config`, `codec`, `produce`, `consume`, `tls`, `admin` (health) and `telemetry` (metrics) packages under `io.github.bpalermo.odradek.server` |
 | `client/core/` | The client protocol with no I/O: `handle(event) -> actions`, shared by the JVM clients |
