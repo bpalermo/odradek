@@ -1,4 +1,20 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
 exports_files([
     "registry-lib.sh",
+    "set-version.sh",
     "verify-image-signatures.sh",
 ])
+
+sh_test(
+    name = "version_test",
+    size = "small",
+    srcs = ["version_test.sh"],
+    data = [
+        "set-version.sh",
+        "//bazel:version.bzl",
+        "//client/clojure:deps.edn",
+        "//client/clojure:src/odradek/client/version.edn",
+        "//client/python:odradek/_stream.py",
+    ],
+)

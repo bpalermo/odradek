@@ -4,6 +4,18 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Called by release.yml for a version tag: the same jobs, with the version as
+  # the image tag instead of `dev`, and the version written into the build.
+  workflow_call:
+    inputs:
+      tag:
+        description: the mutable tag of the images; `dev` when this is not a release
+        type: string
+        default: dev
+      version:
+        description: the release version (X.Y.Z); empty when this is not a release
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -32,15 +44,23 @@ jobs:
   publish:
     # workflow_dispatch can target any branch. Without this guard a manual run
     # from a feature branch would publish under the same mutable tags.
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     environment: release
     runs-on: ubuntu-latest
+    env:
+      # `inputs` is empty for a push to main, which publishes `dev`.
+      IMAGE_TAG: ${{ inputs.tag || 'dev' }}
+      RELEASE_VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Bazel executes build tooling from the dependency graph; do not
           # leave GITHUB_TOKEN in .git/config while it runs.
           persist-credentials: false
+
+      - name: Set the release version
+        if: inputs.version != ''
+        run: scripts/set-version.sh "${RELEASE_VERSION}"
 
       # Re-running an old run checks that old commit out again and would move
       # the mutable `dev` tag backwards. Publishing is only correct for main's
@@ -90,6 +110,7 @@ jobs:
       - name: Build the image and the tools
         run: |
           bazel build --config=ci --output_groups=+digest \
+            "--//server:image_tag=${IMAGE_TAG}" \
             //server:image_index //server:image_push \
             //bazel/cosign //bazel/cosign:verify_image
 
@@ -102,7 +123,7 @@ jobs:
           password: ${{ secrets.QUAY_TOKEN }}
 
       - name: Push the multi-arch image
-        run: bazel run --config=ci //server:image_push
+        run: bazel run --config=ci "--//server:image_tag=${IMAGE_TAG}" //server:image_push
 
       # The digest comes from the build rather than from the registry:
       # re-resolving a mutable tag reintroduces a time-of-check window. The
@@ -112,7 +133,8 @@ jobs:
         id: digest
         run: |
           set -euo pipefail
-          index_file="$(bazel cquery --config=ci //server:image_index --output=files 2>/dev/null \
+          index_file="$(bazel cquery --config=ci "--//server:image_tag=${IMAGE_TAG}" \
+            //server:image_index --output=files 2>/dev/null \
             | grep -E '_index\.json$' | head -1)"
           digest_file="${index_file%_index.json}_digest"
           if [ -z "${index_file}" ] || [ ! -s "${digest_file}" ]; then
@@ -174,7 +196,7 @@ jobs:
   # architecture is built and pushed on a machine of that architecture, and the
   # multi-arch index is assembled below from the two pushed manifests.
   native-amd64:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/publish-native.yml
     with:
       arch: amd64
@@ -182,25 +204,27 @@ jobs:
       # The mutable tag. The same value as the default of the string_flag
       # //server:image_tag, which names the JVM image's tag; spelled out here
       # because the index below needs it too.
-      tag: dev
+      tag: ${{ inputs.tag || 'dev' }}
+      version: ${{ inputs.version }}
     secrets: inherit
 
   native-arm64:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/publish-native.yml
     with:
       arch: arm64
       runner: ubuntu-24.04-arm
-      tag: dev
+      tag: ${{ inputs.tag || 'dev' }}
+      version: ${{ inputs.version }}
     secrets: inherit
 
   native-index:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: [native-amd64, native-arm64]
     environment: release
     runs-on: ubuntu-latest
     env:
-      IMAGE_TAG: dev
+      IMAGE_TAG: ${{ inputs.tag || 'dev' }}
       AMD64_DIGEST: ${{ needs.native-amd64.outputs.digest }}
       ARM64_DIGEST: ${{ needs.native-arm64.outputs.digest }}
     steps:

@@ -13,7 +13,7 @@ import grpc.aio
 from odradek.client.v1 import core_pb2
 from odradek.kafka.v1 import odradek_pb2
 
-#: Replaced at release time; see docs/adr/0004.
+#: Replaced at release time by scripts/set-version.sh; see docs/adr/0004.
 VERSION = "0.0.0-dev"
 
 T = TypeVar("T")

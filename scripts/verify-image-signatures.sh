@@ -40,7 +40,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${here}/registry-lib.sh"
 
 cosign_bin="${COSIGN:-cosign}"
-identity="${CERT_IDENTITY_REGEXP:-^https://github\.com/${GITHUB_REPOSITORY:-bpalermo/odradek}/\.github/workflows/publish\.yml@refs/heads/main$}"
+identity="${CERT_IDENTITY_REGEXP:-^https://github\.com/${GITHUB_REPOSITORY:-bpalermo/odradek}/\.github/workflows/publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$}"
 issuer="${CERT_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 expect="${EXPECT_SIGNATURE_LAYOUT:-}"
 if [ -z "$expect" ]; then

@@ -20,6 +20,10 @@ on:
         description: the mutable tag of the image; the string_flag //server:image_tag
         required: true
         type: string
+      version:
+        description: the release version (X.Y.Z); empty when this is not a release
+        type: string
+        default: ""
     outputs:
       digest:
         description: digest of the pushed single-architecture manifest
@@ -40,6 +44,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Set the release version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: scripts/set-version.sh "${RELEASE_VERSION}"
 
       # See publish.yml: only main's current tip is published.
       - name: Refuse to publish a commit that is no longer main's tip
