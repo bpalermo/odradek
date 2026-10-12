@@ -295,7 +295,7 @@ This section is design only; the `codecs` schema and the decode-error marker are
 
 - The app's contract for a topic is a protobuf message type, never a Kafka wire format. `ProduceRecord.value` and `ConsumedRecord.value` carry that message in protobuf encoding. The Java client library exposes it as typed messages.
 - The format stored in Kafka (protobuf with or without schema-registry framing, Avro, JSON), and whether it is encrypted, is the topic's codec. Changing it is a configuration change; the app is not rebuilt and cannot tell.
-- A topic without a codec passes bytes through unchanged, as today. The app then owns the format.
+- With no codec configured, bytes pass through unchanged, as today. The app then owns the format.
 
 ### Pipeline
 
@@ -318,7 +318,7 @@ flowchart LR
 
 | Stage | Interface | Notes |
 |---|---|---|
-| Wire format | Kafka's own `org.apache.kafka.common.serialization.Serializer<T>` and `Deserializer<T>` | `T` is `com.google.protobuf.Message` when the codec declares a contract type, `byte[]` when it does not. Serializers written for the Java client against those types are usable as they are |
+| Wire format | Kafka's own `org.apache.kafka.common.serialization.Serializer<T>` and `Deserializer<T>` | `T` is `com.google.protobuf.Message` when the topic declares a contract type, `byte[]` when it does not. Serializers written for the Java client against those types are usable as they are |
 | Transform | `RecordTransform`, published by Odradek in a small API artifact | Bytes to bytes, one class for both directions so encrypt and decrypt cannot be configured apart |
 
 ```java
@@ -338,14 +338,32 @@ public interface RecordTransform extends Closeable {
 
 ### Configuration
 
-Codecs are named, like clusters, and referenced from `producers` and `consumers` entries. A reference to a missing codec, or a class that cannot be loaded, rejects the configuration.
+Two things are configured, separately:
+
+- **The contract**, per topic: the protobuf message type the app exchanges, as `valueType` and `keyType` on the topic's `producers` and `consumers` entries. Types are resolved from the descriptor sets listed under `contracts`. A topic present in both maps must declare the same types.
+- **The codec**, reusable: how records are stored. Codecs are named, like clusters. `defaultCodec` names the one used by every topic; a topic's `codec` field overrides it.
+
+Resolution for a topic:
+
+1. The topic entry's `codec`, if set.
+2. Otherwise `defaultCodec`, if set.
+3. Otherwise the built-in `passthrough`, which stores the app's bytes unchanged.
+
+- An override replaces the default as a whole. Nothing is merged, so what a topic uses is always one named codec read in one place.
+- `passthrough` is a reserved name. Setting `codec: passthrough` on a topic is how it opts out of the default.
+- A reference to a missing codec, a type missing from the descriptor sets, or a class that cannot be loaded rejects the configuration.
+- A serializer that needs the message type (`T` is `Message`) cannot be used for a topic without a declared type; that also rejects the configuration.
 
 ```yaml
+contracts:
+  descriptorSets:                # FileDescriptorSet files
+    - /etc/odradek/schemas/acme.binpb
+
+defaultCodec: encrypted-avro     # every topic, unless it says otherwise
+
 codecs:
-  orders:
+  encrypted-avro:
     value:
-      messageType: acme.orders.v1.OrderCreated        # the app's contract
-      descriptorSet: /etc/odradek/schemas/orders.binpb # FileDescriptorSet
       serializer: com.example.serde.AvroFromProtoSerializer
       deserializer: com.example.serde.AvroToProtoDeserializer
       properties:
@@ -353,19 +371,32 @@ codecs:
       transforms:
         - class: com.example.crypto.AesGcmTransform
           properties:
-            key.uri: kms://orders
+            key.uri: kms://default
     # key: omitted, so keys pass through as bytes
+  plain-protobuf:
+    value:
+      serializer: com.example.serde.ProtobufSerializer
+      deserializer: com.example.serde.ProtobufDeserializer
 
 producers:
-  orders.created:
-    codec: orders
+  orders.created:                # uses the default codec
+    valueType: acme.orders.v1.OrderCreated
     clusters:
       - cluster: orders
       - cluster: analytics
+  clickstream:                   # override
+    codec: plain-protobuf
+    valueType: acme.web.v1.Click
+    clusters:
+      - cluster: analytics
+  legacy.raw:                    # opts out; the app owns the bytes
+    codec: passthrough
+    clusters:
+      - cluster: orders
 
 consumers:
   orders.created:
-    codec: orders
+    valueType: acme.orders.v1.OrderCreated
     cluster: orders
     groupId: billing
 ```
@@ -389,7 +420,7 @@ A record that cannot be reversed or deserialized cannot be delivered as the cont
 
 ### Changing a codec
 
-- A change to a codec's `properties`, classes or transforms is applied by hot reload (section 8): produce pipelines are replaced at a record boundary, consume pipelines between batches. No producer is recreated and no rebalance happens.
+- A change to a codec's `properties`, classes or transforms, to `defaultCodec`, or to a topic's `codec` is applied by hot reload (section 8): produce pipelines are replaced at a record boundary, consume pipelines between batches. No producer is recreated and no rebalance happens.
 - Changing what is stored in a topic that already holds records is a compatibility problem the codec has to solve, not the server: the deserializer must read both the old and the new form until the old records have expired. Self-describing forms (schema-registry framing, a header naming the encryption key) make that possible.
 - Key rotation is the transform's concern for the same reason: write with the new key, keep reading with the old ones.
 
@@ -423,7 +454,7 @@ At startup there is no last good configuration, so an invalid or missing one fai
 | A cluster's consumer properties or SASL credentials; a topic's consumer `cluster` or `groupId` | Consumer rebuild for the streams reading it. If a stream's topics no longer share one cluster and group, it is closed with `FAILED_PRECONDITION` after the revoke handshake | `Revoked` then `Assigned`, or stream ends |
 | A topic's `consumers` entry removed | Revoke handshake, commit, then the streams reading it close with `NOT_FOUND` | Stream ends |
 | A topic's `startTimestamp` or `offsetReset` | Stored; used only the next time a partition has no committed offset | No |
-| A codec's classes, properties or transforms; a topic's `codec` reference | Pipeline replaced at a record boundary (produce) or between batches (consume) | No |
+| A codec's classes, properties or transforms; `defaultCodec`; a topic's `codec` or contract type | Pipeline replaced at a record boundary (produce) or between batches (consume) | No |
 | A cluster added | Available immediately | No |
 | Socket path, admin port | Not reloadable; logged and flagged in `config_restart_required` | No, until restart |
 
