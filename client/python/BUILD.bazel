@@ -1,15 +1,19 @@
 load("@rules_python//python:packaging.bzl", "py_package", "py_wheel")
 load("@rules_python//python:py_library.bzl", "py_library")
 load("@rules_python//python:py_test.bzl", "py_test")
+load("//bazel:version.bzl", "VERSION")
 load(":proto.bzl", "py_proto_gen")
 
 package(default_visibility = ["//visibility:private"])
 
-exports_files(["requirements_lock.txt"])
+exports_files([
+    "odradek/_stream.py",
+    "requirements_lock.txt",
+])
 
-# The version of the wheel: Version.VERSION of the Java client in the form
-# PyPI accepts (PEP 440). Replaced at release time; see docs/adr/0004.
-_VERSION = "0.0.0.dev0"
+# The version of the wheel: the one version of the repository (ADR 4), with the
+# development value spelled the way PyPI accepts it (PEP 440).
+_VERSION = "0.0.0.dev0" if VERSION == "0.0.0-dev" else VERSION
 
 # The API as Python modules, generated into this package so that they are part
 # of the `odradek` package: odradek.kafka.v1.odradek_pb2 (+ _pb2_grpc) and

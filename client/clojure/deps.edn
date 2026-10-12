@@ -22,6 +22,10 @@
 ;; second copy of anything. After editing: `bazel run //client/clojure:lock`.
 {:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.1"}
+        ;; The protocol core and protoc's Java classes of the API, which this
+        ;; client calls through interop. Same release, same version
+        ;; (scripts/set-version.sh). In the Bazel build they are //client/core.
+        io.github.bpalermo/odradek-client {:mvn/version "0.0.0-dev"}
         com.github.bpalermo/clj-grpc {:mvn/version "0.1.12"}
         com.github.bpalermo/clj-protobuf {:mvn/version "0.4.0"}
 

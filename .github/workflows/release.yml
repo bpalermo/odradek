@@ -1,0 +1,219 @@
+name: release
+
+# A version tag releases everything under one number (ADR 4): the server image
+# (JVM and native), and, where a registry has been set up, the Java artifacts
+# and the Clojure and Python clients.
+#
+#   git tag v1.2.3 <main's tip> && git push origin v1.2.3
+#
+# The tag must point at main's tip: the jobs reused from publish.yml refuse any
+# other commit. Nothing is committed: the version is written into the checkout
+# of each job (scripts/set-version.sh) and main stays at 0.0.0-dev.
+#
+# The image jobs are publish.yml's, unchanged, so a release is pushed and signed
+# exactly as every commit on main is. The three library jobs are off until
+# their repository variable says the registry is ready; see each job.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Read the version from the tag
+        id: version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # Also proves the script accepts it, before any job publishes.
+          scripts/set-version.sh "${version}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Refuse a tag that is not main's tip
+        run: |
+          set -euo pipefail
+          tip="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
+          if [ -z "${tip}" ] || [ "${tip}" != "${GITHUB_SHA}" ]; then
+            echo "::error::${GITHUB_REF_NAME} points at ${GITHUB_SHA}, but main is ${tip:-unreadable}" >&2
+            exit 1
+          fi
+
+  # Build, test and lint the tagged commit with the release version in place,
+  # before anything is pushed anywhere.
+  verify:
+    needs: plan
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: scripts/set-version.sh "${RELEASE_VERSION}"
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ci-build
+          repository-cache: true
+          cache-save: false
+      - run: bazel build //... --config=ci
+      - run: bazel test //... --config=ci
+
+  images:
+    needs: [plan, verify]
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.plan.outputs.version }}
+      version: ${{ needs.plan.outputs.version }}
+    secrets: inherit
+
+  # io.github.bpalermo:odradek-client and :odradek-extension.
+  #
+  # Off until the repository variable PUBLISH_MAVEN is `true`. NOT VALIDATED:
+  # it has never run. It needs, in the `release` environment, MAVEN_USER and
+  # MAVEN_PASSWORD (a Central Portal token), GPG_PRIVATE_KEY and
+  # GPG_PASSPHRASE, and the io.github.bpalermo namespace verified on Maven
+  # Central. MAVEN_REPO defaults to the Portal's staging-compatible endpoint;
+  # a deployment made there still has to be released in the Portal.
+  maven:
+    if: vars.PUBLISH_MAVEN == 'true'
+    needs: [plan, images]
+    environment: release
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: scripts/set-version.sh "${RELEASE_VERSION}"
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: release-maven
+          repository-cache: true
+          cache-save: false
+      # Built before any credential exists on the runner.
+      - run: bazel build --config=ci //client/java:maven.publish //extension/java:maven.publish
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: printf '%s' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+      - name: Upload
+        env:
+          MAVEN_REPO: ${{ vars.MAVEN_REPO || 'https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/' }}
+          MAVEN_USER: ${{ secrets.MAVEN_USER }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+          GPG_SIGN: "true"
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          bazel run --config=ci //extension/java:maven.publish
+          bazel run --config=ci //client/java:maven.publish
+
+  # com.github.bpalermo/odradek-clj.
+  #
+  # Off until the repository variable PUBLISH_CLOJARS is `true`. NOT VALIDATED:
+  # it has never run. It needs CLOJARS_USERNAME and CLOJARS_PASSWORD (a deploy
+  # token) in the `release` environment. The jar depends on
+  # io.github.bpalermo:odradek-client, so it is usable only once `maven` has
+  # published that.
+  clojars:
+    if: vars.PUBLISH_CLOJARS == 'true'
+    needs: [plan, images]
+    environment: release
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: scripts/set-version.sh "${RELEASE_VERSION}"
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: release-clojars
+          repository-cache: true
+          cache-save: false
+      - run: bazel build --config=ci //client/clojure:clojars.publish
+      - name: Upload
+        env:
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
+        run: bazel run --config=ci //client/clojure:clojars.publish
+
+  # The `odradek` wheel.
+  #
+  # Off until the repository variable PUBLISH_PYPI is `true`. NOT VALIDATED: it
+  # has never run. It uses PyPI trusted publishing, so it needs no secret, but
+  # the `odradek` project on PyPI must name this repository, this workflow file
+  # and the `release` environment as a trusted publisher.
+  pypi:
+    if: vars.PUBLISH_PYPI == 'true'
+    needs: [plan, images]
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: scripts/set-version.sh "${RELEASE_VERSION}"
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: release-pypi
+          repository-cache: true
+          cache-save: false
+      - name: Build the wheel
+        run: |
+          set -euo pipefail
+          bazel build --config=ci //client/python:wheel
+          mkdir dist
+          cp "$(bazel cquery --config=ci //client/python:wheel --output=files 2>/dev/null | grep '\.whl$')" dist/
+          ls -l dist
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  # The GitHub release, once the images exist. Its notes are generated from the
+  # pull requests merged since the previous tag.
+  github-release:
+    needs: [plan, images]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Images: \`quay.io/odradek/odradek:${VERSION}\` (JVM) and \`quay.io/odradek/odradek:${VERSION}-native\`, for linux/amd64 and linux/arm64, signed with cosign."

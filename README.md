@@ -63,6 +63,26 @@ Everything released from this repository carries one version ([ADR 4](docs/adr/0
 
 `bazel build //client/java:maven-pom` writes the POM. `bazel run //client/java:maven.publish` uploads; it is meant for the release workflow.
 
+### Releasing
+
+A release is a tag `vX.Y.Z` on `main`'s tip:
+
+```sh
+git tag v1.2.3 origin/main && git push origin v1.2.3
+```
+
+`.github/workflows/release.yml` then writes the version into its checkout (`scripts/set-version.sh`, never committed), builds and tests, and publishes:
+
+| What | Where | Status |
+| --- | --- | --- |
+| Server image, JVM and native | `quay.io/odradek/odradek:X.Y.Z` and `:X.Y.Z-native`, signed | Same jobs as every commit on `main` |
+| Java client and extension API | Maven Central | Off until the repository variable `PUBLISH_MAVEN` is `true`; never run |
+| Clojure client | Clojars | Off until `PUBLISH_CLOJARS` is `true`; never run |
+| Python client | PyPI | Off until `PUBLISH_PYPI` is `true`; never run |
+| GitHub release | this repository | Generated notes |
+
+Each library job documents the secrets and registry setup it needs. Only repository admins can create `v*` tags.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
