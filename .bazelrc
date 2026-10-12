@@ -50,7 +50,9 @@ common:ci --lockfile_mode=error
 
 # Lint (usage: bazel build --config=lint //...). Findings are warnings.
 build:lint --aspects=//bazel/lint:linters.bzl%buf
-build:lint --output_groups=rules_lint_report
+# "+" adds the lint reports to the default outputs. Replacing them would leave
+# `bazel run` under this config with nothing to execute.
+build:lint --output_groups=+rules_lint_report
 # CI lint: fail the build on violations.
 build:ci --config=lint
 build:ci --@aspect_rules_lint//lint:fail_on_violation
