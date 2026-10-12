@@ -108,6 +108,15 @@ native_image(
         "-march=compatibility",
         # Heap of the image builder: a ceiling, not a reservation.
         "-J-Xmx8g",
+        # Netty's clock is System.nanoTime() minus the value it had when this
+        # class was initialized. Initialized while the image is built, that
+        # value is the build machine's, and on a machine whose monotonic clock
+        # reads less (it booted more recently) Netty's time is negative: every
+        # timer on a Netty event loop then fires at once, among them the
+        # deadline of each gRPC call. Netty's own metadata still names the class
+        # that held this in 4.1 (ScheduledFutureTask), not this one.
+        # //server:native_config_test runs the image with such a clock.
+        "--initialize-at-run-time=io.netty.util.concurrent.SystemTicker",
         # zlib linked in, libc not: runs on a base that has glibc and nothing
         # else, and netty's epoll library can still be loaded.
         "--static-nolibc",
@@ -147,10 +156,14 @@ sh_test(
     srcs = ["native_config_test.sh"],
     args = ["$(rootpath :server_native)"],
     data = [
+        "testdata/native/monotonic_back.c",
         ":native_fixture",
         ":server_native",
     ],
-    env = {"EXTENSION_JAR": "$(rootpath :native_fixture)"},
+    env = {
+        "CLOCK_SHIM": "$(rootpath testdata/native/monotonic_back.c)",
+        "EXTENSION_JAR": "$(rootpath :native_fixture)",
+    },
     tags = ["manual"],
     target_compatible_with = ["@platforms//os:linux"],
 )
@@ -219,6 +232,8 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.config.ConfigLoaderTest",
         "io.github.bpalermo.odradek.server.consume.ConsumeServiceTest",
         "io.github.bpalermo.odradek.server.consume.PartitionStateTest",
+        "io.github.bpalermo.odradek.server.dispatch.DispatchCoreRandomTest",
+        "io.github.bpalermo.odradek.server.dispatch.DispatchCoreTest",
         "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
         "io.github.bpalermo.odradek.server.telemetry.KafkaClientMetricsTest",

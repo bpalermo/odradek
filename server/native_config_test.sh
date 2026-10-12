@@ -7,6 +7,7 @@ set -euo pipefail
 
 server="$(realpath "$1")"
 extension_jar="$(realpath "${EXTENSION_JAR}")"
+clock_shim="$(realpath "${CLOCK_SHIM}")"
 # Short: a Unix socket path is limited to about 100 bytes, which TEST_TMPDIR exceeds.
 dir="$(mktemp -d /tmp/odradek-native.XXXXXX)"
 trap 'rm -rf "${dir}"' EXIT
@@ -262,6 +263,65 @@ done
 
 printf 'clusters: [unterminated\n' >yaml-error.yaml
 rejected yaml-error "not valid YAML"
+
+# A machine that booted after the one that built the image: its monotonic clock reads less
+# than it did during the build. A clock captured at build time (Netty's was) then runs
+# negative, every timer on a Netty event loop fires at once, and every gRPC call made on one
+# dies of its deadline the moment it starts. Seen here through the metrics export: sent to a
+# gRPC server that is not a collector, it must be answered "unimplemented", not time out.
+config not-a-collector <<'EOF'
+clusters:
+  main:
+    properties:
+      bootstrap.servers: localhost:9092
+EOF
+"${server}" --config not-a-collector.yaml >not-a-collector.log 2>&1 &
+collector_pid=$!
+port=""
+for _ in $(seq 1 100); do
+  port="$(sed -nE 's/.*health service on port ([0-9]+).*/\1/p' not-a-collector.log | head -1)"
+  [ -n "${port}" ] && break
+  sleep 0.1
+done
+if [ -z "${port}" ]; then
+  fail "young-machine: the stand-in server did not report its port"
+  cat not-a-collector.log >&2
+else
+  gcc -shared -fPIC -o monotonic_back.so "${clock_shim}" -ldl
+  config young-machine <<EOF
+telemetry:
+  endpoint: http://localhost:${port}
+  exportInterval: 1s
+clusters:
+  main:
+    properties:
+      bootstrap.servers: localhost:9092
+EOF
+  LD_PRELOAD="${dir}/monotonic_back.so" "${server}" --config young-machine.yaml \
+    >young-machine.log 2>&1 &
+  young_pid=$!
+  exported=0
+  for _ in $(seq 1 100); do
+    if grep -q "Failed to export" young-machine.log; then
+      exported=1
+      break
+    fi
+    sleep 0.1
+  done
+  # A few more exports, so that one timing out is seen if any does.
+  sleep 3
+  kill -TERM "${young_pid}" 2>/dev/null || true
+  wait "${young_pid}" 2>/dev/null || true
+  if [ "${exported}" -ne 1 ]; then
+    fail "young-machine: no export was attempted"
+    cat young-machine.log >&2
+  elif grep -qi "deadline exceeded" young-machine.log; then
+    fail "young-machine: a gRPC call timed out at once; a clock was captured when the image was built"
+    grep -i "deadline exceeded" young-machine.log | head -3 >&2
+  fi
+fi
+kill -TERM "${collector_pid}" 2>/dev/null || true
+wait "${collector_pid}" 2>/dev/null || true
 
 if [ "${failures}" -ne 0 ]; then
   echo "${failures} check(s) failed" >&2
