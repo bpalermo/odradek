@@ -22,12 +22,17 @@ import io.netty.channel.unix.DomainSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.RetriableException;
 
 /**
  * A running server and a gRPC channel to its Unix socket, in a temporary directory.
@@ -169,9 +174,38 @@ final class ServerHarness {
         Map.<String, Object>of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap));
   }
 
+  /**
+   * Creates a topic and waits until every partition's leader answers.
+   *
+   * <p>The wait matters. A topic exists in the metadata before its broker has taken up leadership.
+   * An idempotent producer that writes in that gap can have its first batch refused and a later one
+   * accepted; the retried first batch is then out of sequence for good, and the record fails only
+   * when delivery.timeout.ms expires. That is Kafka's behaviour for any producer, and nothing an
+   * app would normally meet, but a test that produces a few milliseconds after creating its topic
+   * does.
+   */
   static void createTopic(String bootstrap, String name, int partitions) throws Exception {
     try (Admin admin = admin(bootstrap)) {
       admin.createTopics(List.of(new NewTopic(name, partitions, (short) 1))).all().get();
+      Map<TopicPartition, OffsetSpec> ends = new HashMap<>();
+      for (int partition = 0; partition < partitions; partition++) {
+        ends.put(new TopicPartition(name, partition), OffsetSpec.latest());
+      }
+      // Answered by each partition's leader. Until the topic has reached the broker's own
+      // metadata, and the broker has taken up leadership, the request fails with a retriable
+      // error.
+      long deadline = System.nanoTime() + START_TIMEOUT.toNanos();
+      while (true) {
+        try {
+          admin.listOffsets(ends).all().get(30, TimeUnit.SECONDS);
+          return;
+        } catch (ExecutionException e) {
+          if (!(e.getCause() instanceof RetriableException) || System.nanoTime() > deadline) {
+            throw e;
+          }
+          Thread.sleep(50);
+        }
+      }
     }
   }
 
