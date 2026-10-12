@@ -19,21 +19,34 @@ Kafka's share groups (KIP-932) lift the same two limits inside the broker: many 
 
 We will add a second way to run the server, as a **dispatcher**: a standalone deployment that is the consumer group and hands the records it consumes to the sidecars of the application's pods, over streams the sidecars open to it. The application's pods stop being group members.
 
+```mermaid
+flowchart TB
+  kafka[("Kafka")]
+  subgraph dispatcher["Dispatcher: a Deployment of its own, few replicas"]
+    d0["replica"]
+    d1["replica"]
+  end
+  subgraph pods["Application pods, any number"]
+    subgraph pod1["pod"]
+      s1["sidecar"]
+      a1["app"]
+    end
+    subgraph pod2["pod"]
+      s2["sidecar"]
+      a2["app"]
+    end
+  end
+  kafka -- "consumer group =<br/>the dispatcher's replicas" --> d0
+  kafka --> d1
+  s1 -- "Deliver stream<br/>gRPC over mTLS" --> d0
+  s1 --> d1
+  s2 --> d0
+  s2 --> d1
+  a1 -- "Consume stream<br/>Unix socket (unchanged)" --> s1
+  a2 --> s2
 ```
-            Kafka
-              |  consumer group = the dispatcher's replicas
-        +-----+------+
-        | dispatcher |   a Deployment of its own, few replicas
-        +-----+------+
-              ^  Deliver streams, gRPC over mTLS, opened by each sidecar
-     +--------+--------+----------- ...
-     |                 |
- +---+-----+       +---+-----+
- | sidecar |       | sidecar |    one per application pod, any number
- +---+-----+       +---+-----+
-     | Consume stream, Unix socket (unchanged)
-   app               app
-```
+
+Arrows point from whoever opens the connection. Records flow the other way: from Kafka through a replica and a sidecar to the app.
 
 ### Roles
 
