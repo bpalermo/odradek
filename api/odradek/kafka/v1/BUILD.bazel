@@ -1,38 +1,16 @@
-load("@grpc-java//:java_grpc_library.bzl", "java_grpc_library")
-load("@protobuf//bazel:java_proto_library.bzl", "java_proto_library")
-load("@protobuf//bazel:proto_library.bzl", "proto_library")
-load("//bazel/lint:linters.bzl", "buf_test")
+load("//bazel/proto:defs.bzl", "odradek_proto_library")
 
 package(default_visibility = ["//visibility:private"])
 
-# The generated stubs are for the server, the client library and the e2e suite only.
-_JAVA_CONSUMERS = [
-    "//client:__subpackages__",
-    "//e2e:__pkg__",
-    "//server:__subpackages__",
-]
-
-proto_library(
-    name = "odradek_proto",
-    srcs = ["odradek.proto"],
-    strip_import_prefix = "/api",
-    visibility = ["//visibility:public"],
-)
-
-java_proto_library(
-    name = "odradek_java_proto",
-    visibility = _JAVA_CONSUMERS,
-    deps = [":odradek_proto"],
-)
-
-java_grpc_library(
-    name = "odradek_java_grpc",
-    srcs = [":odradek_proto"],
-    visibility = _JAVA_CONSUMERS,
-    deps = [":odradek_java_proto"],
-)
-
-buf_test(
-    name = "odradek_buf_lint_test",
-    srcs = [":odradek_proto"],
+# The generated libraries are for the server, the clients and the e2e suite only.
+odradek_proto_library(
+    name = "odradek",
+    # Every Clojure namespace already maps Error to java.lang.Error.
+    clj_shadowed = ["Error"],
+    grpc = True,
+    visibility = [
+        "//client:__subpackages__",
+        "//e2e:__subpackages__",
+        "//server:__subpackages__",
+    ],
 )

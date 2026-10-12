@@ -1,4 +1,8 @@
-"""py_proto_gen: Python code for a proto_library, generated into this package.
+"""py_proto_gen and py_proto_package: Python code for a proto_library.
+
+py_proto_gen generates the modules next to the proto (odradek_proto_library of
+//bazel/proto:defs.bzl declares one per .proto). py_proto_package places them in the
+package that ships them.
 
 protobuf's own py_proto_library is not used for two reasons. Its runtime is
 @protobuf//:protobuf_python, which compiles the upb C extension from source,
@@ -7,7 +11,7 @@ And it places the generated modules under the proto's own package, while the
 wheel needs them inside the `odradek` package next to the client's sources:
 `odradek/__init__.py` is hand-written, `odradek/kafka/v1/odradek_pb2.py` is
 generated, and Python only sees one `odradek` package if both are in the same
-directory.
+directory. That is what py_proto_package is for.
 
 The messages (`_pb2.py`) and their type stubs (`_pb2.pyi`) come from the
 protoc that proto toolchain resolution selects, the same prebuilt binary that
@@ -20,6 +24,15 @@ load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@protobuf//bazel/common:proto_info.bzl", "ProtoInfo")
 
 _TOOLCHAIN_TYPE = "@protobuf//bazel/private:proto_toolchain_type"
+
+PyProtoGenInfo = provider(
+    doc = "The Python code generated for one proto_library.",
+    fields = {
+        "modules": "depset of the .py files",
+        "root": "the directory the files' import paths are relative to",
+        "stubs": "depset of the .pyi files",
+    },
+)
 
 def _py_proto_gen_impl(ctx):
     info = ctx.attr.proto[ProtoInfo]
@@ -71,6 +84,11 @@ def _py_proto_gen_impl(ctx):
     return [
         DefaultInfo(files = depset(modules)),
         OutputGroupInfo(pyi = depset(stubs)),
+        PyProtoGenInfo(
+            modules = depset(modules),
+            root = out_root,
+            stubs = depset(stubs),
+        ),
     ]
 
 py_proto_gen = rule(
@@ -86,10 +104,40 @@ py_proto_gen = rule(
             providers = [ProtoInfo],
         ),
         "_grpc_protoc": attr.label(
-            default = "//client/python/tools:grpc_protoc",
+            default = "//bazel/python:grpc_protoc",
             executable = True,
             cfg = "exec",
         ),
     },
     toolchains = [_TOOLCHAIN_TYPE],
+)
+
+def _py_proto_package_impl(ctx):
+    modules = []
+    stubs = []
+    for proto in ctx.attr.protos:
+        info = proto[PyProtoGenInfo]
+        for files, placed in ((info.modules, modules), (info.stubs, stubs)):
+            for src in files.to_list():
+                out = ctx.actions.declare_file(paths.relativize(src.path, info.root))
+                ctx.actions.symlink(output = out, target_file = src)
+                placed.append(out)
+    return [
+        DefaultInfo(files = depset(modules)),
+        OutputGroupInfo(pyi = depset(stubs)),
+    ]
+
+py_proto_package = rule(
+    implementation = _py_proto_package_impl,
+    doc = """Places generated modules in this package, each at its import path.
+
+The default outputs are the .py files and the output group `pyi` their stubs,
+so a py_library here with `imports = ["."]` sees them as part of its package.""",
+    attrs = {
+        "protos": attr.label_list(
+            doc = "py_proto_gen targets.",
+            mandatory = True,
+            providers = [PyProtoGenInfo],
+        ),
+    },
 )

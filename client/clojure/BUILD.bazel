@@ -1,4 +1,3 @@
-load("@protoc_gen_clojure//clojure:defs.bzl", "clojure_proto_library")
 load("@rules_clj//clojure:defs.bzl", "clj_binary", "clj_library", "clj_maven_export", "clj_test")
 load("@rules_java//java:defs.bzl", "java_library")
 
@@ -17,6 +16,7 @@ exports_files([
 # one protobuf-java, the ones the server and the Java client use.
 java_library(
     name = "jvm_deps",
+    visibility = ["//api:__subpackages__"],
     exports = [
         "@grpc-java//api",
         "@grpc-java//netty",
@@ -35,44 +35,14 @@ java_library(
 )
 
 # --- The API as Clojure ------------------------------------------------------------
-# Generated in the build by protoc-gen-clojure, never checked in. The copy puts
-# the file under src/, next to the hand-written namespaces, so the library and the
-# Clojars jar strip one prefix.
-clojure_proto_library(
-    name = "odradek_clj_proto",
-    outs = ["odradek/kafka/v1/odradek.clj"],
-    proto = "//api/odradek/kafka/v1:odradek_proto",
-)
-
-# The API has a message named Error. protoc-gen-clojure 0.7.0 emits
-# `(defrecord Error ...)` for it, which does not load: every namespace already maps
-# Error to java.lang.Error. Until the plugin handles such names, the one line
-# that frees the name is added here, and the build fails if the place for it is
-# no longer found.
+# Generated next to the proto (odradek_proto_library of //bazel/proto:defs.bzl), never
+# checked in. The copy puts the file under src/, next to the hand-written
+# namespaces, because the Clojars jar strips one prefix.
 genrule(
     name = "odradek_clj_proto_src",
-    srcs = ["odradek/kafka/v1/odradek.clj"],
+    srcs = ["//api/odradek/kafka/v1:odradek_clj_proto_src"],
     outs = ["src/odradek/kafka/v1/odradek.clj"],
-    cmd = """
-awk '/^\\(defrecord Error \\[/ { print "(ns-unmap *ns* (quote Error))" } { print }' $< > $@
-grep -q '^(ns-unmap \\*ns\\* (quote Error))$$' $@
-""",
-)
-
-clj_library(
-    name = "api",
-    srcs = [":odradek_clj_proto_src"],
-    namespaces = ["odradek.kafka.v1.odradek"],
-    strip_prefix = "client/clojure/src",
-    deps = [
-        ":jvm_deps",
-        # With protoc's Java classes on the class path the generated namespace
-        # uses them as its message type, which is what lets a message go from
-        # clj-grpc to the Java core and back without a copy.
-        "//api/odradek/kafka/v1:odradek_java_proto",
-        "@clj_deps//:com_github_bpalermo_clj_grpc",
-        "@clj_deps//:com_github_bpalermo_clj_protobuf",
-    ],
+    cmd = "cp $< $@",
 )
 
 # --- The client --------------------------------------------------------------------
@@ -102,9 +72,9 @@ clj_library(
     strip_prefix = "client/clojure/src",
     visibility = ["//e2e:__pkg__"],
     deps = [
-        ":api",
         ":jvm_deps",
         "//api/odradek/client/v1:core_java_proto",
+        "//api/odradek/kafka/v1:odradek_clj_proto",
         "//api/odradek/kafka/v1:odradek_java_proto",
         "//client/core",
         "@clj_deps//:com_github_bpalermo_clj_grpc",
