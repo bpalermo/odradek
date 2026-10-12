@@ -10,6 +10,7 @@ package odradek.config.v1;
 
 import "buf/validate/validate.proto";
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 option java_outer_classname = "ConfigProto";
 option java_package = "io.github.bpalermo.odradek.config.v1";
@@ -22,9 +23,9 @@ option java_package = "io.github.bpalermo.odradek.config.v1";
 // default" unless stated otherwise.
 message SidecarConfig {
   option (buf.validate.message).cel = {
-    id: "sidecar_config.default_cluster_exists"
-    message: "default_cluster must name an entry in clusters"
-    expression: "this.default_cluster in this.clusters"
+    id: "sidecar_config.producer_clusters_exist"
+    message: "every producer must reference entries in clusters"
+    expression: "this.producers.all(topic, this.producers[topic].clusters.all(t, t.cluster in this.clusters))"
   };
   option (buf.validate.message).cel = {
     id: "sidecar_config.consumer_cluster_exists"
@@ -39,15 +40,10 @@ message SidecarConfig {
   // effect at the next sidecar restart.
   Admin admin = 2;
 
-  // Name of the cluster used by Produce streams that leave
-  // ProduceOpen.cluster empty. Must be a key of `clusters`. Required.
-  string default_cluster = 3 [
-    (buf.validate.field).required = true,
-    (buf.validate.field).string.min_len = 1
-  ];
+  reserved 3;
 
-  // Kafka clusters by name. The name is what apps pass in
-  // ProduceOpen.cluster and what `consumers` entries reference. Names are
+  // Kafka clusters by name. The name is what `producers` and `consumers`
+  // entries reference; apps never see it as a parameter. Names are
   // lowercase alphanumerics and dashes, at most 63 characters. At least one
   // cluster is required.
   map<string, Cluster> clusters = 4 [(buf.validate.field).map = {
@@ -66,13 +62,56 @@ message SidecarConfig {
   // the cluster and consumer group for each topic come from here, never from
   // the app. A topic without an entry cannot be consumed.
   map<string, Consumer> consumers = 7 [(buf.validate.field).map.keys.string.pattern = "^[a-zA-Z0-9._-]{1,249}$"];
+
+  // Producers by topic name. Each entry lists the cluster or clusters a
+  // topic is produced to. A topic without an entry cannot be produced to:
+  // the record is rejected with ERROR_CODE_TOPIC_NOT_CONFIGURED.
+  map<string, Producer> producers = 8 [(buf.validate.field).map.keys.string.pattern = "^[a-zA-Z0-9._-]{1,249}$"];
+}
+
+// Producer says which clusters a topic is produced to. With more than one
+// cluster every record is written to all of them, with the same key, value,
+// headers and timestamp. This can be a permanent arrangement or a stage of
+// moving a topic between clusters. Offsets, and the relative order of records
+// from different producers, are not the same across clusters.
+message Producer {
+  option (buf.validate.message).cel = {
+    id: "producer.clusters_unique"
+    message: "a cluster may be listed only once"
+    expression: "this.clusters.map(t, t.cluster).unique()"
+  };
+  option (buf.validate.message).cel = {
+    id: "producer.one_required_cluster"
+    message: "at least one cluster must not be best_effort"
+    expression: "this.clusters.exists(t, !t.best_effort)"
+  };
+
+  // The clusters to write to. All are equal peers; the order only determines
+  // the order of ProduceResult.writes. At least one is required.
+  repeated ProduceTarget clusters = 1 [(buf.validate.field).repeated.min_items = 1];
+}
+
+// ProduceTarget is one cluster a topic is produced to.
+message ProduceTarget {
+  // Name of an entry in SidecarConfig.clusters. The topic must already exist
+  // there. Required.
+  string cluster = 1 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.min_len = 1
+  ];
+  // Whether the write to this cluster is best effort. A record is reported
+  // as produced once every cluster that is not best effort acknowledged it;
+  // a failure on a best-effort cluster is only counted in metrics. Such a
+  // cluster may miss records, so do not consume from it expecting
+  // completeness. Default: false.
+  bool best_effort = 2;
 }
 
 // Consumer says where and as whom one topic is consumed. It is the value of
 // SidecarConfig.consumers, keyed by topic name.
 message Consumer {
   // Name of an entry in SidecarConfig.clusters to read the topic from.
-  // Required; there is no fallback to default_cluster.
+  // Required; there is no default cluster for consuming.
   string cluster = 1 [
     (buf.validate.field).required = true,
     (buf.validate.field).string.min_len = 1
@@ -83,6 +122,32 @@ message Consumer {
     (buf.validate.field).required = true,
     (buf.validate.field).string.min_len = 1
   ];
+  // Where to start reading a partition for which the group has no committed
+  // offset on `cluster`: at the first record whose timestamp is at or after
+  // this instant. Takes precedence over offset_reset. Intended for moving a
+  // consumer to another cluster the topic is also produced to, where a
+  // record carries the same timestamp on every cluster. Ignored once the group has
+  // committed an offset. In the file it is an RFC 3339 string, e.g.
+  // "2026-10-12T10:00:00Z".
+  google.protobuf.Timestamp start_timestamp = 3;
+  // Where to start reading a partition for which the group has no committed
+  // offset and start_timestamp is unset or matches no record.
+  // Default: OFFSET_RESET_EARLIEST.
+  OffsetReset offset_reset = 4 [(buf.validate.field).enum.defined_only = true];
+}
+
+// OffsetReset is the position used for a partition without a committed
+// offset. The sidecar applies it itself; the Kafka property
+// auto.offset.reset must not be set.
+enum OffsetReset {
+  // Not set; behaves as OFFSET_RESET_EARLIEST.
+  OFFSET_RESET_UNSPECIFIED = 0;
+  // Start at the oldest retained record. Never skips records; may re-read
+  // ones already processed elsewhere.
+  OFFSET_RESET_EARLIEST = 1;
+  // Start at the end of the partition. Records written before the consumer
+  // first joins are skipped.
+  OFFSET_RESET_LATEST = 2;
 }
 
 // Listener configures the Unix domain socket the app connects to.
@@ -138,6 +203,12 @@ message Cluster {
     id: "cluster.auto_commit_disabled"
     message: "enable.auto.commit must be false"
     expression: "[this.properties, this.consumer_properties].all(m, !('enable.auto.commit' in m) || m['enable.auto.commit'] == 'false')"
+  };
+  // The starting position is set per topic in Consumer, not per cluster.
+  option (buf.validate.message).cel = {
+    id: "cluster.offset_reset_owned_by_sidecar"
+    message: "auto.offset.reset must not be set; use consumers.<topic>.offset_reset"
+    expression: "[this.properties, this.consumer_properties].all(m, !('auto.offset.reset' in m))"
   };
   // TLS material is owned by the sidecar's engine factory, never by Kafka's
   // keystore settings, so that rotation does not rebuild clients.

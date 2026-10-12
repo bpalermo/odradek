@@ -27,8 +27,9 @@ service OdradekService {
   // never acknowledges on enqueue. Records on one stream are handed to the
   // Kafka producer in arrival order, so one stream is one ordering domain.
   //
-  // The stream fails with NOT_FOUND for an unknown cluster and UNAVAILABLE
-  // for a cluster that cannot be reached.
+  // The app does not choose where a record goes: the sidecar configuration
+  // maps each topic to one or more Kafka clusters, and a record is written to
+  // all of them.
   rpc Produce(stream ProduceRequest) returns (stream ProduceResponse);
 
   // Consume joins a consumer group and delivers records, assignments and
@@ -72,8 +73,10 @@ enum ErrorCode {
   // Not set. Never sent by the sidecar.
   ERROR_CODE_UNSPECIFIED = 0;
   // The outcome is unknown: the record may or may not have been written
-  // (e.g. delivery.timeout.ms expired, or the sidecar restarted). Resending
-  // may duplicate.
+  // (e.g. delivery.timeout.ms expired, or the sidecar restarted). Also used
+  // when the topic is produced to several clusters and not all required ones
+  // acknowledged; ProduceResult.writes lists those that did. Resending may
+  // duplicate.
   ERROR_CODE_OUTCOME_UNKNOWN = 1;
   // The record was definitively not written and never will be as-is (too
   // large, invalid topic name, ...). Resending unchanged will fail again.
@@ -92,6 +95,10 @@ enum ErrorCode {
   ERROR_CODE_PROTOCOL_VIOLATION = 6;
   // An unexpected failure inside the sidecar. Treat the outcome as unknown.
   ERROR_CODE_INTERNAL = 7;
+  // The topic has no entry under `producers` in the sidecar configuration.
+  // The record was not sent to Kafka. Only the affected record fails; the
+  // stream stays open.
+  ERROR_CODE_TOPIC_NOT_CONFIGURED = 8;
 }
 
 // Error describes a failed produce.
@@ -121,18 +128,13 @@ message ProduceRequest {
   }
 }
 
-// ProduceOpen is the Produce handshake. It binds the stream to a session and
-// a cluster.
+// ProduceOpen is the Produce handshake. It binds the stream to a session.
 message ProduceOpen {
   // App-chosen identifier, stable for the lifetime of the app process (a
   // random UUID is suitable). `seq` values are scoped to it. Reopening a
   // stream with the same session_id against the same sidecar_epoch resumes
   // deduplication. Required.
   string session_id = 1;
-  // Name of a Kafka cluster from the sidecar configuration. Empty selects the
-  // sidecar's default cluster. A stream is bound to one cluster for its whole
-  // life; `seq` values are scoped to (cluster, session_id).
-  string cluster = 2;
 }
 
 // ProduceRecord is one record to write to Kafka.
@@ -145,10 +147,14 @@ message ProduceRecord {
   // sidecar discards retained results below it. Equal to `seq` when nothing
   // older is outstanding.
   uint64 low_watermark = 2;
-  // Destination topic. Required.
+  // Destination topic. It must be declared under `producers` in the sidecar
+  // configuration, which decides the cluster or clusters it is written to.
+  // Required.
   string topic = 3;
   // Destination partition. Unset lets the sidecar's partitioner decide (by
-  // key hash when a key is present).
+  // key hash when a key is present). When the topic is produced to several
+  // clusters an explicit partition is used on all of them and must exist on
+  // all.
   int32 partition = 4;
   // Record key. Unset is a null key, which is distinct from an empty one.
   bytes key = 5;
@@ -158,7 +164,8 @@ message ProduceRecord {
   // Record headers, in order.
   repeated Header headers = 7;
   // Record timestamp in milliseconds since the Unix epoch. Unset uses the
-  // sidecar's clock at send time.
+  // sidecar's clock at send time. The same timestamp is written to every
+  // cluster the topic is produced to.
   int64 timestamp_ms = 8;
 }
 
@@ -187,9 +194,6 @@ message ProduceReady {
   // Flow-control window in bytes, counted over key, value and headers of the
   // records awaiting a result.
   uint64 max_in_flight_bytes = 3;
-  // Resolved cluster name (the default cluster's name if the app left
-  // ProduceOpen.cluster empty).
-  string cluster = 4;
 }
 
 // ProduceResult is the final outcome of one ProduceRecord. Results for
@@ -198,27 +202,31 @@ message ProduceReady {
 message ProduceResult {
   // The seq of the record this result belongs to.
   uint64 seq = 1;
-  // Exactly one is set.
-  oneof outcome {
-    // The broker acknowledged the record with acks=all.
-    RecordMetadata metadata = 2;
-    // The record was not acknowledged; see Error.code for whether it may
-    // have been written.
-    Error error = 3;
-  }
+  // Unset on success: every cluster the topic requires acknowledged the
+  // record with acks=all. Set when at least one required cluster did not;
+  // see Error.code for whether the record may have been written.
+  Error error = 2;
+  // One entry per cluster that acknowledged the record, in configuration
+  // order. On success it has every required cluster, plus any best-effort
+  // cluster that had already acknowledged. On error it tells which clusters
+  // hold the record anyway.
+  repeated RecordMetadata writes = 3;
 }
 
-// RecordMetadata says where an acknowledged record was written.
+// RecordMetadata says where one cluster wrote an acknowledged record.
+// Partition and offset are specific to that cluster.
 message RecordMetadata {
+  // Name of the cluster, as in the sidecar configuration.
+  string cluster = 1;
   // Topic the record was written to.
-  string topic = 1;
+  string topic = 2;
   // Partition the record was written to.
-  int32 partition = 2;
+  int32 partition = 3;
   // Offset assigned by the broker.
-  int64 offset = 3;
+  int64 offset = 4;
   // Timestamp stored with the record, in milliseconds since the Unix epoch.
   // May differ from the requested one when the topic uses log-append time.
-  int64 timestamp_ms = 4;
+  int64 timestamp_ms = 5;
 }
 
 // ---------------------------------------------------------------------------

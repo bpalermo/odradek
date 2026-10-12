@@ -12,6 +12,8 @@ import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.Consume;
 import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.Listener;
+import io.github.bpalermo.odradek.config.v1.ProduceTarget;
+import io.github.bpalermo.odradek.config.v1.Producer;
 import io.github.bpalermo.odradek.config.v1.SidecarConfig;
 import io.github.bpalermo.odradek.config.v1.SpiffeSource;
 import io.github.bpalermo.odradek.config.v1.Tls;
@@ -48,7 +50,7 @@ class SidecarConfigValidationTest {
         .setListener(
             Listener.newBuilder().setSocketPath("/var/run/kafka/kafka.sock").addAllowedUids(1000))
         .setAdmin(Admin.newBuilder().setPort(9464))
-        .setDefaultCluster("main")
+        .putProducers("orders", producer("main"))
         .putClusters("main", cluster().build())
         .putConsumers(
             "orders",
@@ -87,10 +89,86 @@ class SidecarConfigValidationTest {
     assertThat(VALIDATOR.validate(valid().build()).isSuccess()).isTrue();
   }
 
+  private static ProduceTarget.Builder target(String cluster) {
+    return ProduceTarget.newBuilder().setCluster(cluster);
+  }
+
+  private static Producer producer(String... clusters) {
+    Producer.Builder p = Producer.newBuilder();
+    for (String c : clusters) {
+      p.addClusters(target(c));
+    }
+    return p.build();
+  }
+
   @Test
-  void defaultClusterMustExist() throws ValidationException {
+  void producingToSeveralClustersPasses() throws ValidationException {
+    SidecarConfig config =
+        valid()
+            .putClusters("next", cluster().build())
+            .putProducers("orders", producer("main", "next"))
+            .putProducers(
+                "audit",
+                Producer.newBuilder()
+                    .addClusters(target("main"))
+                    .addClusters(target("next").setBestEffort(true))
+                    .build())
+            .build();
+    assertThat(VALIDATOR.validate(config).isSuccess()).isTrue();
+  }
+
+  @Test
+  void producerClustersMustExist() throws ValidationException {
     assertViolates(
-        valid().setDefaultCluster("other").build(), "sidecar_config.default_cluster_exists");
+        valid().putProducers("orders", producer("main", "missing")).build(),
+        "sidecar_config.producer_clusters_exist");
+  }
+
+  @Test
+  void producerClustersMustBeUnique() throws ValidationException {
+    assertViolates(
+        valid().putProducers("orders", producer("main", "main")).build(),
+        "producer.clusters_unique");
+  }
+
+  @Test
+  void producerNeedsOneRequiredCluster() throws ValidationException {
+    SidecarConfig config =
+        valid()
+            .putProducers(
+                "orders",
+                Producer.newBuilder().addClusters(target("main").setBestEffort(true)).build())
+            .build();
+    assertViolates(config, "producer.one_required_cluster");
+  }
+
+  @Test
+  void producerNeedsACluster() throws ValidationException {
+    assertThat(ruleIds(valid().putProducers("orders", Producer.getDefaultInstance()).build()))
+        .contains("repeated.min_items");
+  }
+
+  @Test
+  void produceTargetClusterUnsetIsRejected() throws ValidationException {
+    SidecarConfig config =
+        valid()
+            .putProducers(
+                "orders",
+                Producer.newBuilder().addClusters(ProduceTarget.getDefaultInstance()).build())
+            .build();
+    assertThat(ruleIds(config)).contains("required");
+  }
+
+  @Test
+  void producerTopicNamesMustBeValid() throws ValidationException {
+    assertViolates(valid().putProducers("bad topic!", producer("main")).build(), "string.pattern");
+  }
+
+  @Test
+  void offsetResetIsOwnedBySidecar() throws ValidationException {
+    assertViolates(
+        withCluster(c -> c.putConsumerProperties("auto.offset.reset", "latest")),
+        "cluster.offset_reset_owned_by_sidecar");
   }
 
   @Test
@@ -160,20 +238,6 @@ class SidecarConfigValidationTest {
                     .build())
             .build();
     assertViolates(config, "string.min_len");
-  }
-
-  @Test
-  void defaultClusterUnsetIsRejected() throws ValidationException {
-    SidecarConfig config = valid().clearDefaultCluster().build();
-    assertThat(ruleIds(config))
-        .containsExactlyInAnyOrder("required", "sidecar_config.default_cluster_exists");
-  }
-
-  @Test
-  void defaultClusterEmptyIsRejected() throws ValidationException {
-    SidecarConfig config = valid().setDefaultCluster("").build();
-    assertThat(ruleIds(config))
-        .containsExactlyInAnyOrder("string.min_len", "sidecar_config.default_cluster_exists");
   }
 
   @Test
@@ -309,7 +373,7 @@ class SidecarConfigValidationTest {
         valid()
             .clearClusters()
             .putClusters("Bad_Name", cluster().build())
-            .setDefaultCluster("Bad_Name")
+            .clearProducers()
             .clearConsumers()
             .build();
     assertViolates(config, "string.pattern");
