@@ -41,6 +41,17 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 
 Formatting covers Java (google-java-format), Starlark (buildifier, including its lint) and protobuf (buf). Java is linted by Error Prone inside every `javac` action, with warnings as errors for first-party code; protos are linted by buf.
 
+## Versions and Maven artifacts
+
+Everything released from this repository carries one version ([ADR 4](docs/adr/0004-one-version-for-server-and-clients.md)), held in `bazel/version.bzl`. It is `0.0.0-dev` on `main`.
+
+| Artifact | Target | Contents |
+| --- | --- | --- |
+| `io.github.bpalermo:odradek-client` | `//client/java:maven` | The Java client, the protocol core and the generated API classes. gRPC, Netty and protobuf are dependencies |
+| `io.github.bpalermo:odradek-extension` | `//extension/java:maven` | `RecordTransform`, for codec extension jars |
+
+`bazel build //client/java:maven-pom` writes the POM. `bazel run //client/java:maven.publish` uploads; it is meant for the release workflow.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).

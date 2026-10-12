@@ -1,5 +1,7 @@
 load("@rules_java//java:defs.bzl", "java_library")
+load("//bazel:version.bzl", "VERSION")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
+load("//bazel/maven:defs.bzl", "GRPC_DEPENDENCIES", "maven_artifact")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -8,6 +10,8 @@ java_library(
     name = "client",
     srcs = glob(["src/main/java/**/*.java"]),
     javacopts = JAVACOPTS,
+    resource_strip_prefix = package_name(),
+    resources = [":version"],
     visibility = ["//visibility:public"],
     exports = ["//api/odradek/kafka/v1:odradek_java_proto"],
     deps = [
@@ -24,4 +28,21 @@ java_library(
         "@maven//:org_slf4j_slf4j_api",
         "@protobuf//java/core",
     ],
+)
+
+# What the client tells the server about itself, read by Version.java.
+genrule(
+    name = "version",
+    outs = ["odradek-client.version"],
+    cmd = "echo -n '%s' > $@" % VERSION,
+)
+
+# The Maven artifact: this library with the protocol core and the generated API
+# classes inside it; gRPC, Netty, protobuf and slf4j are dependencies.
+maven_artifact(
+    name = "maven",
+    artifact = "odradek-client",
+    extra_dependencies = GRPC_DEPENDENCIES,
+    visibility = ["//visibility:public"],
+    exports = [":client"],
 )

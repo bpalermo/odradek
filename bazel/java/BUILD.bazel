@@ -12,6 +12,8 @@ exports_files([
 # must come from there and nowhere else.
 java_library(
     name = "proto_runtime",
+    # Named by //bazel/maven:defs.bzl, to keep it out of published jars.
+    visibility = ["//visibility:public"],
     exports = [
         "@maven//:build_buf_protovalidate",
         "@protobuf//java/core",
