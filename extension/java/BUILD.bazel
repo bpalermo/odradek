@@ -1,5 +1,6 @@
 load("@rules_java//java:defs.bzl", "java_library")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
+load("//bazel/maven:defs.bzl", "maven_artifact")
 
 # The interfaces an extension jar compiles against. Kept apart from the server
 # so an extension depends on this and kafka-clients, and on nothing else.
@@ -10,4 +11,12 @@ java_library(
     visibility = ["//visibility:public"],
     exports = ["@maven//:org_apache_kafka_kafka_clients"],
     deps = ["@maven//:org_apache_kafka_kafka_clients"],
+)
+
+# The Maven artifact an extension jar compiles against.
+maven_artifact(
+    name = "maven",
+    artifact = "odradek-extension",
+    visibility = ["//visibility:public"],
+    exports = [":extension"],
 )
