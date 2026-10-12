@@ -11,11 +11,17 @@ import io.github.bpalermo.odradek.config.v1.Admin;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.Codec;
 import io.github.bpalermo.odradek.config.v1.Consume;
+import io.github.bpalermo.odradek.config.v1.ConsumerSource;
 import io.github.bpalermo.odradek.config.v1.Contracts;
+import io.github.bpalermo.odradek.config.v1.Dispatch;
+import io.github.bpalermo.odradek.config.v1.Dispatcher;
 import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.Listener;
 import io.github.bpalermo.odradek.config.v1.OnDecodeError;
+import io.github.bpalermo.odradek.config.v1.OnExhausted;
+import io.github.bpalermo.odradek.config.v1.Ordering;
 import io.github.bpalermo.odradek.config.v1.Pipeline;
+import io.github.bpalermo.odradek.config.v1.PolicyRule;
 import io.github.bpalermo.odradek.config.v1.ProduceTarget;
 import io.github.bpalermo.odradek.config.v1.Producer;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
@@ -536,5 +542,360 @@ class ServerConfigValidationTest {
   void transformClassIsWrittenAsClassInTheFile() {
     assertThat(Transform.getDescriptor().findFieldByName("class_name").getJsonName())
         .isEqualTo("class");
+  }
+
+  // --- Dispatcher (ADR 6) ---
+
+  private static final String SIDECAR_ID = "spiffe://example.org/ns/billing/sa/billing";
+
+  private static PolicyRule.Builder rule() {
+    return PolicyRule.newBuilder()
+        .addSpiffeIds(SIDECAR_ID)
+        .setCluster("main")
+        .addTopics("orders.*")
+        .addGroups("billing");
+  }
+
+  /** A valid config whose dispatch section has this one rule. */
+  private static ServerConfig withRule(PolicyRule.Builder rule) {
+    return valid().setDispatch(Dispatch.newBuilder().addPolicy(rule)).build();
+  }
+
+  private static io.github.bpalermo.odradek.config.v1.Consumer.Builder dispatched() {
+    return io.github.bpalermo.odradek.config.v1.Consumer.newBuilder()
+        .setCluster("orders")
+        .setGroupId("billing")
+        .setSource(ConsumerSource.CONSUMER_SOURCE_DISPATCHER);
+  }
+
+  /** A valid config that also receives {@code payments} from a dispatcher. */
+  private static ServerConfig receiving(
+      io.github.bpalermo.odradek.config.v1.Consumer.Builder consumer) {
+    return valid()
+        .setDispatcher(Dispatcher.newBuilder().setAddress("odradek-dispatcher.kafka.svc:9465"))
+        .putConsumers("payments", consumer.build())
+        .build();
+  }
+
+  @Test
+  void dispatcherConfigurationPasses() throws ValidationException {
+    ServerConfig config =
+        valid()
+            .setDispatch(
+                Dispatch.newBuilder()
+                    .setPort(9465)
+                    .setAdvertisedAddress("10.0.0.7:9465")
+                    .setIdleGrace(seconds(300))
+                    .setPartitionWindow(1000)
+                    .addPolicy(
+                        rule()
+                            .setTrustDomain("example.org")
+                            .addTopics("payments")
+                            .addGroups("billing-*")
+                            .addDeadLetterTopics("orders.dlq"))
+                    .addPolicy(
+                        PolicyRule.newBuilder()
+                            .setTrustDomain("example.org")
+                            .setCluster("main")
+                            .addTopics("*")
+                            .addGroups("*")
+                            .addDeadLetterTopics("*")))
+            .build();
+    assertThat(ruleIds(config)).isEmpty();
+  }
+
+  @Test
+  void emptyDispatchSectionPasses() throws ValidationException {
+    // Every field has a default, and no rule means that every declaration is refused.
+    assertThat(ruleIds(valid().setDispatch(Dispatch.getDefaultInstance()).build())).isEmpty();
+  }
+
+  @Test
+  void dispatchedConsumerPasses() throws ValidationException {
+    // Its cluster, "orders", is a name in the dispatcher's configuration, not in this one.
+    ServerConfig config =
+        receiving(
+            dispatched()
+                .setOrdering(Ordering.ORDERING_PARTITION)
+                .setMaxAttempts(5)
+                .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                .setDeadLetterTopic("payments.dlq")
+                .setOnDecodeError(OnDecodeError.ON_DECODE_ERROR_DELIVER_UNDECODED));
+    assertThat(ruleIds(config)).isEmpty();
+  }
+
+  @Test
+  void dispatchedConsumerWithDefaultsPasses() throws ValidationException {
+    assertThat(ruleIds(receiving(dispatched()))).isEmpty();
+    assertThat(ruleIds(receiving(dispatched().setMaxAttempts(3)))).isEmpty();
+    assertThat(
+            ruleIds(
+                receiving(
+                    dispatched().setMaxAttempts(3).setOnExhausted(OnExhausted.ON_EXHAUSTED_BLOCK))))
+        .isEmpty();
+  }
+
+  @Test
+  void serverThatOnlyReceivesNeedsNoCluster() throws ValidationException {
+    ServerConfig config =
+        ServerConfig.newBuilder()
+            .setDispatcher(Dispatcher.newBuilder().setAddress("odradek-dispatcher:9465"))
+            .putConsumers("payments", dispatched().build())
+            .build();
+    assertThat(ruleIds(config)).isEmpty();
+  }
+
+  @Test
+  void aClusterIsRequiredWithoutADispatchedConsumer() throws ValidationException {
+    assertViolates(ServerConfig.getDefaultInstance(), "server_config.clusters_required");
+    // Where the dispatcher is does not make the server receive anything.
+    assertViolates(
+        ServerConfig.newBuilder()
+            .setDispatcher(Dispatcher.newBuilder().setAddress("odradek-dispatcher:9465"))
+            .build(),
+        "server_config.clusters_required");
+  }
+
+  @Test
+  void consumerThatReadsKafkaItselfStillNeedsItsCluster() throws ValidationException {
+    ServerConfig config =
+        receiving(dispatched().setSource(ConsumerSource.CONSUMER_SOURCE_KAFKA).setCluster("gone"));
+    assertViolates(config, "server_config.consumer_cluster_exists");
+  }
+
+  @Test
+  void producerOfAServerThatReceivesStillNeedsItsCluster() throws ValidationException {
+    ServerConfig config =
+        ServerConfig.newBuilder()
+            .setDispatcher(Dispatcher.newBuilder().setAddress("odradek-dispatcher:9465"))
+            .putConsumers("payments", dispatched().build())
+            .putProducers("payments.done", producer("orders"))
+            .build();
+    assertViolates(config, "server_config.producer_clusters_exist");
+  }
+
+  @Test
+  void dispatchedConsumerNeedsTheDispatcher() throws ValidationException {
+    assertViolates(
+        valid().putConsumers("payments", dispatched().build()).build(),
+        "server_config.dispatcher_required");
+  }
+
+  @Test
+  void dispatcherAddressUnsetIsRejected() throws ValidationException {
+    assertViolates(valid().setDispatcher(Dispatcher.getDefaultInstance()).build(), "required");
+  }
+
+  @Test
+  void dispatcherAddressMustBeHostAndPort() throws ValidationException {
+    for (String address :
+        List.of("odradek-dispatcher", "http://odradek-dispatcher:9465", "dispatcher:99999")) {
+      assertViolates(
+          valid().setDispatcher(Dispatcher.newBuilder().setAddress(address)).build(),
+          "string.host_and_port");
+    }
+    assertThat(
+            ruleIds(
+                valid()
+                    .setDispatcher(Dispatcher.newBuilder().setAddress("[fd00::7]:9465"))
+                    .build()))
+        .isEmpty();
+  }
+
+  @Test
+  void consumerSourceMustBeDefined() throws ValidationException {
+    assertViolates(
+        valid().putConsumers("orders", ordersConsumer().setSourceValue(99).build()).build(),
+        "enum.defined_only");
+  }
+
+  @Test
+  void dispatcherSettingsAreRejectedOnAConsumerThatReadsKafkaItself() throws ValidationException {
+    List<Consumer<io.github.bpalermo.odradek.config.v1.Consumer.Builder>> settings =
+        List.of(
+            c -> c.setOrdering(Ordering.ORDERING_NONE),
+            c -> c.setMaxAttempts(3),
+            c -> c.setMaxAttempts(3).setOnExhausted(OnExhausted.ON_EXHAUSTED_BLOCK),
+            c ->
+                c.setMaxAttempts(3)
+                    .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                    .setDeadLetterTopic("orders.dlq"));
+    for (var setting : settings) {
+      var direct = ordersConsumer();
+      setting.accept(direct);
+      assertViolates(
+          valid().putConsumers("orders", direct.build()).build(), "consumer.dispatcher_settings");
+      // The same with the source spelled out.
+      direct.setSource(ConsumerSource.CONSUMER_SOURCE_KAFKA);
+      assertViolates(
+          valid().putConsumers("orders", direct.build()).build(), "consumer.dispatcher_settings");
+    }
+  }
+
+  @Test
+  void orderingMustBeDefined() throws ValidationException {
+    assertViolates(receiving(dispatched().setOrderingValue(99)), "enum.defined_only");
+  }
+
+  @Test
+  void maxAttemptsMustBeAtLeastOne() throws ValidationException {
+    assertViolates(receiving(dispatched().setMaxAttempts(0)), "uint32.gte");
+  }
+
+  @Test
+  void onExhaustedNeedsMaxAttempts() throws ValidationException {
+    assertViolates(
+        receiving(dispatched().setOnExhausted(OnExhausted.ON_EXHAUSTED_BLOCK)),
+        "consumer.on_exhausted_needs_max_attempts");
+    assertViolates(
+        receiving(
+            dispatched()
+                .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                .setDeadLetterTopic("payments.dlq")),
+        "consumer.on_exhausted_needs_max_attempts");
+  }
+
+  @Test
+  void deadLetteringNeedsADeadLetterTopic() throws ValidationException {
+    assertViolates(
+        receiving(
+            dispatched().setMaxAttempts(3).setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)),
+        "consumer.dead_letter_topic");
+  }
+
+  @Test
+  void deadLetterTopicIsRejectedUnlessDeadLettering() throws ValidationException {
+    assertViolates(
+        receiving(dispatched().setMaxAttempts(3).setDeadLetterTopic("payments.dlq")),
+        "consumer.dead_letter_topic");
+    assertViolates(
+        receiving(
+            dispatched()
+                .setMaxAttempts(3)
+                .setOnExhausted(OnExhausted.ON_EXHAUSTED_BLOCK)
+                .setDeadLetterTopic("payments.dlq")),
+        "consumer.dead_letter_topic");
+  }
+
+  @Test
+  void deadLetterTopicMustNotBeTheTopicItself() throws ValidationException {
+    assertViolates(
+        receiving(
+            dispatched()
+                .setMaxAttempts(3)
+                .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                .setDeadLetterTopic("payments")),
+        "server_config.dead_letter_topic_differs");
+  }
+
+  @Test
+  void deadLetterTopicNameMustBeValid() throws ValidationException {
+    assertViolates(
+        receiving(
+            dispatched()
+                .setMaxAttempts(3)
+                .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                .setDeadLetterTopic("bad topic!")),
+        "string.pattern");
+  }
+
+  @Test
+  void onExhaustedMustBeDefined() throws ValidationException {
+    assertViolates(
+        receiving(dispatched().setMaxAttempts(3).setOnExhaustedValue(99)), "enum.defined_only");
+  }
+
+  @Test
+  void dispatchPortMustBeAPort() throws ValidationException {
+    assertViolates(valid().setDispatch(Dispatch.newBuilder().setPort(70000)).build(), "uint32.lte");
+  }
+
+  @Test
+  void advertisedAddressMustBeHostAndPort() throws ValidationException {
+    assertViolates(
+        valid().setDispatch(Dispatch.newBuilder().setAdvertisedAddress("10.0.0.7")).build(),
+        "string.host_and_port");
+  }
+
+  @Test
+  void idleGraceMustNotBeNegative() throws ValidationException {
+    assertViolates(
+        valid().setDispatch(Dispatch.newBuilder().setIdleGrace(seconds(-1))).build(),
+        "duration.gte");
+    assertThat(ruleIds(valid().setDispatch(Dispatch.newBuilder().setIdleGrace(seconds(0))).build()))
+        .isEmpty();
+  }
+
+  @Test
+  void partitionWindowMustBeAtLeastOne() throws ValidationException {
+    assertViolates(
+        valid().setDispatch(Dispatch.newBuilder().setPartitionWindow(0)).build(), "uint32.gte");
+  }
+
+  @Test
+  void policyRuleClusterMustExist() throws ValidationException {
+    assertViolates(withRule(rule().setCluster("missing")), "server_config.policy_clusters_exist");
+  }
+
+  @Test
+  void policyRuleClusterUnsetIsRejected() throws ValidationException {
+    // Unset violates `required`; an unset cluster is also no entry of clusters.
+    assertThat(ruleIds(withRule(rule().clearCluster())))
+        .containsExactlyInAnyOrder("required", "server_config.policy_clusters_exist");
+  }
+
+  @Test
+  void policyRuleNeedsAnIdentity() throws ValidationException {
+    assertViolates(withRule(rule().clearSpiffeIds()), "policy_rule.identity_required");
+    assertThat(ruleIds(withRule(rule().clearSpiffeIds().setTrustDomain("example.org")))).isEmpty();
+  }
+
+  @Test
+  void policyRuleSpiffeIdsMustBeSpiffeIds() throws ValidationException {
+    assertViolates(withRule(rule().addSpiffeIds("example.org/billing")), "string.prefix");
+    assertViolates(withRule(rule().addSpiffeIds(SIDECAR_ID)), "repeated.unique");
+  }
+
+  @Test
+  void policyRuleTrustDomainHasNoScheme() throws ValidationException {
+    assertViolates(withRule(rule().setTrustDomain("spiffe://example.org")), "string.pattern");
+  }
+
+  @Test
+  void policyRuleNeedsTopicsAndGroups() throws ValidationException {
+    assertViolates(withRule(rule().clearTopics()), "repeated.min_items");
+    assertViolates(withRule(rule().clearGroups()), "repeated.min_items");
+  }
+
+  @Test
+  void policyRuleNeedsNoDeadLetterTopics() throws ValidationException {
+    assertThat(ruleIds(withRule(rule().clearDeadLetterTopics()))).isEmpty();
+  }
+
+  @Test
+  void policyPatternsAreANameOrAPrefixAndAStar() throws ValidationException {
+    for (String pattern : List.of("orders.created", "orders.*", "orders*", "*", "a_b-c.D9")) {
+      assertThat(ruleIds(withRule(rule().clearTopics().addTopics(pattern)))).isEmpty();
+      assertThat(ruleIds(withRule(rule().addDeadLetterTopics(pattern)))).isEmpty();
+    }
+    for (String pattern : List.of("", "*.created", "orders.*.v1", "orders.**", "bad topic", "o?")) {
+      assertViolates(withRule(rule().clearTopics().addTopics(pattern)), "string.pattern");
+      assertViolates(withRule(rule().addDeadLetterTopics(pattern)), "string.pattern");
+    }
+    // A group id is any text, so only the star is constrained.
+    for (String pattern : List.of("billing", "billing-*", "*", "a group, with: punctuation")) {
+      assertThat(ruleIds(withRule(rule().clearGroups().addGroups(pattern)))).isEmpty();
+    }
+    for (String pattern : List.of("", "*-billing", "bill*ing", "billing**")) {
+      assertViolates(withRule(rule().clearGroups().addGroups(pattern)), "string.pattern");
+    }
+  }
+
+  @Test
+  void policyPatternsAreListedOnce() throws ValidationException {
+    assertViolates(withRule(rule().addTopics("orders.*")), "repeated.unique");
+    assertViolates(withRule(rule().addGroups("billing")), "repeated.unique");
+    assertViolates(
+        withRule(rule().addDeadLetterTopics("dlq").addDeadLetterTopics("dlq")), "repeated.unique");
   }
 }

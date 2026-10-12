@@ -1,5 +1,7 @@
 package io.github.bpalermo.odradek.server;
 
+import io.github.bpalermo.odradek.config.v1.Consumer;
+import io.github.bpalermo.odradek.config.v1.ConsumerSource;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.kafka.v1.OdradekServiceGrpc;
 import io.github.bpalermo.odradek.server.admin.AdminServer;
@@ -24,6 +26,10 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -78,6 +84,14 @@ public final class Main {
       return;
     } catch (IOException e) {
       LOG.error("configuration {} cannot be read: {}", file, e.toString());
+      System.exit(2);
+      return;
+    }
+
+    List<String> notImplemented = notImplemented(config);
+    if (!notImplemented.isEmpty()) {
+      LOG.error("configuration {} rejected:", file);
+      notImplemented.forEach(problem -> LOG.error("  {}", problem));
       System.exit(2);
       return;
     }
@@ -186,6 +200,28 @@ public final class Main {
                 },
                 "shutdown"));
     server.awaitTermination();
+  }
+
+  /**
+   * Returns one line for each setting that the schema accepts and the server cannot honour yet: the
+   * dispatcher of ADR 6, of which only the schema exists. Starting anyway would mean consuming
+   * nothing while looking healthy, or consuming in a way the configuration does not say.
+   */
+  static List<String> notImplemented(ServerConfig config) {
+    List<String> problems = new ArrayList<>();
+    if (config.hasDispatch()) {
+      problems.add("dispatch is set, and acting as a dispatcher is not implemented yet");
+    }
+    for (Map.Entry<String, Consumer> entry : new TreeMap<>(config.getConsumersMap()).entrySet()) {
+      if (entry.getValue().getSource() == ConsumerSource.CONSUMER_SOURCE_DISPATCHER) {
+        problems.add(
+            "consumers."
+                + entry.getKey()
+                + ".source is CONSUMER_SOURCE_DISPATCHER, and receiving from a dispatcher is not"
+                + " implemented yet");
+      }
+    }
+    return problems;
   }
 
   /** Loads the contracts and builds the codecs the configuration names. */
