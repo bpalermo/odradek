@@ -5,32 +5,32 @@ load("//bazel/lint:linters.bzl", "buf_test")
 
 package(default_visibility = ["//visibility:private"])
 
-# The generated stubs are for the sidecar and the client library only.
+# The generated stubs are for the server and the client library only.
 _JAVA_CONSUMERS = [
     "//client:__subpackages__",
-    "//sidecar:__subpackages__",
+    "//server:__subpackages__",
 ]
 
 proto_library(
-    name = "sidecar_proto",
-    srcs = ["sidecar.proto"],
+    name = "odradek_proto",
+    srcs = ["odradek.proto"],
     visibility = ["//visibility:public"],
 )
 
 java_proto_library(
-    name = "sidecar_java_proto",
+    name = "odradek_java_proto",
     visibility = _JAVA_CONSUMERS,
-    deps = [":sidecar_proto"],
+    deps = [":odradek_proto"],
 )
 
 java_grpc_library(
-    name = "sidecar_java_grpc",
-    srcs = [":sidecar_proto"],
+    name = "odradek_java_grpc",
+    srcs = [":odradek_proto"],
     visibility = _JAVA_CONSUMERS,
-    deps = [":sidecar_java_proto"],
+    deps = [":odradek_java_proto"],
 )
 
 buf_test(
-    name = "sidecar_buf_lint_test",
-    srcs = [":sidecar_proto"],
+    name = "odradek_buf_lint_test",
+    srcs = [":odradek_proto"],
 )

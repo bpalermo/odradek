@@ -74,15 +74,15 @@ jobs:
       - name: Build the image, the push target and the signing tools
         run: |
           bazel build --config=ci \
-            //sidecar:image_index //sidecar:image_push \
+            //server:image_index //server:image_push \
             //bazel/cosign //bazel/cosign:verify_image
 
       - name: Load the image and start it
         run: |
           set -euo pipefail
-          bazel run --config=ci //sidecar:image_load
+          bazel run --config=ci //server:image_load
           docker run --rm localhost/odradek:e2e | tee image-run.log
-          grep -q "odradek sidecar starting" image-run.log
+          grep -q "odradek server starting" image-run.log
 
   # End to end against real Kafka in KRaft mode (no ZooKeeper). Two
   # independent single-node clusters, so the multi-cluster cases run in the

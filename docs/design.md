@@ -1,12 +1,12 @@
-# Odradek — Kafka client sidecar: design
+# Odradek: design
 
-Odradek moves the Kafka client out of the application process into a sidecar container in the same pod. The app talks to the sidecar over gRPC on a Unix domain socket and names only topics; which Kafka cluster a topic lives on, and how to connect to it, is the sidecar's configuration.
+Odradek moves the Kafka client out of the application process into a separate server process. This document covers the server deployed as a sidecar container in the application's pod; "the server" below always means that process. The app talks to the server over gRPC on a Unix domain socket and names only topics; which Kafka cluster a topic lives on, and how to connect to it, is the server's configuration.
 
-The design goal is that an app using the sidecar keeps the guarantees it would have with an in-process client. Where it cannot, the difference is named explicitly (section 10).
+The design goal is that an app using the server keeps the guarantees it would have with an in-process client. Where it cannot, the difference is named explicitly (section 10).
 
 Contracts:
 
-- App-facing API: [`api/odradek/kafka/v1/sidecar.proto`](../api/odradek/kafka/v1/sidecar.proto)
+- App-facing API: [`api/odradek/kafka/v1/odradek.proto`](../api/odradek/kafka/v1/odradek.proto)
 - Configuration schema: [`api/odradek/config/v1/config.proto`](../api/odradek/config/v1/config.proto)
 
 ## 1. Scope
@@ -15,9 +15,9 @@ In scope:
 
 - Produce with broker-ack semantics, per-stream ordering, deduplication of app resends, bounded buffering.
 - Consume with consumer groups, app-driven offset commits, rebalance propagation, hung-app detection.
-- Several Kafka clusters behind one sidecar, with topic routing owned by the configuration. A topic can be produced to more than one cluster.
+- Several Kafka clusters behind one server, with topic routing owned by the configuration. A topic can be produced to more than one cluster.
 - Configuration read from a mounted volume and applied without restart, including mTLS credential rotation.
-- One Java sidecar binary and a thin Java client library.
+- One Java server binary and a thin Java client library.
 
 Deferred:
 
@@ -36,7 +36,7 @@ flowchart LR
       code --> lib
     end
     sock(["/var/run/kafka/kafka.sock<br/>emptyDir, medium: Memory"])
-    subgraph sidecar["Sidecar container (native sidecar)"]
+    subgraph server["Server container (native sidecar)"]
       grpc["gRPC server<br/>Netty + epoll"]
       ps["ProduceSession<br/>routes by topic"]
       cs["ConsumeSession"]
@@ -48,8 +48,8 @@ flowchart LR
     end
     lib -- "gRPC over UDS" --> sock --> grpc
   end
-  cfg[("Config volume<br/>/etc/odradek")] -. "inotify" .-> sidecar
-  spire["SPIRE agent<br/>Workload API"] -. "X.509 SVID watch" .-> sidecar
+  cfg[("Config volume<br/>/etc/odradek")] -. "inotify" .-> server
+  spire["SPIRE agent<br/>Workload API"] -. "X.509 SVID watch" .-> server
   kubelet["kubelet"] -. "probes" .-> admin
   prod --> brokers[("Kafka clusters")]
   cons --> brokers
@@ -58,10 +58,10 @@ flowchart LR
 | Component | Responsibility |
 |---|---|
 | `//api` | The two proto contracts. The only thing another language needs. |
-| `//sidecar` | Owns all Kafka clients, topic routing, credentials and the settings the guarantees depend on. |
+| `//server` | Owns all Kafka clients, topic routing, credentials and the settings the guarantees depend on. |
 | `//client/java` | Hides streams, `seq`, credits and reconnects. Exposes `send() -> CompletableFuture` and a poll/handler consumer API. |
 
-### Sidecar internals
+### Server internals
 
 - **Transport**: grpc-java on unshaded Netty (`grpc-netty`, never `grpc-netty-shaded`) with the epoll native transport (`netty-transport-native-epoll`, `linux-x86_64` and `linux-aarch_64`). The server binds a Unix domain socket, mode `0660`, on an `emptyDir` shared by both containers. Peer UID/GID are checked with `SO_PEERCRED` against an allow-list.
 - **Admin endpoint**: a small HTTP server on a TCP port for `startupProbe` / `livenessProbe` and Prometheus metrics. Kubelet gRPC probes cannot target a Unix socket, so probes use HTTP.
@@ -71,12 +71,12 @@ flowchart LR
 
 ### Lifecycle
 
-- The sidecar is a native sidecar: an `initContainer` with `restartPolicy: Always`.
+- The server runs as a native sidecar: an `initContainer` with `restartPolicy: Always`.
 - **Startup**: the `startupProbe` passes once the configuration is valid, the first credentials are loaded, the socket is listening and broker metadata has been fetched for every required cluster. The app container starts after that.
 - **App readiness**: the client library reports ready only while it holds a session whose handshake has completed.
-- **Shutdown**: the sidecar receives SIGTERM after the app container exits. It stops accepting streams, completes in-flight produce results, `flush()`es, commits acked offsets, leaves its groups and exits. `terminationGracePeriodSeconds` must cover app drain plus `delivery.timeout.ms`.
-- **Sidecar restart with the app alive**: the app reconnects, sees a new `sidecar_epoch`, and fails every unacknowledged send with *outcome unknown*. Consumers get a fresh assignment; unacked records are redelivered.
-- **App restart with the sidecar alive**: produce sessions idle out; consume streams close, which triggers a commit of acked offsets and a group leave.
+- **Shutdown**: the server receives SIGTERM after the app container exits. It stops accepting streams, completes in-flight produce results, `flush()`es, commits acked offsets, leaves its groups and exits. `terminationGracePeriodSeconds` must cover app drain plus `delivery.timeout.ms`.
+- **Server restart with the app alive**: the app reconnects, sees a new `server_epoch`, and fails every unacknowledged send with *outcome unknown*. Consumers get a fresh assignment; unacked records are redelivered.
+- **App restart with the server alive**: produce sessions idle out; consume streams close, which triggers a commit of acked offsets and a group leave.
 
 ## 3. API
 
@@ -84,7 +84,7 @@ flowchart LR
 - Every service, RPC, message, field and enum value carries a leading comment, so the protos are the source for generated reference documentation.
 - `OdradekService` has two long-lived bidirectional streams:
 
-| RPC | App sends | Sidecar sends |
+| RPC | App sends | Server sends |
 |---|---|---|
 | `Produce` | `ProduceOpen`, then `ProduceRecord`s | `ProduceReady`, then one `ProduceResult` per record |
 | `Consume` | `Subscribe`, then `Credits`, `Ack`, `RevokeDone` | `Subscribed`, then `Assigned`, `Revoked`, `Lost`, `RecordBatch` |
@@ -96,7 +96,7 @@ flowchart LR
 
 ### Schema and validation
 
-- The schema is the protobuf message `odradek.config.v1.SidecarConfig`. There is no hand-written configuration model.
+- The schema is the protobuf message `odradek.config.v1.ServerConfig`. There is no hand-written configuration model.
 - The file is YAML (or JSON) in the protobuf JSON mapping: field names in lowerCamelCase, durations as `"30s"`, timestamps as RFC 3339. YAML is converted to JSON and parsed with the protobuf JSON parser in strict mode, so an unknown or misspelled field is an error rather than silently ignored.
 - Constraints are declared in the schema with [protovalidate](https://github.com/bufbuild/protovalidate) and evaluated by `protovalidate-java`:
   - Field rules: name patterns for clusters and topics, absolute paths, port range, positive durations, `spiffe://` prefixes, mandatory fields marked `required`.
@@ -155,7 +155,7 @@ consumers:                     # keyed by topic name
 
 ### Enforced Kafka settings
 
-The sidecar owns the settings the guarantees rest on. They may be omitted from `properties` (the sidecar sets them) but never set to a weaker value, and the app cannot change them over the API.
+The server owns the settings the guarantees rest on. They may be omitted from `properties` (the server sets them) but never set to a weaker value, and the app cannot change them over the API.
 
 | Setting | Rule |
 |---|---|
@@ -165,7 +165,7 @@ The sidecar owns the settings the guarantees rest on. They may be omitted from `
 | `enable.auto.commit` | `false` |
 | `auto.offset.reset` | Must not be set; the start position is per topic (see Consumers) |
 | `ssl.keystore.*`, `ssl.truststore.*`, `ssl.engine.factory.class` | Must not be set; TLS material belongs to the `tls` block |
-| `partition.assignment.strategy` | Set by the sidecar to cooperative-sticky (classic group protocol) |
+| `partition.assignment.strategy` | Set by the server to cooperative-sticky (classic group protocol) |
 
 ### Producers
 
@@ -180,7 +180,7 @@ The sidecar owns the settings the guarantees rest on. They may be omitted from `
 - The cluster reference is mandatory. A topic is consumed from exactly one cluster, even when it is produced to several.
 - A `Subscribe` for a topic without an entry fails the stream with `NOT_FOUND`.
 - One stream is one Kafka consumer, so all topics of a `Subscribe` must resolve to the same cluster and group; otherwise the stream fails with `FAILED_PRECONDITION`. The resolved cluster and group are returned in `Subscribed`.
-- **Start position**: for a partition where the group has no committed offset, the sidecar positions the consumer itself:
+- **Start position**: for a partition where the group has no committed offset, the server positions the consumer itself:
   - `startTimestamp`, if set: the first record at or after that instant.
   - otherwise `offsetReset`: `EARLIEST` (default, never skips) or `LATEST`.
 
@@ -193,20 +193,20 @@ A Produce stream is not bound to a cluster. Each record is routed by its topic t
 ### Session and deduplication
 
 - The app picks a `session_id` once per process and numbers records with a strictly increasing `seq`.
-- The sidecar generates a `sidecar_epoch` at start and returns it in `ProduceReady`.
-- Per `session_id` the sidecar keeps a table `seq -> {in-flight | result}`, with one entry per record covering all of its writes:
+- The server generates a `server_epoch` at start and returns it in `ProduceReady`.
+- Per `session_id` the server keeps a table `seq -> {in-flight | result}`, with one entry per record covering all of its writes:
   - A record whose `seq` is already in the table is not sent again; the stream is attached to the existing outcome.
   - Entries below the app's `low_watermark` are dropped. Because the window bounds unacknowledged records, the table is bounded too.
 - After a stream reconnect:
-  - Same `sidecar_epoch`: the library resends everything without a result, with the original `seq`. No duplicates are produced.
-  - Different `sidecar_epoch`: the table is gone. The library fails pending sends with `OUTCOME_UNKNOWN`. Whether to resend, accepting possible duplicates, is the app's call, as it is after a Kafka timeout in-process.
+  - Same `server_epoch`: the library resends everything without a result, with the original `seq`. No duplicates are produced.
+  - Different `server_epoch`: the table is gone. The library fails pending sends with `OUTCOME_UNKNOWN`. Whether to resend, accepting possible duplicates, is the app's call, as it is after a Kafka timeout in-process.
 
 ### Acknowledgement
 
-- A `ProduceResult` is built only from Kafka delivery callbacks. The sidecar never acknowledges on enqueue.
+- A `ProduceResult` is built only from Kafka delivery callbacks. The server never acknowledges on enqueue.
 - The result is a success once every cluster of the topic that is not `bestEffort` has acknowledged with `acks=all`.
 - `ProduceResult.writes` lists each cluster that acknowledged, with its own partition and offset.
-- A sidecar crash between broker ack and result delivery surfaces as *outcome unknown*, never as a false success.
+- A server crash between broker ack and result delivery surfaces as *outcome unknown*, never as a false success.
 
 ### Producing to several clusters
 
@@ -214,14 +214,14 @@ Listing more than one cluster for a topic is a first-class, possibly permanent a
 
 ```mermaid
 flowchart LR
-  app["App<br/>ProduceRecord{topic: orders.created}"] --> sc["Sidecar<br/>routes by topic"]
+  app["App<br/>ProduceRecord{topic: orders.created}"] --> sc["Server<br/>routes by topic"]
   sc --> a[("Cluster orders")]
   sc --> b[("Cluster analytics")]
   a -. "consumers.orders.created.cluster" .-> c["Consumer group"]
 ```
 
 - The record is handed to every listed cluster's producer from the same serialized callback, so each cluster receives a stream's records in the same order.
-- The sidecar stamps the record with one timestamp (its clock, unless the app set one) and uses it for every write. Timestamps are identical across clusters, which makes timestamp-based positioning of a consumer on another cluster possible.
+- The server stamps the record with one timestamp (its clock, unless the app set one) and uses it for every write. Timestamps are identical across clusters, which makes timestamp-based positioning of a consumer on another cluster possible.
 - A failure on a `bestEffort` cluster is only counted in metrics. That cluster may miss records.
 - If a required cluster fails after another acknowledged, the result is `OUTCOME_UNKNOWN` and `writes` shows where the record already is. An app resend duplicates it there. Multi-cluster produce is at-least-once on each cluster, never exactly-once across them.
 - **Prerequisite**: the topic exists on every listed cluster with the same partition count, so that keys map to the same partition number and an explicit `ProduceRecord.partition` is valid everywhere.
@@ -243,7 +243,7 @@ What it does not give:
 ### Backpressure
 
 - `ProduceReady` advertises `max_in_flight_records` and `max_in_flight_bytes`. The library blocks (or fails after a configurable `max.block` equivalent) when the window is full. Each result returns a slot.
-- The window is sized below the producers' `buffer.memory`, so `send()` in the sidecar does not block on buffer exhaustion. gRPC/HTTP-2 flow control is the backstop.
+- The window is sized below the producers' `buffer.memory`, so `send()` in the server does not block on buffer exhaustion. gRPC/HTTP-2 flow control is the backstop.
 - A record that exceeds the window is rejected with `PROTOCOL_VIOLATION`.
 - The window is per stream, not per cluster. Records waiting on a slow cluster occupy slots and can delay records for other topics on the same stream. An app that needs isolation between topics uses separate producers in the client library, which are separate streams.
 
@@ -251,23 +251,23 @@ What it does not give:
 
 ### Delivery and flow control
 
-- The app grants `Credits`. The sidecar delivers at most that many records and pauses all partitions when credits run out, while continuing to `poll()` to stay in the group.
+- The app grants `Credits`. The server delivers at most that many records and pauses all partitions when credits run out, while continuing to `poll()` to stay in the group.
 - Records are delivered as per-partition `RecordBatch`es tagged with the partition's `assignment_epoch`.
 
 ### Commit after processing
 
 - Auto-commit is off. The app sends `Ack` ranges per partition.
-- Per partition the sidecar tracks delivered and acked offsets and commits `highest contiguous acked offset + 1`: asynchronously on an interval, synchronously on revoke and on close.
+- Per partition the server tracks delivered and acked offsets and commits `highest contiguous acked offset + 1`: asynchronously on an interval, synchronously on revoke and on close.
 - Acks carrying a stale `assignment_epoch` are ignored.
 - Result: at-least-once, with redelivery limited to records that were delivered but not acked.
 
 ### Liveness
 
-In-process, `max.poll.interval.ms` evicts a consumer whose processing thread is stuck. Here the sidecar keeps polling regardless, so it enforces the equivalent itself:
+In-process, `max.poll.interval.ms` evicts a consumer whose processing thread is stuck. Here the server keeps polling regardless, so it enforces the equivalent itself:
 
 - If the oldest delivered-but-unacked record is older than `max_processing_ms`, the app is considered hung.
-- The sidecar commits what was acked, leaves the group, and closes the stream with `ABORTED`. The library surfaces this and fails app readiness.
-- `max.poll.interval.ms` on the real consumer is set above `max_processing_ms` plus the revoke deadline, so the sidecar's own rule always fires first.
+- The server commits what was acked, leaves the group, and closes the stream with `ABORTED`. The library surfaces this and fails app readiness.
+- `max.poll.interval.ms` on the real consumer is set above `max_processing_ms` plus the revoke deadline, so the server's own rule always fires first.
 
 ### Rebalance
 
@@ -296,7 +296,7 @@ With the cooperative-sticky assignor, `onPartitionsRevoked` runs on the poll thr
 
 ### Applying a change
 
-1. Parse the complete new configuration into `SidecarConfig`, validate it with protovalidate, then run the non-schema checks.
+1. Parse the complete new configuration into `ServerConfig`, validate it with protovalidate, then run the non-schema checks.
 2. If invalid: keep running on the last good configuration, log every violation, increment `config_reload_failures_total`. Liveness is not affected.
 3. If valid: diff against the running configuration and apply per the table below, then publish the new content hash and reload timestamp on the admin endpoint and as metrics.
 
@@ -304,7 +304,7 @@ At startup there is no last good configuration, so an invalid or missing one fai
 
 | What changed | How it is applied | Visible to the app |
 |---|---|---|
-| Sidecar tunables: processing deadlines, revoke deadline, commit interval, peer allow-list | In place | No |
+| Server tunables: processing deadlines, revoke deadline, commit interval, peer allow-list | In place | No |
 | Produce window sizes | New streams only (the window is advertised once per stream) | No |
 | mTLS key material and trust bundle | In-memory swap inside the running clients (section 8) | No |
 | A cluster's producer properties or SASL credentials | Producer swap | Latency blip only |
@@ -325,7 +325,7 @@ Kafka clients cannot change properties after construction, so a change means a n
 3. Create the new producer. If construction fails, resume on the old one and count a reload failure.
 4. Resume the streams on the new producer; close the old one.
 
-The session `seq` tables live above the producers, so `sidecar_epoch` does not change and no send becomes *outcome unknown*. The app sees backpressure through the window for the duration of the flush.
+The session `seq` tables live above the producers, so `server_epoch` does not change and no send becomes *outcome unknown*. The app sees backpressure through the window for the duration of the flush.
 
 ### Consumer rebuild
 
@@ -341,11 +341,11 @@ The session `seq` tables live above the producers, so `sidecar_epoch` does not c
 
 Certificates do not go through the producer swap or consumer rebuild. SPIRE SVIDs are short-lived (rotated around half of a default one-hour TTL), and a consumer rebuild on every rotation would mean a rebalance every half hour.
 
-The reference is [java-spiffe](https://github.com/spiffe/java-spiffe) and its `java-spiffe-helper`: the helper holds a Workload API watch and, on every X.509 context update, rewrites a keystore and truststore. The sidecar follows the same model — one long-lived watch, an update callback, atomic replacement of key material and bundle together — but replaces the material in memory instead of on disk.
+The reference is [java-spiffe](https://github.com/spiffe/java-spiffe) and its `java-spiffe-helper`: the helper holds a Workload API watch and, on every X.509 context update, rewrites a keystore and truststore. The server follows the same model — one long-lived watch, an update callback, atomic replacement of key material and bundle together — but replaces the material in memory instead of on disk.
 
 ### Mechanism
 
-- Kafka clients accept a custom TLS engine factory through `ssl.engine.factory.class` (KIP-519). The sidecar sets it to its own `ReloadingSslEngineFactory` on every client it creates.
+- Kafka clients accept a custom TLS engine factory through `ssl.engine.factory.class` (KIP-519). The server sets it to its own `ReloadingSslEngineFactory` on every client it creates.
 - The factory reads from a `CredentialSource` that always holds the current `{private key, certificate chain, trust bundle}` as one immutable snapshot.
 - Each new TLS handshake builds its engine from the current snapshot. Established connections are left alone; TLS does not re-validate a certificate on a live connection, and connections pick up the new SVID as they are naturally re-established.
 - The Kafka clients are never rebuilt for a rotation, so there is no flush, no rebalance, and nothing visible to the app.
@@ -370,8 +370,8 @@ Each cluster's `tls` block selects one source.
 
 ### Deployment
 
-- The SPIRE agent socket is mounted into the sidecar container only (CSI driver or hostPath). The app container never sees Kafka credentials.
-- At startup the sidecar blocks, bounded by the `startupProbe`, until the first SVID is received.
+- The SPIRE agent socket is mounted into the server container only (CSI driver or hostPath). The app container never sees Kafka credentials.
+- At startup the server blocks, bounded by the `startupProbe`, until the first SVID is received.
 
 ## 9. Moving a topic between clusters
 
@@ -379,7 +379,7 @@ A migration is a sequence of configuration changes on top of multi-cluster produ
 
 | Step | Config change | Wait for |
 |---|---|---|
-| 1. Add B | New `clusters` entry, `required: false` | Sidecars report the cluster healthy |
+| 1. Add B | New `clusters` entry, `required: false` | Servers report the cluster healthy |
 | 2. Warm up (optional) | Add B to the topic's `producers` entry with `bestEffort: true` | Produce error rate on B at zero |
 | 3. Produce to both | Remove `bestEffort` from B | Every pod of every producing app has applied it; note this instant as T0 |
 | 4. Move consumers | `consumers.<topic>.cluster` to B, `startTimestamp` set | The group's lag on B stable, and no member left on A |
@@ -394,16 +394,16 @@ A migration is a sequence of configuration changes on top of multi-cluster produ
 
 ## 10. Guarantee summary
 
-| In-process guarantee | With the sidecar |
+| In-process guarantee | With the server |
 |---|---|
 | `send()` success means broker-acked | Preserved. Results come only from delivery callbacks, from every required cluster of the topic. |
 | Per-partition ordering | Preserved per Produce stream, on every cluster the topic is produced to. |
-| No duplicates from client retries | Preserved while the sidecar stays up. A sidecar restart, or a partial multi-cluster write, yields *outcome unknown*; resending may duplicate. |
+| No duplicates from client retries | Preserved while the server stays up. A server restart, or a partial multi-cluster write, yields *outcome unknown*; resending may duplicate. |
 | Bounded producer memory | Preserved via the in-flight window, shared by all topics of a stream. |
 | Hung consumer is evicted | Preserved via `max_processing_ms`. |
 | Commit only processed offsets | Preserved; contiguous-ack rule. |
 | Rebalance callbacks | Preserved as `Revoked` / `RevokeDone` with a deadline. |
-| App chooses cluster, group and offset reset | Moved to the sidecar configuration by design. |
+| App chooses cluster, group and offset reset | Moved to the server configuration by design. |
 | Transactions / exactly-once | Not provided. |
 
 New, with no in-process equivalent: topics produced to several clusters. Their logs hold the same records but are not identical in order or offsets.
@@ -412,7 +412,7 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 
 - A transactional session is a dedicated Produce stream bound to its own `KafkaProducer` with a stable `transactional.id` per pod (StatefulSet ordinal or configured id) for zombie fencing.
 - `Begin`, `SendOffsets`, `Commit`, `Abort` travel in-band on that stream rather than as unary RPCs, so their order relative to produced records is unambiguous.
-- `SendOffsets` references a Consume stream in the same sidecar and on the same cluster; the sidecar supplies the consumer group metadata.
+- `SendOffsets` references a Consume stream in the same server and on the same cluster; the server supplies the consumer group metadata.
 - A transaction cannot span clusters. Topics produced to more than one cluster are rejected in a transaction.
 - A stream drop mid-transaction aborts it.
 
@@ -421,18 +421,18 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 | Level | What | How |
 |---|---|---|
 | Unit | Configuration rules (one test per rule id), session tables, contiguous-ack tracker, credit accounting, topic routing | Plain JUnit; Kafka's `MockProducer` / `MockConsumer` |
-| Component | Full gRPC stream behaviour over a real UDS against mock Kafka clients | In-process sidecar, real client library |
-| End to end | The sidecar binary and the Java client against real brokers: ordering, commit positions, rebalance with two sidecars | Kafka in KRaft mode (no ZooKeeper), provided by the environment: service containers in CI, containers started locally. Two brokers, so multi-cluster cases run in the same suite |
-| Fault | Kill the sidecar mid-produce and mid-revoke; hang the app; drop the stream; stop a broker | End-to-end harness; assert no false acks and no committed-but-unprocessed offsets |
+| Component | Full gRPC stream behaviour over a real UDS against mock Kafka clients | In-process server, real client library |
+| End to end | The server binary and the Java client against real brokers: ordering, commit positions, rebalance with two servers | Kafka in KRaft mode (no ZooKeeper), provided by the environment: service containers in CI, containers started locally. Two brokers, so multi-cluster cases run in the same suite |
+| Fault | Kill the server mid-produce and mid-revoke; hang the app; drop the stream; stop a broker | End-to-end harness; assert no false acks and no committed-but-unprocessed offsets |
 | Reload | ConfigMap-style `..data` symlink swap; invalid configuration keeps the last good one; producer swap under load keeps order and produces no duplicates; consumer rebuild commits before closing; credential rotation against a fake Workload API | Component and end-to-end harness |
 | Multi-cluster | Two brokers: a topic produced to both under load; one cluster failing as required and as best effort; a consumer moved with `startTimestamp` loses nothing; removing a cluster from a topic by reload | End-to-end harness |
-| Soak | Rolling restarts of app and sidecar under load in a cluster | With the deployment work |
+| Soak | Rolling restarts of app and server under load in a cluster | With the deployment work |
 
 ## 13. Open decisions
 
 - **Java package root**: `io.github.bpalermo.odradek` is a placeholder; change it before anything is published.
 - **Consumer group protocol**: classic with cooperative-sticky, or the KIP-848 protocol (`group.protocol=consumer`). The callback contract is the same, so the session code keeps the choice in configuration.
-- **SPIFFE integration shape**: the design embeds the Workload API watch in the sidecar. Running `java-spiffe-helper` as a separate container and using the `files` source is the alternative.
+- **SPIFFE integration shape**: the design embeds the Workload API watch in the server. Running `java-spiffe-helper` as a separate container and using the `files` source is the alternative.
 - **`java-spiffe-core` dependencies**: its gRPC transport must be unshaded and compatible with the pinned Netty before it is added.
 - **Broker principal mapping**: brokers need a principal builder that understands SPIFFE IDs; confirm one exists.
 - **Serialization**: the API carries bytes. Schema-registry integration, if wanted, belongs in the client library.

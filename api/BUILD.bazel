@@ -5,7 +5,7 @@ load("//bazel/proto:image.bzl", "proto_image")
 # The protos whose wire compatibility is guarded.
 _PROTOS = [
     "//api/odradek/config/v1:config_proto",
-    "//api/odradek/kafka/v1:sidecar_proto",
+    "//api/odradek/kafka/v1:odradek_proto",
 ]
 
 # The current protos as one self-contained image (what `buf build` would make).

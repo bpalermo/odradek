@@ -1,11 +1,11 @@
 edition = "2024";
 
-// The configuration schema of the Odradek sidecar.
+// The configuration schema of the Odradek server.
 //
-// The sidecar reads one file in this schema from a mounted volume, watches it
+// The server reads one file in this schema from a mounted volume, watches it
 // and applies changes without restarting. Constraints are declared with
 // protovalidate; a file that violates any of them is rejected as a whole and
-// the sidecar keeps its last valid configuration.
+// the server keeps its last valid configuration.
 package odradek.config.v1;
 
 import "buf/validate/validate.proto";
@@ -15,29 +15,29 @@ import "google/protobuf/timestamp.proto";
 option java_outer_classname = "ConfigProto";
 option java_package = "io.github.bpalermo.odradek.config.v1";
 
-// SidecarConfig is the root of the sidecar configuration file.
+// ServerConfig is the root of the server configuration file.
 //
 // The file is YAML or JSON in the protobuf JSON mapping (field names in
 // lowerCamelCase, durations as strings such as "30s"). It is parsed strictly:
 // an unknown field is an error. Unset fields mean "use the documented
 // default" unless stated otherwise.
-message SidecarConfig {
+message ServerConfig {
   option (buf.validate.message).cel = {
-    id: "sidecar_config.producer_clusters_exist"
+    id: "server_config.producer_clusters_exist"
     message: "every producer must reference entries in clusters"
     expression: "this.producers.all(topic, this.producers[topic].clusters.all(t, t.cluster in this.clusters))"
   };
   option (buf.validate.message).cel = {
-    id: "sidecar_config.consumer_cluster_exists"
+    id: "server_config.consumer_cluster_exists"
     message: "every consumer must reference an entry in clusters"
     expression: "this.consumers.all(topic, this.consumers[topic].cluster in this.clusters)"
   };
 
   // Where the app-facing gRPC server listens. Not hot-reloadable: a change
-  // takes effect at the next sidecar restart.
+  // takes effect at the next server restart.
   Listener listener = 1;
   // The health and metrics endpoint. Not hot-reloadable: a change takes
-  // effect at the next sidecar restart.
+  // effect at the next server restart.
   Admin admin = 2;
 
   reserved 3;
@@ -93,7 +93,7 @@ message Producer {
 
 // ProduceTarget is one cluster a topic is produced to.
 message ProduceTarget {
-  // Name of an entry in SidecarConfig.clusters. The topic must already exist
+  // Name of an entry in ServerConfig.clusters. The topic must already exist
   // there. Required.
   string cluster = 1 [
     (buf.validate.field).required = true,
@@ -108,9 +108,9 @@ message ProduceTarget {
 }
 
 // Consumer says where and as whom one topic is consumed. It is the value of
-// SidecarConfig.consumers, keyed by topic name.
+// ServerConfig.consumers, keyed by topic name.
 message Consumer {
-  // Name of an entry in SidecarConfig.clusters to read the topic from.
+  // Name of an entry in ServerConfig.clusters to read the topic from.
   // Required; there is no default cluster for consuming.
   string cluster = 1 [
     (buf.validate.field).required = true,
@@ -137,7 +137,7 @@ message Consumer {
 }
 
 // OffsetReset is the position used for a partition without a committed
-// offset. The sidecar applies it itself; the Kafka property
+// offset. The server applies it itself; the Kafka property
 // auto.offset.reset must not be set.
 enum OffsetReset {
   // Not set; behaves as OFFSET_RESET_EARLIEST.
@@ -183,7 +183,7 @@ message Cluster {
     expression: "'bootstrap.servers' in this.properties && this.properties['bootstrap.servers'] != ''"
   };
   // The settings below are what the delivery guarantees rest on. They may be
-  // omitted (the sidecar sets them) but never set to a weaker value.
+  // omitted (the server sets them) but never set to a weaker value.
   option (buf.validate.message).cel = {
     id: "cluster.acks_all"
     message: "acks must be all"
@@ -206,19 +206,19 @@ message Cluster {
   };
   // The starting position is set per topic in Consumer, not per cluster.
   option (buf.validate.message).cel = {
-    id: "cluster.offset_reset_owned_by_sidecar"
+    id: "cluster.offset_reset_owned_by_server"
     message: "auto.offset.reset must not be set; use consumers.<topic>.offset_reset"
     expression: "[this.properties, this.consumer_properties].all(m, !('auto.offset.reset' in m))"
   };
-  // TLS material is owned by the sidecar's engine factory, never by Kafka's
+  // TLS material is owned by the server's engine factory, never by Kafka's
   // keystore settings, so that rotation does not rebuild clients.
   option (buf.validate.message).cel = {
-    id: "cluster.tls_owned_by_sidecar"
+    id: "cluster.tls_owned_by_server"
     message: "ssl.engine.factory.class, ssl.keystore.* and ssl.truststore.* must not be set; use tls"
     expression: "[this.properties, this.producer_properties, this.consumer_properties].all(m, m.all(k, k != 'ssl.engine.factory.class' && !k.startsWith('ssl.keystore.') && !k.startsWith('ssl.truststore.')))"
   };
 
-  // Whether the sidecar must reach this cluster before it reports started.
+  // Whether the server must reach this cluster before it reports started.
   // Required clusters gate the startup probe; optional ones connect on first
   // use. Default: false.
   bool required = 1;
@@ -337,7 +337,7 @@ message Consume {
   // Upper bound for the processing deadline an app may request; larger
   // requests are clamped to it. Must be positive. Default: 30m.
   google.protobuf.Duration max_max_processing = 2 [(buf.validate.field).duration.gt = {}];
-  // How long the sidecar waits for RevokeDone after a Revoked event before it
+  // How long the server waits for RevokeDone after a Revoked event before it
   // commits and gives the partitions up anyway. Must be positive and well
   // under the group's rebalance timeout. Default: 10s.
   google.protobuf.Duration revoke_deadline = 3 [(buf.validate.field).duration.gt = {}];
