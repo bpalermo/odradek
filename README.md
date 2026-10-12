@@ -11,7 +11,7 @@ odradek moves the Kafka client out of the application. Its server is a Java proc
 | `client/java/` | Java client library for applications |
 | `extension/java/` | Interfaces for extension jars: `RecordTransform`, the byte-to-byte codec step (encryption and similar) |
 | `bazel/` | Shared build code: formatter, linters, JUnit 6 macro, gRPC codegen shims |
-| `docs/` | Design documents |
+| `docs/` | The design (`design.md`) and architecture decision records (`adr/`) |
 
 Java root package: `io.github.bpalermo.odradek`.
 
