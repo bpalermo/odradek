@@ -104,7 +104,7 @@ py_proto_gen = rule(
             providers = [ProtoInfo],
         ),
         "_grpc_protoc": attr.label(
-            default = "//client/python/tools:grpc_protoc",
+            default = "//bazel/python:grpc_protoc",
             executable = True,
             cfg = "exec",
         ),

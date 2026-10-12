@@ -21,7 +21,7 @@ declares
 
 Nothing generated is checked in. The Python and Clojure clients ship the
 generated code inside their own artifacts, so they place these outputs in
-their own source trees: //client/python with py_proto_package, //client/clojure
+their own source trees: //client/python with py_proto_package (//bazel/python:proto.bzl), //client/clojure
 with a copy for the one strip_prefix clj_maven_export takes.
 """
 
@@ -31,7 +31,7 @@ load("@protobuf//bazel:proto_library.bzl", "proto_library")
 load("@protoc_gen_clojure//clojure:defs.bzl", "clojure_proto_library")
 load("@rules_clj//clojure:defs.bzl", "clj_library")
 load("//bazel/lint:linters.bzl", "buf_test")
-load("//client/python:proto.bzl", "py_proto_gen")
+load("//bazel/python:proto.bzl", "py_proto_gen")
 
 # Every .proto of the API is imported by its path below this directory.
 _ROOT = "api"
