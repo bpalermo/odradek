@@ -10,6 +10,7 @@ import io.github.bpalermo.odradek.kafka.v1.Subscribe;
 import io.github.bpalermo.odradek.kafka.v1.Subscribed;
 import io.github.bpalermo.odradek.server.codec.CodecRegistry;
 import io.github.bpalermo.odradek.server.codec.RecordDecoder;
+import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.Status;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
@@ -49,6 +50,7 @@ public final class ConsumeService {
 
   private final ServerConfig config;
   private final CodecRegistry codecs;
+  private final TlsSources tls;
   private final Factory factory;
   private final String serverEpoch;
   private final LongSupplier nanoClock;
@@ -60,10 +62,12 @@ public final class ConsumeService {
   private final long commitIntervalMs;
   private volatile boolean shuttingDown;
 
-  public ConsumeService(ServerConfig config, CodecRegistry codecs, String serverEpoch) {
+  public ConsumeService(
+      ServerConfig config, CodecRegistry codecs, TlsSources tls, String serverEpoch) {
     this(
         config,
         codecs,
+        tls,
         serverEpoch,
         (cluster, properties) ->
             new KafkaConsumer<>(
@@ -77,8 +81,19 @@ public final class ConsumeService {
       String serverEpoch,
       Factory factory,
       LongSupplier nanoClock) {
+    this(config, codecs, TlsSources.none(), serverEpoch, factory, nanoClock);
+  }
+
+  ConsumeService(
+      ServerConfig config,
+      CodecRegistry codecs,
+      TlsSources tls,
+      String serverEpoch,
+      Factory factory,
+      LongSupplier nanoClock) {
     this.config = config;
     this.codecs = codecs;
+    this.tls = tls;
     this.serverEpoch = serverEpoch;
     this.factory = factory;
     this.nanoClock = nanoClock;
@@ -218,14 +233,6 @@ public final class ConsumeService {
       }
       String clusterName = first.getCluster();
       Cluster cluster = config.getClustersOrThrow(clusterName);
-      if (cluster.hasTls()) {
-        fail(
-            Status.FAILED_PRECONDITION.withDescription(
-                "clusters."
-                    + clusterName
-                    + ".tls is set, and mTLS to brokers is not implemented yet"));
-        return;
-      }
       long maxProcessingMs =
           Math.min(
               subscribe.getMaxProcessingMs() == 0
@@ -239,14 +246,14 @@ public final class ConsumeService {
         for (String topic : topics) {
           decoders.put(topic, codecs.newDecoder(topic));
         }
-        consumer =
-            factory.create(
-                clusterName,
-                properties(
-                    cluster,
-                    first.getGroupId(),
-                    streamCounter.incrementAndGet(),
-                    maxProcessingMs + revokeDeadlineMs + POLL_INTERVAL_MARGIN_MS));
+        Map<String, Object> properties =
+            properties(
+                cluster,
+                first.getGroupId(),
+                streamCounter.incrementAndGet(),
+                maxProcessingMs + revokeDeadlineMs + POLL_INTERVAL_MARGIN_MS);
+        tls.apply(clusterName, properties);
+        consumer = factory.create(clusterName, properties);
       } catch (RuntimeException e) {
         decoders.values().forEach(RecordDecoder::close);
         throw e;

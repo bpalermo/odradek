@@ -12,6 +12,7 @@ import io.github.bpalermo.odradek.server.consume.ConsumeService;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
+import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.ManagedChannel;
 import io.grpc.netty.NettyChannelBuilder;
 import io.netty.channel.EventLoopGroup;
@@ -58,6 +59,7 @@ final class ServerHarness {
 
   // In-process server.
   private CodecRegistry codecs;
+  private TlsSources tls;
   private ClusterProducers producers;
   private ConsumeService consume;
   private OdradekServer server;
@@ -95,10 +97,11 @@ final class ServerHarness {
     String executable = System.getenv("ODRADEK_E2E_SERVER");
     if (executable == null || executable.isBlank()) {
       codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
-      producers = ClusterProducers.create(config);
+      tls = TlsSources.create(config);
+      producers = ClusterProducers.create(config, tls);
       ProduceService produce =
           new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
-      consume = new ConsumeService(config, codecs, produce.serverEpoch());
+      consume = new ConsumeService(config, codecs, tls, produce.serverEpoch());
       server = OdradekServer.start(config, new OdradekService(produce, consume));
       return;
     }
@@ -137,6 +140,7 @@ final class ServerHarness {
       consume.shutdown(Duration.ofSeconds(15));
       server.close();
       producers.close(Duration.ofSeconds(5));
+      tls.close();
       codecs.close();
     }
   }
@@ -161,7 +165,8 @@ final class ServerHarness {
     }
   }
 
-  private static String bootstrap(String variable) {
+  /** A required environment variable of the suite. */
+  static String bootstrap(String variable) {
     String value = System.getenv(variable);
     if (value == null || value.isBlank()) {
       return fail("%s is not set; see e2e/BUILD.bazel", variable);
