@@ -248,7 +248,7 @@ The server owns the settings the guarantees rest on. They may be omitted from `p
 
 ### Dispatcher
 
-[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. **Only the schema and the `odradek.delivery.v1` protocol exist so far.** The fields below load and are validated, and the server then refuses to start (exit status 2) if the configuration has a `dispatch` section or a consumer whose `source` is the dispatcher. The ADR describes the behaviour they will have.
+[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. **Only the schema, the `odradek.delivery.v1` protocol and the dispatch core (the decisions, wired to nothing) exist so far.** The fields below load and are validated, and the server then refuses to start (exit status 2) if the configuration has a `dispatch` section or a consumer whose `source` is the dispatcher. The ADR describes the behaviour they will have.
 
 A server that acts as a dispatcher has a `dispatch` section:
 
@@ -304,6 +304,18 @@ consumers:
     onExhausted: ON_EXHAUSTED_DEAD_LETTER
     deadLetterTopic: billing.dlq.orders
 ```
+
+#### Dispatch core
+
+`DispatchCore` (`server/dispatch`) is the dispatcher's decision logic with no I/O, in the manner of the client core: events in (partitions assigned, revoked or lost; records fetched; receivers joining, leaving and granting credit; acknowledgements, rejections; dead letters written or failed; time passing), actions out (deliver, commit, dead-letter, pause and resume fetching, tell a receiver to drop a partition's records, partition released, partition blocked or unblocked). One instance covers one topic of one consumer group on one replica. Nothing calls it yet. It settles what the ADR left open:
+
+- **Commit position.** The offset of a partition's oldest unacknowledged record, or one past the last fetched record when there is none; offsets that hold no record are not waited for. `Commit` is emitted each time an acknowledgement moves it, and how often to commit is the caller's business.
+- **Window.** A record is delivered for the first time only while its offset is less than the window above the commit position. The oldest unacknowledged record is therefore always deliverable.
+- **Fetching** of a partition pauses when its never-delivered records reach a bound, in records or bytes, and resumes at half.
+- **Redelivery.** After a rejection or a missed deadline the record goes to a different receiver if one has credit at that moment, and back to the same one otherwise. Within a partition the lowest offset is sent first, and under `key` and `partition` ordering a record waiting to be redelivered holds back what it constrains.
+- **Late acknowledgement.** A receiver whose record passed its deadline still holds it, and its acknowledgement counts for as long as the record is unacknowledged, even if another receiver has been sent it since: the record was processed. The second copy is a duplicate, and its acknowledgement is ignored.
+- **Blocked partition.** An exhausted record with `ON_EXHAUSTED_BLOCK` is not delivered again, the commit position stays at it, and nothing after it in its partition is sent, for the first time or again. Records before it are still delivered and committed. It stays blocked until the partition is revoked or lost, which also resets the attempt counts, or until a receiver that held the record past its deadline acknowledges it.
+- **Hand-over.** A revoked partition stops sending at once and is released when nothing of it is in flight or being dead-lettered, or after a bounded wait; receivers still holding its records are then told to drop them. A lost partition is dropped without a commit.
 
 ## 5. Produce path
 

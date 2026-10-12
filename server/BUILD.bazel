@@ -232,6 +232,8 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.config.ConfigLoaderTest",
         "io.github.bpalermo.odradek.server.consume.ConsumeServiceTest",
         "io.github.bpalermo.odradek.server.consume.PartitionStateTest",
+        "io.github.bpalermo.odradek.server.dispatch.DispatchCoreRandomTest",
+        "io.github.bpalermo.odradek.server.dispatch.DispatchCoreTest",
         "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
         "io.github.bpalermo.odradek.server.telemetry.KafkaClientMetricsTest",
