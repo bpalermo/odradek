@@ -2,7 +2,7 @@
 
 Odradek moves the Kafka client out of the application process into a separate server process. This document covers the server deployed as a sidecar container in the application's pod; "the server" below always means that process. The app talks to the server over gRPC on a Unix domain socket and names only topics; which Kafka cluster a topic lives on, and how to connect to it, is the server's configuration.
 
-The design goal is that an app using the server keeps the guarantees it would have with an in-process client. Where it cannot, the difference is named explicitly (section 10).
+The design goal is that an app using the server keeps the guarantees it would have with an in-process client. Where it cannot, the difference is named explicitly (section 11).
 
 Contracts:
 
@@ -16,12 +16,13 @@ In scope:
 - Produce with broker-ack semantics, per-stream ordering, deduplication of app resends, bounded buffering.
 - Consume with consumer groups, app-driven offset commits, rebalance propagation, hung-app detection.
 - Several Kafka clusters behind one server, with topic routing owned by the configuration. A topic can be produced to more than one cluster.
+- Per-topic record codecs: the format stored in Kafka and transforms such as encryption are server configuration and extension classes, unknown to the app (section 7).
 - Configuration read from a mounted volume and applied without restart, including mTLS credential rotation.
 - One Java server binary and a thin Java client library.
 
 Deferred:
 
-- Transactions / exactly-once (section 11).
+- Transactions / exactly-once (section 12).
 - Client libraries for other languages.
 - Shared-memory transport. Broker acknowledgements dominate latency; revisit only if profiles show IPC cost.
 
@@ -91,6 +92,7 @@ flowchart LR
 
 - The first message on each stream is the handshake, answered before anything else.
 - Neither handshake names a cluster. `ProduceRecord` carries a topic; `Subscribe` carries a list of topics.
+- Keys and values are bytes on the API. For a topic with a codec they are a protobuf message of the topic's contract type, independent of what is stored in Kafka (section 7).
 
 ## 4. Configuration
 
@@ -210,7 +212,7 @@ A Produce stream is not bound to a cluster. Each record is routed by its topic t
 
 ### Producing to several clusters
 
-Listing more than one cluster for a topic is a first-class, possibly permanent arrangement (two regions, an analytics copy, a standby). It is also the mechanism for moving a topic between clusters (section 9).
+Listing more than one cluster for a topic is a first-class, possibly permanent arrangement (two regions, an analytics copy, a standby). It is also the mechanism for moving a topic between clusters (section 10).
 
 ```mermaid
 flowchart LR
@@ -283,7 +285,115 @@ With the cooperative-sticky assignor, `onPartitionsRevoked` runs on the poll thr
 - `onPartitionsLost` sends `Lost`; nothing is committed.
 - `onPartitionsAssigned` sends `Assigned` with a new `assignment_epoch` per partition.
 
-## 7. Hot reload
+## 7. Record codecs: serialization and encryption
+
+A codec is the per-topic pipeline between the bytes the app exchanges with the server and the bytes stored in Kafka. It is the server's extension point: wire formats and transforms such as encryption are classes named in the configuration, loaded the way the Kafka Java client loads `value.serializer`.
+
+This section is design only; the `codecs` schema and the decode-error marker are not in the protos yet.
+
+### What the app sees
+
+- The app's contract for a topic is a protobuf message type, never a Kafka wire format. `ProduceRecord.value` and `ConsumedRecord.value` carry that message in protobuf encoding. The Java client library exposes it as typed messages.
+- The format stored in Kafka (protobuf with or without schema-registry framing, Avro, JSON), and whether it is encrypted, is the topic's codec. Changing it is a configuration change; the app is not rebuilt and cannot tell.
+- A topic without a codec passes bytes through unchanged, as today. The app then owns the format.
+
+### Pipeline
+
+```mermaid
+flowchart LR
+  subgraph produce["Produce"]
+    direction LR
+    a1["App bytes<br/>protobuf message"] --> p1["Parse<br/>contract type"] --> s1["Serializer<br/>wire format"] --> t1["Transforms<br/>in order"] --> k1[("Kafka")]
+  end
+  subgraph consume["Consume"]
+    direction LR
+    k2[("Kafka")] --> t2["Transforms<br/>reverse order"] --> s2["Deserializer"] --> p2["Encode<br/>contract type"] --> a2["App bytes"]
+  end
+```
+
+- Keys and values have separate pipelines. Each has one serializer/deserializer pair and zero or more transforms.
+- The Kafka clients themselves are always configured with the byte-array serializers; the pipeline runs in the server, before `send()` and after `poll()`.
+
+### Extension interfaces
+
+| Stage | Interface | Notes |
+|---|---|---|
+| Wire format | Kafka's own `org.apache.kafka.common.serialization.Serializer<T>` and `Deserializer<T>` | `T` is `com.google.protobuf.Message` when the codec declares a contract type, `byte[]` when it does not. Serializers written for the Java client against those types are usable as they are |
+| Transform | `RecordTransform`, published by Odradek in a small API artifact | Bytes to bytes, one class for both directions so encrypt and decrypt cannot be configured apart |
+
+```java
+public interface RecordTransform extends Closeable {
+  void configure(Map<String, ?> configs, boolean isKey);
+  byte[] apply(String topic, Headers headers, byte[] data);    // produce
+  byte[] reverse(String topic, Headers headers, byte[] data);  // consume
+}
+```
+
+- The lifecycle matches the Java client: instantiate by class name, `configure` once with the codec's `properties`, call per record with topic and headers, `close` on teardown.
+- A transform may add headers on produce (key id, algorithm) and is responsible for removing them on consume if the app should not see them.
+- A serializer instance is shared by all Produce streams, so it must be thread-safe, as it must be under a shared `KafkaProducer`. Deserializers and the reverse side of transforms get one instance per Consume stream.
+- Pipeline code runs on the stream's serialized callback and on the consumer poll thread. It must not block per record: key material and schemas are fetched in `configure` or cached.
+- Extension jars are read from one directory at startup, into a class loader below the server's. Adding or replacing a jar needs a restart; the image is extended or the directory is mounted.
+- Extensions run inside the server process, next to the Kafka credentials. Only trusted code belongs there.
+
+### Configuration
+
+Codecs are named, like clusters, and referenced from `producers` and `consumers` entries. A reference to a missing codec, or a class that cannot be loaded, rejects the configuration.
+
+```yaml
+codecs:
+  orders:
+    value:
+      messageType: acme.orders.v1.OrderCreated        # the app's contract
+      descriptorSet: /etc/odradek/schemas/orders.binpb # FileDescriptorSet
+      serializer: com.example.serde.AvroFromProtoSerializer
+      deserializer: com.example.serde.AvroToProtoDeserializer
+      properties:
+        schema.registry.url: https://registry.example:8081
+      transforms:
+        - class: com.example.crypto.AesGcmTransform
+          properties:
+            key.uri: kms://orders
+    # key: omitted, so keys pass through as bytes
+
+producers:
+  orders.created:
+    codec: orders
+    clusters:
+      - cluster: orders
+      - cluster: analytics
+
+consumers:
+  orders.created:
+    codec: orders
+    cluster: orders
+    groupId: billing
+```
+
+### Effect on the produce path
+
+- The pipeline runs once per record, before routing. Every cluster the topic is produced to receives the same bytes.
+- It runs on the stream's serialized callback, in arrival order, so ordering is unchanged.
+- The partitioner hashes the key as stored. A transform on the key must be deterministic, or records of one key spread over partitions and compaction stops working. The server cannot check this.
+- A payload that does not parse as the contract type, or a serializer or transform that throws, fails that record with `INVALID_RECORD`. Nothing was sent to any cluster, and the stream stays open.
+- The in-flight window counts the bytes the app sent. The stored size can differ; a record that grows past the broker limit fails with `INVALID_RECORD`.
+
+### Effect on the consume path
+
+A record that cannot be reversed or deserialized cannot be delivered as the contract type, and skipping it would be silent loss. The consumer entry chooses:
+
+| `onDecodeError` | Behaviour |
+|---|---|
+| `FAIL` (default) | The stream ends with `DATA_LOSS`. The offset is not committed, so the record is met again after resubscribing, until the codec or the record's source is fixed. This matches the Java client, whose `poll()` keeps throwing at that offset |
+| `DELIVER_UNDECODED` | The record is delivered with the stored bytes and a decode-error marker. The app acks it like any other record and decides what to do with it, for example dead-lettering |
+
+### Changing a codec
+
+- A change to a codec's `properties`, classes or transforms is applied by hot reload (section 8): produce pipelines are replaced at a record boundary, consume pipelines between batches. No producer is recreated and no rebalance happens.
+- Changing what is stored in a topic that already holds records is a compatibility problem the codec has to solve, not the server: the deserializer must read both the old and the new form until the old records have expired. Self-describing forms (schema-registry framing, a header naming the encryption key) make that possible.
+- Key rotation is the transform's concern for the same reason: write with the new key, keep reading with the old ones.
+
+## 8. Hot reload
 
 ### Source and watching
 
@@ -306,13 +416,14 @@ At startup there is no last good configuration, so an invalid or missing one fai
 |---|---|---|
 | Server tunables: processing deadlines, revoke deadline, commit interval, peer allow-list | In place | No |
 | Produce window sizes | New streams only (the window is advertised once per stream) | No |
-| mTLS key material and trust bundle | In-memory swap inside the running clients (section 8) | No |
+| mTLS key material and trust bundle | In-memory swap inside the running clients (section 9) | No |
 | A cluster's producer properties or SASL credentials | Producer swap | Latency blip only |
 | A topic's `producers` entry: cluster added or removed, `bestEffort` changed | At a flush boundary of the produce streams; producers of unchanged clusters are kept | Latency blip only |
 | A topic's `producers` entry added or removed | For the next record of that topic; in-flight records complete first | New records for a removed topic fail with `TOPIC_NOT_CONFIGURED` |
 | A cluster's consumer properties or SASL credentials; a topic's consumer `cluster` or `groupId` | Consumer rebuild for the streams reading it. If a stream's topics no longer share one cluster and group, it is closed with `FAILED_PRECONDITION` after the revoke handshake | `Revoked` then `Assigned`, or stream ends |
 | A topic's `consumers` entry removed | Revoke handshake, commit, then the streams reading it close with `NOT_FOUND` | Stream ends |
 | A topic's `startTimestamp` or `offsetReset` | Stored; used only the next time a partition has no committed offset | No |
+| A codec's classes, properties or transforms; a topic's `codec` reference | Pipeline replaced at a record boundary (produce) or between batches (consume) | No |
 | A cluster added | Available immediately | No |
 | Socket path, admin port | Not reloadable; logged and flagged in `config_restart_required` | No, until restart |
 
@@ -337,7 +448,7 @@ The session `seq` tables live above the producers, so `server_epoch` does not ch
 - A fleet-wide ConfigMap change reaches every pod within about a kubelet sync period, so rebuilds start after a random jitter to avoid a rebalance storm.
 - With static membership (`group.instance.id`) and a rejoin inside the session timeout, the rebuild causes no group rebalance.
 
-## 8. mTLS credential rotation
+## 9. mTLS credential rotation
 
 Certificates do not go through the producer swap or consumer rebuild. SPIRE SVIDs are short-lived (rotated around half of a default one-hour TTL), and a consumer rebuild on every rotation would mean a rebalance every half hour.
 
@@ -373,7 +484,7 @@ Each cluster's `tls` block selects one source.
 - The SPIRE agent socket is mounted into the server container only (CSI driver or hostPath). The app container never sees Kafka credentials.
 - At startup the server blocks, bounded by the `startupProbe`, until the first SVID is received.
 
-## 9. Moving a topic between clusters
+## 10. Moving a topic between clusters
 
 A migration is a sequence of configuration changes on top of multi-cluster produce. Apps are neither changed nor restarted. Any step can be the last: stopping after step 3 simply leaves the topic produced to both clusters.
 
@@ -392,7 +503,7 @@ A migration is a sequence of configuration changes on top of multi-cluster produ
 - **Step 4 overlap**: the change reaches pods over about a minute, so for a while some members read A and others read B. Records are processed twice in that window, never skipped. Consumers must be idempotent, as with any at-least-once consumer.
 - **Rollback**: while the topic is still produced to both, moving consumers back is step 4 in reverse, since A has every record. After step 5, A no longer receives writes.
 
-## 10. Guarantee summary
+## 11. Guarantee summary
 
 | In-process guarantee | With the server |
 |---|---|
@@ -404,11 +515,13 @@ A migration is a sequence of configuration changes on top of multi-cluster produ
 | Commit only processed offsets | Preserved; contiguous-ack rule. |
 | Rebalance callbacks | Preserved as `Revoked` / `RevokeDone` with a deadline. |
 | App chooses cluster, group and offset reset | Moved to the server configuration by design. |
+| App chooses serializers, and with them the stored format | Moved to the server configuration by design. The app's contract is a protobuf message type per topic. |
+| A record that cannot be deserialized blocks its partition | Preserved by default; delivering it undecoded is an option per consumer. |
 | Transactions / exactly-once | Not provided. |
 
 New, with no in-process equivalent: topics produced to several clusters. Their logs hold the same records but are not identical in order or offsets.
 
-## 11. Transactions (deferred)
+## 12. Transactions (deferred)
 
 - A transactional session is a dedicated Produce stream bound to its own `KafkaProducer` with a stable `transactional.id` per pod (StatefulSet ordinal or configured id) for zombie fencing.
 - `Begin`, `SendOffsets`, `Commit`, `Abort` travel in-band on that stream rather than as unary RPCs, so their order relative to produced records is unambiguous.
@@ -416,7 +529,7 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 - A transaction cannot span clusters. Topics produced to more than one cluster are rejected in a transaction.
 - A stream drop mid-transaction aborts it.
 
-## 12. Testing strategy
+## 13. Testing strategy
 
 | Level | What | How |
 |---|---|---|
@@ -428,11 +541,14 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 | Multi-cluster | Two brokers: a topic produced to both under load; one cluster failing as required and as best effort; a consumer moved with `startTimestamp` loses nothing; removing a cluster from a topic by reload | End-to-end harness |
 | Soak | Rolling restarts of app and server under load in a cluster | With the deployment work |
 
-## 13. Open decisions
+## 14. Open decisions
 
 - **Java package root**: `io.github.bpalermo.odradek` is a placeholder; change it before anything is published.
 - **Consumer group protocol**: classic with cooperative-sticky, or the KIP-848 protocol (`group.protocol=consumer`). The callback contract is the same, so the session code keeps the choice in configuration.
 - **SPIFFE integration shape**: the design embeds the Workload API watch in the server. Running `java-spiffe-helper` as a separate container and using the `files` source is the alternative.
 - **`java-spiffe-core` dependencies**: its gRPC transport must be unshaded and compatible with the pinned Netty before it is added.
 - **Broker principal mapping**: brokers need a principal builder that understands SPIFFE IDs; confirm one exists.
-- **Serialization**: the API carries bytes. Schema-registry integration, if wanted, belongs in the client library.
+- **Protobuf to Avro and JSON mapping**: storing a protobuf contract as Avro needs a defined mapping between the two schemas. Whether Odradek ships one or leaves it to the serializer class is open.
+- **Third-party serializers**: existing schema-registry serializers for protobuf are expected to plug in unchanged; this is not verified, and their licences need checking before any is bundled.
+- **Contract descriptors**: the design reads a `FileDescriptorSet` from the config volume. Fetching descriptors from a schema registry is the alternative.
+- **Key management for encryption**: left entirely to the transform class. Whether Odradek ships a reference transform is open.
