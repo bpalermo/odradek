@@ -17,6 +17,7 @@ A scenario creates one core from its `setup`, then applies its `steps` in order.
 | Implementation | Command |
 |---|---|
 | Java core (`//client/core`) | `bazel test //client/core:conformance_test` |
+| Python core (`//client/python`, `odradek.core`) | `bazel test //client/python:conformance_test` |
 
 ## Changing the protocol
 

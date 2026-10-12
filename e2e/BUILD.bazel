@@ -1,4 +1,5 @@
 load("@rules_clj//clojure:defs.bzl", "clj_library", "clj_test")
+load("@rules_java//java:defs.bzl", "java_binary")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
 load("//bazel/java:junit.bzl", "java_junit_test")
 
@@ -132,4 +133,15 @@ clj_test(
     ns = "odradek.e2e.client-e2e-test",
     tags = _TAGS,
     deps = [":clojure_client_e2e_test_lib"],
+)
+
+# Creates and deletes topics for the suites of the other clients (//e2e/python),
+# which run it as a process instead of carrying a Kafka client of their own.
+java_binary(
+    name = "topics",
+    srcs = ["src/main/java/io/github/bpalermo/odradek/e2e/Topics.java"],
+    javacopts = JAVACOPTS,
+    main_class = "io.github.bpalermo.odradek.e2e.Topics",
+    visibility = ["//e2e:__subpackages__"],
+    deps = ["@maven//:org_apache_kafka_kafka_clients"],
 )

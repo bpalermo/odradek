@@ -77,6 +77,26 @@ clj_deps.install(
 )
 use_repo(clj_deps, "clj_deps", "clj_lock_deps")
 
+# --- Python (client/python, ADR 3) ------------------------------------------------
+# The interpreter is downloaded by rules_python (never the host's), and every
+# PyPI package is pinned with hashes in //client/python:requirements_lock.txt.
+# Re-lock after editing requirements.in: see the README.
+bazel_dep(name = "rules_python", version = "2.4.2")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.13",
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "odradek_pypi",
+    python_version = "3.13",
+    requirements_lock = "//client/python:requirements_lock.txt",
+)
+use_repo(pip, "odradek_pypi")
+
 # Java proto codegen skips buf/validate/validate.proto; protovalidate-java supplies it.
 register_toolchains("//bazel/java:proto_toolchain_toolchain")
 

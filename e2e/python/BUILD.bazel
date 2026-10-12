@@ -1,0 +1,26 @@
+load("@rules_python//python:py_test.bzl", "py_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# The Python client end to end: the same cases as ClientE2eTest.java, against
+# the packaged server started as a process and two real clusters. Selected and
+# run like the Java suites; see //e2e:BUILD.bazel.
+py_test(
+    name = "client_e2e_test",
+    size = "large",
+    srcs = ["client_e2e_test.py"],
+    data = [
+        "//e2e:topics",
+        "//server",
+    ],
+    env = {
+        "ODRADEK_E2E_SERVER": "$(rootpath //server)",
+        "ODRADEK_E2E_TOPICS": "$(rootpath //e2e:topics)",
+    },
+    tags = [
+        "e2e",
+        "external",
+        "requires-network",
+    ],
+    deps = ["//client/python:odradek"],
+)

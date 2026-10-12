@@ -17,6 +17,11 @@ build --java_runtime_version=remotejdk_25
 build --tool_java_language_version=25
 build --tool_java_runtime_version=remotejdk_25
 
+# --- Python toolchain: hermetic CPython, pinned in MODULE.bazel ------------------
+# No __init__.py is invented in runfiles: what is importable under Bazel is what
+# the wheel contains.
+build --incompatible_default_to_explicit_init_py
+
 # Error Prone runs inside every javac action (it ships with Bazel's java_tools).
 # Strict warnings (-Xlint:all -Werror) are NOT set globally: gRPC is built from
 # source here and would fail them. First-party targets opt in with JAVACOPTS from
@@ -49,7 +54,7 @@ common --lockfile_mode=update
 common:ci --lockfile_mode=error
 
 # Lint (usage: bazel build --config=lint //...). Findings are warnings.
-build:lint --aspects=//bazel/lint:linters.bzl%buf
+build:lint --aspects=//bazel/lint:linters.bzl%buf,//bazel/lint:linters.bzl%ruff
 # "+" adds the lint reports to the default outputs. Replacing them would leave
 # `bazel run` under this config with nothing to execute.
 build:lint --output_groups=+rules_lint_report
