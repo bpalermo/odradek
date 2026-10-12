@@ -2,6 +2,9 @@ package io.github.bpalermo.odradek.server;
 
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.kafka.v1.OdradekServiceGrpc;
+import io.github.bpalermo.odradek.server.admin.AdminServer;
+import io.github.bpalermo.odradek.server.admin.HealthService;
+import io.github.bpalermo.odradek.server.admin.Readiness;
 import io.github.bpalermo.odradek.server.codec.CodecConfigException;
 import io.github.bpalermo.odradek.server.codec.CodecRegistry;
 import io.github.bpalermo.odradek.server.codec.ContractRegistry;
@@ -16,6 +19,7 @@ import io.github.bpalermo.odradek.server.tls.CredentialException;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -84,13 +88,31 @@ public final class Main {
       return;
     }
 
+    // Up before anything that can take time, so a probe sees "starting" rather than nothing.
+    Readiness readiness = new Readiness();
+    HealthService health = new HealthService(readiness, Clock.systemUTC());
+    AdminServer admin;
+    try {
+      admin =
+          AdminServer.start(
+              config.getAdmin().hasPort() ? config.getAdmin().getPort() : AdminServer.DEFAULT_PORT,
+              health);
+    } catch (IOException e) {
+      LOG.error("could not start the health service: {}", e.toString());
+      codecs.close();
+      System.exit(1);
+      return;
+    }
+
     TlsSources tls;
     try {
+      // With a SPIFFE source this waits for the first SVID.
+      readiness.starting("loading TLS credentials");
       tls = TlsSources.create(config);
     } catch (CredentialException e) {
-      LOG.error("configuration {} rejected: {}", file, e.getMessage());
+      LOG.error("TLS credentials unavailable: {}", e.getMessage());
       codecs.close();
-      System.exit(2);
+      System.exit(1);
       return;
     }
 
@@ -111,7 +133,7 @@ public final class Main {
 
     OdradekServer server;
     try {
-      server = OdradekServer.start(config, new OdradekService(produce, consume));
+      server = OdradekServer.start(config, new OdradekService(produce, consume), health);
     } catch (IOException e) {
       LOG.error("could not start", e);
       producers.close(Duration.ZERO);
@@ -120,6 +142,7 @@ public final class Main {
       System.exit(1);
       return;
     }
+    readiness.started(tls);
     LOG.info("server epoch {}", produce.serverEpoch());
     Runtime.getRuntime()
         .addShutdownHook(
@@ -128,6 +151,7 @@ public final class Main {
                   // No new streams; then every record already accepted gets its broker answer,
                   // and with it its result, before the open streams are closed.
                   // Consumers commit what was acked and leave their groups.
+                  readiness.stopping();
                   server.stopAccepting();
                   producers.flush();
                   consume.shutdown(Duration.ofSeconds(15));
@@ -135,6 +159,7 @@ public final class Main {
                   producers.close();
                   tls.close();
                   codecs.close();
+                  admin.close();
                 },
                 "shutdown"));
     server.awaitTermination();

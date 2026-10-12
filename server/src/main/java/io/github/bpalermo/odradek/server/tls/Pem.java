@@ -13,7 +13,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 
-/** Reads PEM certificates and PKCS#8 private keys. */
+/** Reads certificates and PKCS#8 private keys, PEM or DER. */
 final class Pem {
   private static final String KEY_BEGIN = "-----BEGIN PRIVATE KEY-----";
   private static final String KEY_END = "-----END PRIVATE KEY-----";
@@ -52,6 +52,26 @@ final class Pem {
     } catch (IllegalArgumentException e) {
       throw new CredentialException(what + " is not valid base64", e);
     }
+    return privateKeyDer(der, what);
+  }
+
+  /** Returns the certificates of a buffer of DER certificates placed end to end, in order. */
+  static List<X509Certificate> certificatesDer(byte[] der, String what) throws CredentialException {
+    List<X509Certificate> certificates = new ArrayList<>();
+    ByteArrayInputStream in = new ByteArrayInputStream(der);
+    try {
+      CertificateFactory factory = CertificateFactory.getInstance("X.509");
+      while (in.available() > 0) {
+        certificates.add((X509Certificate) factory.generateCertificate(in));
+      }
+    } catch (CertificateException e) {
+      throw new CredentialException(what + " is not a list of DER certificates", e);
+    }
+    return certificates;
+  }
+
+  /** Returns the unencrypted PKCS#8 private key in DER. */
+  static PrivateKey privateKeyDer(byte[] der, String what) throws CredentialException {
     PKCS8EncodedKeySpec spec = new PKCS8EncodedKeySpec(der);
     for (String algorithm : KEY_ALGORITHMS) {
       try {

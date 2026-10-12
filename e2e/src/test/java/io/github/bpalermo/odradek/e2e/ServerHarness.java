@@ -72,7 +72,8 @@ final class ServerHarness {
     Object[] all = new Object[arguments.length + 1];
     all[0] = dir;
     System.arraycopy(arguments, 0, all, 1, arguments.length);
-    yaml = yamlTemplate.formatted(all);
+    // A free admin port: several suites start a server on one machine at the same time.
+    yaml = "admin: {port: 0}\n" + yamlTemplate.formatted(all);
     config = ConfigLoader.parse(yaml);
     startServer();
     group = new MultiThreadIoEventLoopGroup(1, EpollIoHandler.newFactory());

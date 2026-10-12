@@ -13,7 +13,10 @@ package(default_visibility = ["//visibility:private"])
 # later release will refuse.
 JVM_FLAGS = ["--enable-native-access=ALL-UNNAMED"]
 
-_TEST_PKI = "src/test/java/io/github/bpalermo/odradek/server/tls/TestPki.java"
+_TEST_PKI = [
+    "src/test/java/io/github/bpalermo/odradek/server/tls/FakeWorkloadApi.java",
+    "src/test/java/io/github/bpalermo/odradek/server/tls/TestPki.java",
+]
 
 java_library(
     name = "server_lib",
@@ -167,14 +170,24 @@ executable_image(
     tag_flag = ":image_tag",
 )
 
-# A throwaway certificate authority, for the TLS tests here and the mTLS broker
-# of the end-to-end suite (//e2e:pki).
+# A throwaway certificate authority and a stand-in SPIRE agent, for the TLS tests
+# here and for the end-to-end suite (//e2e:pki makes the mTLS broker's
+# certificates).
 java_library(
     name = "test_pki",
     testonly = True,
-    srcs = [_TEST_PKI],
+    srcs = _TEST_PKI,
     javacopts = JAVACOPTS,
     visibility = ["//e2e:__pkg__"],
+    deps = [
+        ":server_lib",
+        "@grpc-java//api",
+        "@grpc-java//netty",
+        "@maven//:io_netty_netty_transport",
+        "@maven//:io_netty_netty_transport_classes_epoll",
+        "@maven//:io_netty_netty_transport_native_unix_common",
+        "@protobuf//java/core",
+    ],
 )
 
 java_junit_test(
@@ -182,7 +195,7 @@ java_junit_test(
     size = "small",
     srcs = glob(
         ["src/test/java/**/*.java"],
-        exclude = [_TEST_PKI],
+        exclude = _TEST_PKI,
     ),
     data = glob(["testdata/**"]) + glob(["native-image/*.json"]),
     javacopts = JAVACOPTS,
@@ -190,6 +203,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.MainTest",
         "io.github.bpalermo.odradek.server.NativeMetadataTest",
         "io.github.bpalermo.odradek.server.OdradekServerTest",
+        "io.github.bpalermo.odradek.server.admin.AdminServerTest",
         "io.github.bpalermo.odradek.server.codec.CodecRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ContractRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ExtensionsTest",
@@ -199,6 +213,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
         "io.github.bpalermo.odradek.server.tls.TlsTest",
+        "io.github.bpalermo.odradek.server.tls.WorkloadApiTest",
     ],
     runtime_deps = [
         ":netty_epoll_native",

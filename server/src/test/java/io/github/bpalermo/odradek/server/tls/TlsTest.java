@@ -8,7 +8,6 @@ import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.ProduceTarget;
 import io.github.bpalermo.odradek.config.v1.Producer;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
-import io.github.bpalermo.odradek.config.v1.SpiffeSource;
 import io.github.bpalermo.odradek.config.v1.Tls;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import java.nio.ByteBuffer;
@@ -287,21 +286,6 @@ class TlsTest {
         .hasMessageContaining("SASL_PLAINTEXT");
   }
 
-  @Test
-  void spiffeSourceIsRefusedForNow() {
-    ServerConfig config =
-        ServerConfig.newBuilder()
-            .putClusters(
-                "a",
-                Cluster.newBuilder()
-                    .setTls(Tls.newBuilder().setSpiffe(SpiffeSource.getDefaultInstance()))
-                    .build())
-            .build();
-    assertThatThrownBy(() -> TlsSources.create(config))
-        .isInstanceOf(CredentialException.class)
-        .hasMessageContaining("clusters.a.tls.spiffe");
-  }
-
   // --- Helpers ---
 
   private static ReloadingSslEngineFactory factory(CredentialSource source, PeerPolicy policy) {
@@ -320,8 +304,15 @@ class TlsTest {
    * certificate, in memory. Returns the subject of the client certificate the broker saw.
    */
   private static String handshake(ReloadingSslEngineFactory factory, String host) throws Exception {
+    return handshake(factory, host, broker, ca);
+  }
+
+  /** As above, with the broker's certificate and the authorities it accepts clients of. */
+  static String handshake(
+      ReloadingSslEngineFactory factory, String host, TestPki.Issued broker, String clientCa)
+      throws Exception {
     SSLEngine clientEngine = factory.createClientSslEngine(host, 9093, "https");
-    SSLEngine brokerEngine = brokerContext().createSSLEngine();
+    SSLEngine brokerEngine = brokerContext(broker, clientCa).createSSLEngine();
     brokerEngine.setUseClientMode(false);
     brokerEngine.setNeedClientAuth(true);
 
@@ -392,7 +383,7 @@ class TlsTest {
     }
   }
 
-  private static SSLContext brokerContext() throws Exception {
+  private static SSLContext brokerContext(TestPki.Issued broker, String ca) throws Exception {
     char[] password = "test".toCharArray();
     KeyStore keys = KeyStore.getInstance("PKCS12");
     keys.load(null, null);

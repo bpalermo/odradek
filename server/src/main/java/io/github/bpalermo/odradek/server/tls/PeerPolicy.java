@@ -69,7 +69,8 @@ public record PeerPolicy(Set<String> spiffeIds, String trustDomain) {
     return uris.get(0);
   }
 
-  private static String trustDomain(String id) {
+  /** The trust domain of a SPIFFE ID, in lower case. */
+  static String trustDomain(String id) {
     String rest = id.substring(SCHEME.length());
     int slash = rest.indexOf('/');
     return (slash < 0 ? rest : rest.substring(0, slash)).toLowerCase(Locale.ROOT);
