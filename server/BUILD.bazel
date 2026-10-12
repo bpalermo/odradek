@@ -13,6 +13,8 @@ package(default_visibility = ["//visibility:private"])
 # later release will refuse.
 JVM_FLAGS = ["--enable-native-access=ALL-UNNAMED"]
 
+_TEST_PKI = "src/test/java/io/github/bpalermo/odradek/server/tls/TestPki.java"
+
 java_library(
     name = "server_lib",
     srcs = glob(["src/main/java/**/*.java"]),
@@ -165,10 +167,23 @@ executable_image(
     tag_flag = ":image_tag",
 )
 
+# A throwaway certificate authority, for the TLS tests here and the mTLS broker
+# of the end-to-end suite (//e2e:pki).
+java_library(
+    name = "test_pki",
+    testonly = True,
+    srcs = [_TEST_PKI],
+    javacopts = JAVACOPTS,
+    visibility = ["//e2e:__pkg__"],
+)
+
 java_junit_test(
     name = "main_test",
     size = "small",
-    srcs = glob(["src/test/java/**/*.java"]),
+    srcs = glob(
+        ["src/test/java/**/*.java"],
+        exclude = [_TEST_PKI],
+    ),
     data = glob(["testdata/**"]) + glob(["native-image/*.json"]),
     javacopts = JAVACOPTS,
     test_classes = [
@@ -183,6 +198,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.consume.PartitionStateTest",
         "io.github.bpalermo.odradek.server.produce.ProduceServiceTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
+        "io.github.bpalermo.odradek.server.tls.TlsTest",
     ],
     runtime_deps = [
         ":netty_epoll_native",
@@ -190,6 +206,7 @@ java_junit_test(
     ],
     deps = [
         ":server_lib",
+        ":test_pki",
         "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
         "//api/odradek/kafka/v1:odradek_java_proto",

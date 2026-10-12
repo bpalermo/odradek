@@ -47,6 +47,9 @@ test:e2e --test_tag_filters=e2e
 test:e2e --nocache_test_results
 test:e2e --test_env=ODRADEK_E2E_KAFKA_A
 test:e2e --test_env=ODRADEK_E2E_KAFKA_B
+test:e2e --test_env=ODRADEK_E2E_KAFKA_TLS
+test:e2e --test_env=ODRADEK_E2E_KAFKA_TLS_ADMIN
+test:e2e --test_env=ODRADEK_E2E_TLS_DIR
 
 # Reproducible dependency state: pin the resolved Maven tree and let CI refuse
 # any drift of the module lockfile instead of silently rewriting it.

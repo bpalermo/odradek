@@ -36,8 +36,12 @@ native:
 baseline:
 	@bazel run //api:update_baseline
 
-# Needs two Kafka brokers; see README. Broker addresses default to localhost.
+# Needs two plaintext Kafka brokers and the mutual TLS one (e2e/tls/broker.sh);
+# see README. Addresses default to localhost.
 e2e:
 	@ODRADEK_E2E_KAFKA_A=$${ODRADEK_E2E_KAFKA_A:-localhost:9092} \
 	  ODRADEK_E2E_KAFKA_B=$${ODRADEK_E2E_KAFKA_B:-localhost:9093} \
+	  ODRADEK_E2E_KAFKA_TLS=$${ODRADEK_E2E_KAFKA_TLS:-localhost:9094} \
+	  ODRADEK_E2E_KAFKA_TLS_ADMIN=$${ODRADEK_E2E_KAFKA_TLS_ADMIN:-localhost:9095} \
+	  ODRADEK_E2E_TLS_DIR=$${ODRADEK_E2E_TLS_DIR:-$$HOME/.cache/odradek-e2e-tls} \
 	  bazel test //e2e/... --config=e2e

@@ -295,7 +295,7 @@ A codec is the per-topic pipeline between the bytes the app exchanges with the s
 ### What the app sees
 
 - The app's contract for a topic is a protobuf message type, never a Kafka wire format. `ProduceRecord.value` and `ConsumedRecord.value` carry that message in protobuf encoding. The Java client library exposes it as typed messages.
-- The format stored in Kafka (protobuf with or without schema-registry framing, Avro, JSON), and whether it is encrypted, is the topic's codec. Changing it is a configuration change; the app is not rebuilt and cannot tell.
+- The format stored in Kafka (protobuf with or without schema-registry framing, JSON), and whether it is encrypted, is the topic's codec. Changing it is a configuration change; the app is not rebuilt and cannot tell.
 - With no codec configured, bytes pass through unchanged, as today. The app then owns the format.
 
 ### Pipeline
@@ -362,13 +362,13 @@ contracts:
   descriptorSets:                # FileDescriptorSet files
     - /etc/odradek/schemas/acme.binpb
 
-defaultCodec: encrypted-avro     # every topic, unless it says otherwise
+defaultCodec: encrypted-json     # every topic, unless it says otherwise
 
 codecs:
-  encrypted-avro:
+  encrypted-json:
     value:
-      serializer: com.example.serde.AvroFromProtoSerializer
-      deserializer: com.example.serde.AvroToProtoDeserializer
+      serializer: com.example.serde.JsonFromProtoSerializer
+      deserializer: com.example.serde.JsonToProtoDeserializer
       properties:
         schema.registry.url: https://registry.example:8081
       transforms:
@@ -486,37 +486,41 @@ The session `seq` tables live above the producers, so `server_epoch` does not ch
 
 Certificates do not go through the producer swap or consumer rebuild. SPIRE SVIDs are short-lived (rotated around half of a default one-hour TTL), and a consumer rebuild on every rotation would mean a rebalance every half hour.
 
-The reference is [java-spiffe](https://github.com/spiffe/java-spiffe) and its `java-spiffe-helper`: the helper holds a Workload API watch and, on every X.509 context update, rewrites a keystore and truststore. The server follows the same model — one long-lived watch, an update callback, atomic replacement of key material and bundle together — but replaces the material in memory instead of on disk.
+The server keeps the current key, certificate chain and trust bundle in memory as one unit and replaces the three together. What differs between sources is only how a new set arrives.
 
 ### Mechanism
 
-- Kafka clients accept a custom TLS engine factory through `ssl.engine.factory.class` (KIP-519). The server sets it to its own `ReloadingSslEngineFactory` on every client it creates.
+- Kafka clients accept a custom TLS engine factory through `ssl.engine.factory.class` (KIP-519). The server sets it to its own `ReloadingSslEngineFactory` on every client of a cluster with `tls`, and `security.protocol` to `SSL` unless the properties say `SASL_SSL`.
 - The factory reads from a `CredentialSource` that always holds the current `{private key, certificate chain, trust bundle}` as one immutable snapshot.
-- Each new TLS handshake builds its engine from the current snapshot. Established connections are left alone; TLS does not re-validate a certificate on a live connection, and connections pick up the new SVID as they are naturally re-established.
+- Each new TLS handshake builds its engine from the current snapshot. Established connections are left alone; TLS does not re-validate a certificate on a live connection, and connections pick up the new certificate as they are naturally re-established.
 - The Kafka clients are never rebuilt for a rotation, so there is no flush, no rebalance, and nothing visible to the app.
 
 ### Credential sources
 
 Each cluster's `tls` block selects one source.
 
-| Source | How it updates | When to use |
-|---|---|---|
-| `spiffe` | `java-spiffe-core` `X509Source` watching the SPIRE agent's Workload API socket; the update callback swaps the snapshot | Clusters with SPIRE. The private key never touches disk. |
-| `files` | PEM files in a watched directory, written by `java-spiffe-helper`, `spiffe-helper`, cert-manager or similar; the new material is parsed and validated, then swapped | No Workload API access, or non-SPIFFE PKI |
+| Source | How it updates | When to use | Status |
+|---|---|---|---|
+| `files` | PEM files in a directory, written by `spiffe-helper`, cert-manager or similar. The server re-reads them every 5 seconds; changed content is parsed and validated, then swapped | No Workload API access, or non-SPIFFE PKI | Implemented |
+| `spiffe` | The server holds a watch on the SPIRE agent's Workload API socket; each update swaps the snapshot. The private key never touches disk | Clusters with SPIRE | Not implemented: a configuration that uses it is rejected |
 
-- Clusters using `spiffe` share the pod's SVID and one Workload API watch. Federated bundles cover brokers in another trust domain.
-- A snapshot that fails validation (key does not match the leaf, chain does not verify against the bundle, already expired) is rejected; the previous one stays in use and `credential_reload_failures_total` increments.
-- Metrics: SVID `not_after` timestamp, last successful rotation, rotation count. Alert on time-to-expiry, not on rotation events.
+- `files` is polled, not watched: a Kubernetes volume is updated by swapping a symlink, which a watch on the files does not see.
+- A snapshot is rejected if the key does not belong to the leaf certificate, or the leaf is expired or not yet valid. The previous one stays in use and the next poll tries again. This is what makes a writer that replaces the certificate and the key at different moments safe.
+- The certificate chain is not checked against the trust bundle: with a non-SPIFFE PKI the client's issuer and the brokers' issuer may differ.
+- If the first set cannot be loaded, the server does not start.
+- `spiffe` will be the server's own client of the Workload API, on the gRPC stack it already has, rather than `java-spiffe`: one streaming call, no second gRPC or Netty on the class path, and nothing new for the native image. Clusters using it share the pod's SVID and one watch; federated bundles cover brokers in another trust domain. At startup the server will block, bounded by the `startupProbe`, until the first SVID is received.
+- Metrics (with the admin endpoint, not built yet): certificate `not_after` timestamp, last successful reload, reload count, `credential_reload_failures_total`. Alert on time-to-expiry, not on rotation events. Today reloads and rejections are logged.
 
 ### Peer verification
 
-- X.509-SVIDs carry the identity in a URI SAN and usually no DNS SAN, so hostname verification is disabled and replaced by SPIFFE verification in the factory's trust manager: the broker certificate must chain to the trust bundle, and its SPIFFE ID must be in `acceptedSpiffeIds` or in `acceptedTrustDomain`.
+- With `acceptedSpiffeIds` or `acceptedTrustDomain` set, the broker is identified by SPIFFE ID. X.509-SVIDs carry the identity in a URI SAN and usually no DNS SAN, so hostname verification is disabled and replaced in the factory's trust manager: the broker certificate must chain to the trust bundle, carry exactly one URI SAN, and that SPIFFE ID must be listed or belong to the accepted trust domain.
+- With neither set (allowed for `files` only), the broker is verified the usual way: chain to the trust bundle, and a certificate that names the host connected to.
 - Broker side, outside this repo: brokers need a `principal.builder.class` that maps the client's SPIFFE ID to a Kafka principal for ACLs.
 
 ### Deployment
 
-- The SPIRE agent socket is mounted into the server container only (CSI driver or hostPath). The app container never sees Kafka credentials.
-- At startup the server blocks, bounded by the `startupProbe`, until the first SVID is received.
+- Credentials are mounted into the server container only. The app container never sees Kafka credentials.
+- For `files` with SPIRE, a `spiffe-helper` container writes the SVID to a memory-backed volume shared with the server. For `spiffe`, the agent socket is mounted instead (CSI driver or hostPath).
 
 ## 10. Moving a topic between clusters
 
@@ -579,10 +583,7 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 
 - **Java package root**: `io.github.bpalermo.odradek` is a placeholder; change it before anything is published.
 - **Consumer group protocol**: classic with cooperative-sticky, or the KIP-848 protocol (`group.protocol=consumer`). The callback contract is the same, so the session code keeps the choice in configuration.
-- **SPIFFE integration shape**: the design embeds the Workload API watch in the server. Running `java-spiffe-helper` as a separate container and using the `files` source is the alternative.
-- **`java-spiffe-core` dependencies**: its gRPC transport must be unshaded and compatible with the pinned Netty before it is added.
 - **Broker principal mapping**: brokers need a principal builder that understands SPIFFE IDs; confirm one exists.
-- **Protobuf to Avro and JSON mapping**: storing a protobuf contract as Avro needs a defined mapping between the two schemas. Whether Odradek ships one or leaves it to the serializer class is open.
 - **Third-party serializers**: existing schema-registry serializers for protobuf are expected to plug in unchanged; this is not verified, and their licences need checking before any is bundled.
 - **Contract descriptors**: the design reads a `FileDescriptorSet` from the config volume. Fetching descriptors from a schema registry is the alternative.
 - **Key management for encryption**: left entirely to the transform class. Whether Odradek ships a reference transform is open.

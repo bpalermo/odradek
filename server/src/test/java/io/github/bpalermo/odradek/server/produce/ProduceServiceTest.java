@@ -10,7 +10,6 @@ import io.github.bpalermo.odradek.config.v1.Produce;
 import io.github.bpalermo.odradek.config.v1.ProduceTarget;
 import io.github.bpalermo.odradek.config.v1.Producer;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
-import io.github.bpalermo.odradek.config.v1.Tls;
 import io.github.bpalermo.odradek.config.v1.Transform;
 import io.github.bpalermo.odradek.kafka.v1.ErrorCode;
 import io.github.bpalermo.odradek.kafka.v1.Header;
@@ -24,6 +23,7 @@ import io.github.bpalermo.odradek.server.OdradekService;
 import io.github.bpalermo.odradek.server.codec.CodecRegistry;
 import io.github.bpalermo.odradek.server.codec.ContractRegistry;
 import io.github.bpalermo.odradek.server.consume.ConsumeService;
+import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
@@ -135,7 +135,8 @@ class ProduceServiceTest {
         InProcessServerBuilder.forName(name)
             .addService(
                 new OdradekService(
-                    service, new ConsumeService(config, codecs, service.serverEpoch())))
+                    service,
+                    new ConsumeService(config, codecs, TlsSources.none(), service.serverEpoch())))
             .build()
             .start();
     channel = InProcessChannelBuilder.forName(name).build();
@@ -626,18 +627,6 @@ class ProduceServiceTest {
     AppStream app = opened("s1");
     app.requests.onCompleted();
     assertThat(app.status().getCode()).isEqualTo(Status.Code.OK);
-  }
-
-  @Test
-  void clusterWithTlsIsRefusedUntilMtlsExists() {
-    ServerConfig config =
-        config()
-            .putClusters("a", Cluster.newBuilder().setTls(Tls.getDefaultInstance()).build())
-            .build();
-    org.assertj.core.api.Assertions.assertThatThrownBy(
-            () -> ClusterProducers.create(config, (cluster, properties) -> null))
-        .isInstanceOf(UnsupportedOperationException.class)
-        .hasMessageContaining("clusters.a.tls");
   }
 
   @Test

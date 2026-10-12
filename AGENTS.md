@@ -15,10 +15,10 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 | Build and test what CI does | `bazel test --config=ci //...` |
 | One test target | `bazel test //server:main_test` |
 | Format (rewrites files) | `bazel run //:format` |
-| End-to-end tests | `ODRADEK_E2E_KAFKA_A=localhost:9092 ODRADEK_E2E_KAFKA_B=localhost:9093 bazel test //e2e/... --config=e2e` |
+| End-to-end tests | `make e2e`, after starting the brokers (see the README) |
 
 - `--config=ci` adds the linters as failures and refuses lockfile drift. Run it before pushing: a plain `bazel test //...` passes on code CI rejects.
-- End-to-end tests carry the `e2e` tag and are skipped by `bazel test //...`. They need two Kafka brokers, which nothing in the repository starts. `//e2e:e2e_native_binary_test` is also `manual` (it builds the GraalVM image).
+- End-to-end tests carry the `e2e` tag and are skipped by `bazel test //...`. They need two plaintext Kafka brokers, which nothing in the repository starts, and a mutual TLS one, which `e2e/tls/broker.sh` starts. `//e2e:e2e_native_binary_test` is also `manual` (it builds the GraalVM image).
 - `--config=llm` gives plain output with verbose failures.
 - Java tests run on the JUnit console launcher (`java_junit_test`, `//bazel/java:junit.bzl`). A new test class runs only once it is listed in the target's `test_classes`, and `--test_filter` has no effect.
 - First-party Java compiles with `-Xlint:all -Werror` and Error Prone, so a warning is a build failure.
@@ -30,7 +30,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 | `api/odradek/kafka/v1/` | The gRPC API between an application and the server |
 | `api/odradek/config/v1/` | The server's configuration schema, validated with protovalidate |
 | `api/odradek/client/v1/` | The client protocol as data: events, actions, conformance scenarios |
-| `server/` | The server: `config`, `codec`, `produce` and `consume` packages under `io.github.bpalermo.odradek.server` |
+| `server/` | The server: `config`, `codec`, `produce`, `consume` and `tls` packages under `io.github.bpalermo.odradek.server` |
 | `client/core/` | The client protocol with no I/O: `handle(event) -> actions`, shared by the JVM clients |
 | `client/java/`, `client/clojure/`, `client/python/` | The client libraries; Python has its own port of the core |
 | `conformance/scenarios/` | YAML scenarios that every core must pass |

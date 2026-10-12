@@ -12,6 +12,8 @@ import io.github.bpalermo.odradek.server.consume.ConsumeService;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
+import io.github.bpalermo.odradek.server.tls.CredentialException;
+import io.github.bpalermo.odradek.server.tls.TlsSources;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -82,11 +84,22 @@ public final class Main {
       return;
     }
 
+    TlsSources tls;
+    try {
+      tls = TlsSources.create(config);
+    } catch (CredentialException e) {
+      LOG.error("configuration {} rejected: {}", file, e.getMessage());
+      codecs.close();
+      System.exit(2);
+      return;
+    }
+
     ClusterProducers producers;
     try {
-      producers = ClusterProducers.create(config);
+      producers = ClusterProducers.create(config, tls);
     } catch (RuntimeException e) {
       LOG.error("configuration {} rejected: {}", file, e.getMessage());
+      tls.close();
       codecs.close();
       System.exit(2);
       return;
@@ -94,7 +107,7 @@ public final class Main {
     ProduceService produce =
         new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
 
-    ConsumeService consume = new ConsumeService(config, codecs, produce.serverEpoch());
+    ConsumeService consume = new ConsumeService(config, codecs, tls, produce.serverEpoch());
 
     OdradekServer server;
     try {
@@ -102,6 +115,7 @@ public final class Main {
     } catch (IOException e) {
       LOG.error("could not start", e);
       producers.close(Duration.ZERO);
+      tls.close();
       codecs.close();
       System.exit(1);
       return;
@@ -119,6 +133,7 @@ public final class Main {
                   consume.shutdown(Duration.ofSeconds(15));
                   server.close();
                   producers.close();
+                  tls.close();
                   codecs.close();
                 },
                 "shutdown"));

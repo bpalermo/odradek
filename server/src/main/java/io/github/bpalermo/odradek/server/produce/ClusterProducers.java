@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server.produce;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.ProduceTarget;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
+import io.github.bpalermo.odradek.server.tls.TlsSources;
 import java.io.Closeable;
 import java.time.Duration;
 import java.util.HashMap;
@@ -35,20 +36,24 @@ public final class ClusterProducers implements Closeable {
   }
 
   /** Creates real Kafka producers. Creating one does not connect to the cluster. */
-  public static ClusterProducers create(ServerConfig config) {
+  public static ClusterProducers create(ServerConfig config, TlsSources tls) {
     return create(
         config,
+        tls,
         (cluster, properties) ->
             new KafkaProducer<>(properties, new ByteArraySerializer(), new ByteArraySerializer()));
   }
 
-  /**
-   * Creates a producer for each cluster named by an entry under {@code producers}.
-   *
-   * @throws UnsupportedOperationException if such a cluster configures {@code tls}, which the
-   *     server cannot honour yet; connecting without it would be worse than not starting
-   */
+  /** As below, for a configuration in which no cluster sets {@code tls}. */
   public static ClusterProducers create(ServerConfig config, Factory factory) {
+    return create(config, TlsSources.none(), factory);
+  }
+
+  /**
+   * Creates a producer for each cluster named by an entry under {@code producers}. A cluster with
+   * {@code tls} gets the credentials {@code tls} holds for it.
+   */
+  public static ClusterProducers create(ServerConfig config, TlsSources tls, Factory factory) {
     TreeSet<String> used = new TreeSet<>();
     config
         .getProducersMap()
@@ -59,11 +64,9 @@ public final class ClusterProducers implements Closeable {
     try {
       for (String name : used) {
         Cluster cluster = config.getClustersOrThrow(name);
-        if (cluster.hasTls()) {
-          throw new UnsupportedOperationException(
-              "clusters." + name + ".tls is set, and mTLS to brokers is not implemented yet");
-        }
-        producers.put(name, factory.create(name, properties(name, cluster)));
+        Map<String, Object> properties = properties(name, cluster);
+        tls.apply(name, properties);
+        producers.put(name, factory.create(name, properties));
       }
     } catch (RuntimeException e) {
       producers.values().forEach(p -> p.close(Duration.ZERO));

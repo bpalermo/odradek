@@ -159,6 +159,10 @@ jobs:
     env:
       ODRADEK_E2E_KAFKA_A: localhost:9092
       ODRADEK_E2E_KAFKA_B: localhost:9093
+      # The third broker, started by a step below: it needs certificates that
+      # do not exist before the job runs, which a service container cannot wait for.
+      ODRADEK_E2E_KAFKA_TLS: localhost:9094
+      ODRADEK_E2E_KAFKA_TLS_ADMIN: localhost:9095
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -170,6 +174,14 @@ jobs:
           disk-cache: ${{ github.workflow }}-e2e
           repository-cache: true
           cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # A broker that only accepts mutual TLS, with certificates made here.
+      - name: Start the mutual TLS broker
+        env:
+          ODRADEK_BAZEL_FLAGS: --config=ci
+        run: |
+          e2e/tls/broker.sh "${RUNNER_TEMP}/odradek-e2e-tls"
+          echo "ODRADEK_E2E_TLS_DIR=${RUNNER_TEMP}/odradek-e2e-tls" >> "${GITHUB_ENV}"
 
       # The suite is tagged e2e and excluded from `bazel test //...`;
       # --config=e2e selects it, forwards the two addresses above and never
@@ -245,6 +257,10 @@ jobs:
     env:
       ODRADEK_E2E_KAFKA_A: localhost:9092
       ODRADEK_E2E_KAFKA_B: localhost:9093
+      # The third broker, started by a step below: it needs certificates that
+      # do not exist before the job runs, which a service container cannot wait for.
+      ODRADEK_E2E_KAFKA_TLS: localhost:9094
+      ODRADEK_E2E_KAFKA_TLS_ADMIN: localhost:9095
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -256,6 +272,14 @@ jobs:
           disk-cache: ${{ github.workflow }}-native-${{ matrix.arch }}
           repository-cache: true
           cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # A broker that only accepts mutual TLS, with certificates made here.
+      - name: Start the mutual TLS broker
+        env:
+          ODRADEK_BAZEL_FLAGS: --config=ci
+        run: |
+          e2e/tls/broker.sh "${RUNNER_TEMP}/odradek-e2e-tls"
+          echo "ODRADEK_E2E_TLS_DIR=${RUNNER_TEMP}/odradek-e2e-tls" >> "${GITHUB_ENV}"
 
       # native-image links with gcc and the static zlib; the hosted images
       # have both, this only makes sure.

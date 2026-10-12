@@ -8,8 +8,11 @@ package(default_visibility = ["//visibility:private"])
 # End-to-end tests need real Kafka brokers, so they are not part of `bazel test
 # //...` (.bazelrc: `test --test_tag_filters=-e2e`). Run them with
 #
-#   ODRADEK_E2E_KAFKA_A=localhost:9092 ODRADEK_E2E_KAFKA_B=localhost:9093 \
-#     bazel test //e2e/... --config=e2e
+#   make e2e
+#
+# which sets the brokers' addresses: two plaintext ones (ODRADEK_E2E_KAFKA_A and
+# _B) and one that only accepts mutual TLS, started by tls/broker.sh
+# (ODRADEK_E2E_KAFKA_TLS, ODRADEK_E2E_KAFKA_TLS_ADMIN, ODRADEK_E2E_TLS_DIR).
 #
 # Tags: `e2e` selects (and excludes) them; `external` and `requires-network`
 # say they talk to something outside the build, so Bazel never caches the result
@@ -35,6 +38,14 @@ _DEPS = [
     "@protobuf//java/core",
 ]
 
+# Makes the certificates of the mutual TLS broker; run by tls/broker.sh.
+java_binary(
+    name = "pki",
+    testonly = True,
+    main_class = "io.github.bpalermo.odradek.server.tls.TestPki",
+    runtime_deps = ["//server:test_pki"],
+)
+
 _TAGS = [
     "e2e",
     "external",
@@ -53,6 +64,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2e.ClientE2eTest",
         "io.github.bpalermo.odradek.e2e.CompressionE2eTest",
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
+        "io.github.bpalermo.odradek.e2e.MtlsE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
     ],
     runtime_deps = [
@@ -76,6 +88,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2e.ClientE2eTest",
         "io.github.bpalermo.odradek.e2e.CompressionE2eTest",
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
+        "io.github.bpalermo.odradek.e2e.MtlsE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
     ],
     runtime_deps = [
@@ -102,6 +115,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2e.ClientE2eTest",
         "io.github.bpalermo.odradek.e2e.CompressionE2eTest",
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
+        "io.github.bpalermo.odradek.e2e.MtlsE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
     ],
     runtime_deps = [
