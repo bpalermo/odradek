@@ -1,0 +1,29 @@
+name: consume-basic
+description: >-
+  Subscribe, grant the whole allowance, hand records to the app, and forward
+  its acks.
+consume:
+  setup:
+    topics: [orders]
+    maxProcessingMs: 60000
+    client: {language: test, version: "1"}
+    maxUnackedRecords: 10
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit:
+            subscribe: {topics: [orders], maxProcessingMs: 60000, client: {language: test, version: "1"}}
+    - event: {received: {subscribed: {serverEpoch: e1, maxProcessingMs: 60000, cluster: a, groupId: g}}}
+      expect:
+        - transmit: {credits: {records: 10}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0, value: YQ==}, {offset: 1, value: Yg==}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0, value: YQ==}, {offset: 1, value: Yg==}]}
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 0, lastOffset: 1}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 0, lastOffset: 1}}

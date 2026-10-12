@@ -1,0 +1,42 @@
+name: produce-resend-after-reconnect
+description: >-
+  When the stream breaks and the same server answers again, every record
+  without a result is sent again with its original seq, so the server can
+  recognise it. Nothing is failed.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+    - event: {send: {topic: t, value: YQ==}}
+      expect:
+        - accepted: {seq: 1}
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+    - event: {send: {topic: t, value: Yg==}}
+      expect:
+        - accepted: {seq: 2}
+        - transmit: {record: {seq: 2, lowWatermark: 1, topic: t, value: Yg==}}
+    - event: {received: {result: {seq: 1}}}
+      expect:
+        - completed: {result: {seq: 1}}
+    - event: {streamEnded: {statusCode: UNAVAILABLE}}
+      expect:
+        - openStream: {}
+    # Accepted while disconnected; sent once the server is ready again.
+    - event: {send: {topic: t, value: Yw==}}
+      expect:
+        - accepted: {seq: 3}
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+      expect:
+        - transmit: {record: {seq: 2, lowWatermark: 2, topic: t, value: Yg==}}
+        - transmit: {record: {seq: 3, lowWatermark: 2, topic: t, value: Yw==}}
+    - event: {received: {result: {seq: 2}}}
+      expect:
+        - completed: {result: {seq: 2}}
+    # The result of the first transmission of seq 2 arriving late changes nothing.
+    - event: {received: {result: {seq: 2}}}

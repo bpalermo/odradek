@@ -1,0 +1,33 @@
+name: consume-stale-acks
+description: >-
+  An ack is forwarded only if it still means something: for a partition owned
+  now, under the epoch the records were delivered with, and for records not
+  acked before.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 10}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 10}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 5}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 5}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 5, records: [{offset: 3}, {offset: 4}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 5, records: [{offset: 3}, {offset: 4}]}
+    # An earlier ownership of the partition.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 4, firstOffset: 3, lastOffset: 4}}
+    # A partition that is not owned.
+    - event: {ack: {topic: orders, partition: 1, assignmentEpoch: 5, firstOffset: 3, lastOffset: 4}}
+    # Records that were never delivered.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 5, firstOffset: 10, lastOffset: 20}}
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 5, firstOffset: 3, lastOffset: 3}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 5, firstOffset: 3, lastOffset: 3}}
+    # The same ack again.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 5, firstOffset: 3, lastOffset: 3}}

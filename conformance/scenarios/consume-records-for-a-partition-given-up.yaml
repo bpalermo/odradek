@@ -1,0 +1,26 @@
+name: consume-records-for-a-partition-given-up
+description: >-
+  A batch for a partition the core no longer owns, or for an earlier ownership
+  of it, is not handed to the app. The credits it used are granted again.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 2}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 2}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 2}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 2}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0}, {offset: 1}]}
+      expect:
+        - transmit: {credits: {records: 2}}
+    - event:
+        received:
+          records: {topic: orders, partition: 3, assignmentEpoch: 2, records: [{offset: 0}]}
+      expect:
+        - transmit: {credits: {records: 1}}

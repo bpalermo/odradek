@@ -1,0 +1,20 @@
+name: produce-basic
+description: >-
+  The handshake, then one record: it is transmitted with seq 1 once the server
+  is ready, and completed when its result arrives.
+produce:
+  setup:
+    sessionId: s1
+    client: {language: test, version: "1"}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1, client: {language: test, version: "1"}}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+    - event: {send: {topic: t, key: aw==, value: dg==}}
+      expect:
+        - accepted: {seq: 1}
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, key: aw==, value: dg==}}
+    - event: {received: {result: {seq: 1, writes: [{cluster: a, topic: t, partition: 0, offset: 7}]}}}
+      expect:
+        - completed: {result: {seq: 1, writes: [{cluster: a, topic: t, partition: 0, offset: 7}]}}

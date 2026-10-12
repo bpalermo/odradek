@@ -1,0 +1,28 @@
+name: produce-byte-window
+description: >-
+  The window is also counted in bytes of key, value, header keys and header
+  values. A record larger than the whole window can never be sent.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 8}}}
+    # 3 (key) + 2 (value) + 1 (header key) + 1 (header value) = 7 bytes.
+    - event: {send: {topic: t, key: a2V5, value: dmE=, headers: [{key: h, value: eA==}]}}
+      expect:
+        - accepted: {seq: 1}
+        - transmit:
+            record: {seq: 1, lowWatermark: 1, topic: t, key: a2V5, value: dmE=, headers: [{key: h, value: eA==}]}
+    - event: {send: {topic: t, value: dmE=}}
+      expect:
+        - rejected: {reason: SEND_REJECTION_WINDOW_FULL}
+    # 9 bytes.
+    - event: {send: {topic: t, value: MTIzNDU2Nzg5}}
+      expect:
+        - rejected: {reason: SEND_REJECTION_TOO_LARGE}
+    - event: {send: {topic: t, value: dg==}}
+      expect:
+        - accepted: {seq: 2}
+        - transmit: {record: {seq: 2, lowWatermark: 1, topic: t, value: dg==}}

@@ -7,6 +7,7 @@ package(default_visibility = ["//visibility:private"])
 proto_library(
     name = "config_proto",
     srcs = ["config.proto"],
+    strip_import_prefix = "/api",
     visibility = ["//visibility:public"],
     deps = [
         "@protobuf//:duration_proto",

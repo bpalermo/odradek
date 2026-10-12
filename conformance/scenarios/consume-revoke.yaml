@@ -1,0 +1,45 @@
+name: consume-revoke
+description: >-
+  A revocation is passed to the app. Until the app answers, its acks for those
+  partitions still go through. Its answer releases the partitions and whatever
+  the app still held of them.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 4}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 4}}
+    - event:
+        received:
+          assigned:
+            partitions:
+              - {topic: orders, partition: 0, assignmentEpoch: 1}
+              - {topic: orders, partition: 1, assignmentEpoch: 2}
+      expect:
+        - assigned:
+            partitions:
+              - {topic: orders, partition: 0, assignmentEpoch: 1}
+              - {topic: orders, partition: 1, assignmentEpoch: 2}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0}, {offset: 1}, {offset: 2}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0}, {offset: 1}, {offset: 2}]}
+    - event: {received: {revoked: {revokeId: 9, partitions: [{topic: orders, partition: 0}], deadlineMs: 10000}}}
+      expect:
+        - revoking: {revokeId: 9, partitions: [{topic: orders, partition: 0}], deadlineMs: 10000}
+    # A final ack, inside the revocation.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 0, lastOffset: 0}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 0, lastOffset: 0}}
+    # The two records the app abandons no longer count against its allowance.
+    - event: {revokeDone: {revokeId: 9}}
+      expect:
+        - transmit: {revokeDone: {revokeId: 9}}
+        - transmit: {credits: {records: 3}}
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 1, lastOffset: 2}}
+    # An answer to a revocation that was never made.
+    - event: {revokeDone: {revokeId: 10}}

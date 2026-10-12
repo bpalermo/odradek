@@ -46,6 +46,8 @@ final class ServerHarness {
   private static final Duration START_TIMEOUT = Duration.ofSeconds(60);
 
   private final Path dir;
+  private final String yaml;
+  private final ServerConfig config;
   private final EventLoopGroup group;
   final ManagedChannel channel;
 
@@ -63,41 +65,12 @@ final class ServerHarness {
     Object[] all = new Object[arguments.length + 1];
     all[0] = dir;
     System.arraycopy(arguments, 0, all, 1, arguments.length);
-    String yaml = yamlTemplate.formatted(all);
-    ServerConfig config = ConfigLoader.parse(yaml);
-    Path socket = Path.of(config.getListener().getSocketPath());
-
-    String executable = System.getenv("ODRADEK_E2E_SERVER");
-    if (executable == null || executable.isBlank()) {
-      codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
-      producers = ClusterProducers.create(config);
-      ProduceService produce =
-          new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
-      consume = new ConsumeService(config, codecs, produce.serverEpoch());
-      server = OdradekServer.start(config, new OdradekService(produce, consume));
-    } else {
-      Path file = dir.resolve("odradek.yaml");
-      Files.writeString(file, yaml);
-      process =
-          new ProcessBuilder(
-                  Path.of(executable).toAbsolutePath().toString(), "--config", file.toString())
-              .inheritIO()
-              .start();
-      long deadline = System.nanoTime() + START_TIMEOUT.toNanos();
-      while (!Files.exists(socket)) {
-        if (!process.isAlive()) {
-          fail("%s exited with status %s before listening", executable, process.exitValue());
-        }
-        if (System.nanoTime() > deadline) {
-          process.destroyForcibly();
-          fail("%s did not listen on %s within %s", executable, socket, START_TIMEOUT);
-        }
-        Thread.sleep(50);
-      }
-    }
+    yaml = yamlTemplate.formatted(all);
+    config = ConfigLoader.parse(yaml);
+    startServer();
     group = new MultiThreadIoEventLoopGroup(1, EpollIoHandler.newFactory());
     channel =
-        NettyChannelBuilder.forAddress(new DomainSocketAddress(socket.toString()))
+        NettyChannelBuilder.forAddress(new DomainSocketAddress(socket().toString()))
             .eventLoopGroup(group)
             .channelType(EpollDomainSocketChannel.class)
             .usePlaintext()
@@ -108,26 +81,74 @@ final class ServerHarness {
     return new ServerHarness(yamlTemplate, arguments);
   }
 
+  /** The Unix socket the server listens on. */
+  Path socket() {
+    return Path.of(config.getListener().getSocketPath());
+  }
+
+  private void startServer() throws Exception {
+    String executable = System.getenv("ODRADEK_E2E_SERVER");
+    if (executable == null || executable.isBlank()) {
+      codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
+      producers = ClusterProducers.create(config);
+      ProduceService produce =
+          new ProduceService(config, ProduceRoutes.create(config, producers, codecs));
+      consume = new ConsumeService(config, codecs, produce.serverEpoch());
+      server = OdradekServer.start(config, new OdradekService(produce, consume));
+      return;
+    }
+    Path file = dir.resolve("odradek.yaml");
+    Files.writeString(file, yaml);
+    process =
+        new ProcessBuilder(
+                Path.of(executable).toAbsolutePath().toString(), "--config", file.toString())
+            .inheritIO()
+            .start();
+    long deadline = System.nanoTime() + START_TIMEOUT.toNanos();
+    while (!Files.exists(socket())) {
+      if (!process.isAlive()) {
+        fail("%s exited with status %s before listening", executable, process.exitValue());
+      }
+      if (System.nanoTime() > deadline) {
+        process.destroyForcibly();
+        fail("%s did not listen on %s within %s", executable, socket(), START_TIMEOUT);
+      }
+      Thread.sleep(50);
+    }
+  }
+
   /** Stops the server: in process the way its shutdown hook does, otherwise with SIGTERM. */
-  void stop() throws Exception {
+  private void stopServer() throws Exception {
     if (process != null) {
       process.destroy();
       if (!process.waitFor(60, TimeUnit.SECONDS)) {
         process.destroyForcibly();
         fail("the server did not stop within 60s of SIGTERM");
       }
-      channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
-      group.shutdownGracefully();
+      process = null;
     } else {
       server.stopAccepting();
       producers.flush();
       consume.shutdown(Duration.ofSeconds(15));
-      channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
-      group.shutdownGracefully();
       server.close();
       producers.close(Duration.ofSeconds(5));
       codecs.close();
     }
+  }
+
+  /**
+   * Stops the server and starts a new one with the same configuration and socket: a new server
+   * epoch, with no memory of produce sessions.
+   */
+  void restart() throws Exception {
+    stopServer();
+    startServer();
+  }
+
+  void stop() throws Exception {
+    stopServer();
+    channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+    group.shutdownGracefully();
     try (var files = Files.walk(dir)) {
       for (Path file : files.sorted(java.util.Comparator.reverseOrder()).toList()) {
         Files.deleteIfExists(file);

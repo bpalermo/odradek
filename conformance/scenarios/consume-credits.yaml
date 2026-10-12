@@ -1,0 +1,32 @@
+name: consume-credits
+description: >-
+  Credits keep the app's unacked records within its allowance: what the server
+  may still send plus what the app holds never exceeds it. Credits are granted
+  again once half of the allowance is free.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 4}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 4}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}
+    # Three of the four credits used: the app holds 3, the server may send 1.
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0}, {offset: 1}, {offset: 2}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0}, {offset: 1}, {offset: 2}]}
+    # One record freed: less than half of the allowance, so no grant yet.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 0, lastOffset: 0}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 0, lastOffset: 0}}
+    # Two free: granted.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 1, lastOffset: 1}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 1, lastOffset: 1}}
+        - transmit: {credits: {records: 2}}

@@ -1,0 +1,29 @@
+name: produce-close-while-disconnected
+description: >-
+  A producer closed with records outstanding and no stream keeps reconnecting
+  until they are answered.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+    - event: {send: {topic: t, value: YQ==}}
+      expect:
+        - accepted: {seq: 1}
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+    - event: {streamEnded: {statusCode: UNAVAILABLE}}
+      expect:
+        - openStream: {}
+    - event: {close: {}}
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+      expect:
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+    - event: {received: {result: {seq: 1}}}
+      expect:
+        - completed: {result: {seq: 1}}
+        - halfClose: {}

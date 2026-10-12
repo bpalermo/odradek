@@ -1,0 +1,22 @@
+name: consume-fatal
+description: >-
+  A stream ended because the app held a record too long, or refused in a way a
+  new stream would meet again, ends the consumer. It does not resubscribe.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 4}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 4}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}
+    - event: {streamEnded: {statusCode: ABORTED, message: the app is considered hung}}
+      expect:
+        - lost: {partitions: [{topic: orders, partition: 0}]}
+        - fatal: {statusCode: ABORTED, message: the app is considered hung}
+    - event: {streamOpened: {}}
+    - event: {close: {}}

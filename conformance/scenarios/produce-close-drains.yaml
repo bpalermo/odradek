@@ -1,0 +1,24 @@
+name: produce-close-drains
+description: >-
+  Closing does not abandon records: the stream is completed only after the
+  last result. Nothing is accepted after close.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+    - event: {send: {topic: t, value: YQ==}}
+      expect:
+        - accepted: {seq: 1}
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+    - event: {close: {}}
+    - event: {send: {topic: t, value: Yg==}}
+      expect:
+        - rejected: {reason: SEND_REJECTION_CLOSED}
+    - event: {received: {result: {seq: 1}}}
+      expect:
+        - completed: {result: {seq: 1}}
+        - halfClose: {}
+    - event: {streamEnded: {statusCode: OK}}

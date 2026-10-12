@@ -1,0 +1,48 @@
+name: consume-reconnect
+description: >-
+  When the stream ends, every owned partition is reported lost, in topic and
+  partition order, and a new stream starts from the handshake with a full
+  allowance.
+consume:
+  setup: {topics: [orders, refunds], maxUnackedRecords: 4}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders, refunds]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 4}}
+    - event:
+        received:
+          assigned:
+            partitions:
+              - {topic: refunds, partition: 1, assignmentEpoch: 1}
+              - {topic: orders, partition: 2, assignmentEpoch: 2}
+              - {topic: orders, partition: 0, assignmentEpoch: 3}
+      expect:
+        - assigned:
+            partitions:
+              - {topic: refunds, partition: 1, assignmentEpoch: 1}
+              - {topic: orders, partition: 2, assignmentEpoch: 2}
+              - {topic: orders, partition: 0, assignmentEpoch: 3}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 3, records: [{offset: 0}, {offset: 1}, {offset: 2}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 3, records: [{offset: 0}, {offset: 1}, {offset: 2}]}
+    - event: {streamEnded: {statusCode: UNAVAILABLE}}
+      expect:
+        - lost:
+            partitions:
+              - {topic: orders, partition: 0}
+              - {topic: orders, partition: 2}
+              - {topic: refunds, partition: 1}
+        - openStream: {}
+    # Not connected: an ack has nowhere to go and nothing to refer to.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 3, firstOffset: 0, lastOffset: 2}}
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders, refunds]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 4}}

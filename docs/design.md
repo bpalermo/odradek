@@ -60,7 +60,8 @@ flowchart LR
 |---|---|
 | `//api` | The two proto contracts. The only thing another language needs. |
 | `//server` | Owns all Kafka clients, topic routing, credentials and the settings the guarantees depend on. |
-| `//client/java` | Hides streams, `seq`, credits and reconnects. Exposes `send() -> CompletableFuture` and a poll/handler consumer API. |
+| `//client/core` | The client protocol as a state machine without I/O: sequence numbers, the window, resends, credits, acks. Shared by the JVM clients and checked by the scenarios in `//conformance`. |
+| `//client/java` | Binds the core to grpc-java. Exposes `send() -> CompletableFuture` and a handler-based consumer. |
 | `//extension/java` | The interface extension jars implement for codec transforms. Serializers use Kafka's own interfaces. |
 
 ### Server internals

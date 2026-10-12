@@ -22,3 +22,6 @@ user.bazelrc
 
 # OS noise
 .DS_Store
+
+# Git worktrees of local agents.
+.claude/worktrees/
