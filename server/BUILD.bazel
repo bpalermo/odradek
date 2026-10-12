@@ -6,10 +6,17 @@ load("//bazel/java:junit.bzl", "java_junit_test")
 
 package(default_visibility = ["//visibility:private"])
 
+# Netty's epoll transport and the Kafka clients' compression codecs load native
+# libraries. Java 25 warns about that unless native access is granted, and a
+# later release will refuse.
+JVM_FLAGS = ["--enable-native-access=ALL-UNNAMED"]
+
 java_library(
     name = "server_lib",
     srcs = glob(["src/main/java/**/*.java"]),
     javacopts = JAVACOPTS,
+    resource_strip_prefix = "server/src/main/resources",
+    resources = glob(["src/main/resources/**"]),
     deps = [
         "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
@@ -18,9 +25,15 @@ java_library(
         "@grpc-java//api",
         "@grpc-java//netty",
         "@grpc-java//stub",
+        "@maven//:build_buf_protovalidate",
+        "@maven//:io_netty_netty_transport",
+        "@maven//:io_netty_netty_transport_classes_epoll",
+        "@maven//:io_netty_netty_transport_native_unix_common",
         "@maven//:org_apache_kafka_kafka_clients",
         "@maven//:org_slf4j_slf4j_api",
+        "@maven//:org_snakeyaml_snakeyaml_engine",
         "@protobuf//java/core",
+        "@protobuf//java/util",
     ],
 )
 
@@ -37,6 +50,7 @@ java_library(
 
 java_binary(
     name = "server",
+    jvm_flags = JVM_FLAGS,
     main_class = "io.github.bpalermo.odradek.server.Main",
     visibility = ["//visibility:public"],
     runtime_deps = [
@@ -51,6 +65,7 @@ java_image(
     base = "@distroless_java25",
     deploy_jar = ":server_deploy.jar",
     jar_path = "/app/server.jar",
+    jvm_flags = JVM_FLAGS,
     load_tag = "localhost/odradek:e2e",
     registry = IMAGE_REGISTRY,
     repository = image_repository("odradek"),
@@ -60,20 +75,34 @@ java_junit_test(
     name = "main_test",
     size = "small",
     srcs = glob(["src/test/java/**/*.java"]),
+    data = glob(["testdata/**"]),
     javacopts = JAVACOPTS,
     test_classes = [
         "io.github.bpalermo.odradek.server.MainTest",
+        "io.github.bpalermo.odradek.server.OdradekServerTest",
         "io.github.bpalermo.odradek.server.codec.CodecRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ContractRegistryTest",
         "io.github.bpalermo.odradek.server.codec.ExtensionsTest",
+        "io.github.bpalermo.odradek.server.config.ConfigLoaderTest",
         "io.github.bpalermo.odradek.server.config.ServerConfigValidationTest",
+    ],
+    runtime_deps = [
+        ":netty_epoll_native",
+        "@maven//:ch_qos_logback_logback_classic",
     ],
     deps = [
         ":server_lib",
         "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
+        "//api/odradek/kafka/v1:odradek_java_proto",
         "//extension/java:extension",
+        "@grpc-java//api",
+        "@grpc-java//netty",
+        "@grpc-java//stub",
         "@maven//:build_buf_protovalidate",
+        "@maven//:io_netty_netty_transport",
+        "@maven//:io_netty_netty_transport_classes_epoll",
+        "@maven//:io_netty_netty_transport_native_unix_common",
         "@maven//:org_apache_kafka_kafka_clients",
         "@maven//:org_assertj_assertj_core",
         "@maven//:org_junit_jupiter_junit_jupiter_api",

@@ -36,6 +36,7 @@
     "io.netty:netty-tcnative-boringssl-static": 1294848535,
     "io.netty:netty-tcnative-classes": 1285551407,
     "io.netty:netty-transport": 1284261557,
+    "io.netty:netty-transport-classes-epoll": 1061134245,
     "io.netty:netty-transport-native-epoll": -1853841131,
     "io.netty:netty-transport-native-unix-common": 514688630,
     "io.opencensus:opencensus-api": 2042364617,
