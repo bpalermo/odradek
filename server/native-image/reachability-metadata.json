@@ -746,6 +746,14 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ClientInfo"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.kafka.v1.ClientInfo$Builder"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.kafka.v1.ConsumeRequest"
     },
     {
