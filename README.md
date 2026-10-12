@@ -1,6 +1,6 @@
 # odradek
 
-odradek moves the Kafka client out of the application. Its server is a Java process, deployed today as a sidecar container next to the application in a Kubernetes pod, that owns the Kafka producer and consumer, and exposes a gRPC API to the application over a Unix domain socket. Thin client libraries for applications, in Java and Python, live in the same repository.
+odradek moves the Kafka client out of the application. Its server is a Java process, deployed today as a sidecar container next to the application in a Kubernetes pod, that owns the Kafka producer and consumer, and exposes a gRPC API to the application over a Unix domain socket. Thin client libraries for applications, in Java, Clojure and Python, live in the same repository.
 
 ## Layout
 
