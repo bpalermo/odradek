@@ -1,0 +1,36 @@
+load("@grpc-java//:java_grpc_library.bzl", "java_grpc_library")
+load("@protobuf//bazel:java_proto_library.bzl", "java_proto_library")
+load("@protobuf//bazel:proto_library.bzl", "proto_library")
+load("//bazel/lint:linters.bzl", "buf_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# The generated stubs are for the sidecar and the client library only.
+_JAVA_CONSUMERS = [
+    "//client:__subpackages__",
+    "//sidecar:__subpackages__",
+]
+
+proto_library(
+    name = "sidecar_proto",
+    srcs = ["sidecar.proto"],
+    visibility = ["//visibility:public"],
+)
+
+java_proto_library(
+    name = "sidecar_java_proto",
+    visibility = _JAVA_CONSUMERS,
+    deps = [":sidecar_proto"],
+)
+
+java_grpc_library(
+    name = "sidecar_java_grpc",
+    srcs = [":sidecar_proto"],
+    visibility = _JAVA_CONSUMERS,
+    deps = [":sidecar_java_proto"],
+)
+
+buf_test(
+    name = "sidecar_buf_lint_test",
+    srcs = [":sidecar_proto"],
+)

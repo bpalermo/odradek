@@ -1,0 +1,54 @@
+# Bazel 9, bzlmod only. Run `bazel help <command>` for any flag below.
+
+# Use the prebuilt protoc binary instead of compiling protobuf's C++ from source.
+# This is also what keeps the repo free of a host C++ toolchain.
+build --@protobuf//bazel/toolchains:prefer_prebuilt_protoc
+
+# aspect_rules_lint >= 2.9.0 depends on @aspect_tools_telemetry, whose repository
+# rule posts a usage report to telemetry.aspect.build. Opt out for everyone (local
+# and CI): an un-hermetic outbound request from a repo rule has no place here.
+common --repo_env=ASPECT_TOOLS_TELEMETRY=-all
+
+# --- Java toolchain: hermetic JDK 25 (current LTS), never the host's JDK -------
+# rules_java downloads the JDK ("remotejdk_25") and uses it both to run the
+# Java build tools and as the runtime of java_binary / java_test.
+build --java_language_version=25
+build --java_runtime_version=remotejdk_25
+build --tool_java_language_version=25
+build --tool_java_runtime_version=remotejdk_25
+
+# Error Prone runs inside every javac action (it ships with Bazel's java_tools).
+# Strict warnings (-Xlint:all -Werror) are NOT set globally: gRPC is built from
+# source here and would fail them. First-party targets opt in with JAVACOPTS from
+# //bazel/java:defs.bzl.
+
+# Deterministic, hermetic-ish test runs.
+test --test_output=errors
+test --test_verbose_timeout_warnings
+# JUnit tests get a clean env; add --test_env=NAME explicitly when one needs it.
+test --incompatible_strict_action_env
+
+# Reproducible dependency state: pin the resolved Maven tree and let CI refuse
+# any drift of the module lockfile instead of silently rewriting it.
+common --lockfile_mode=update
+common:ci --lockfile_mode=error
+
+# Lint (usage: bazel build --config=lint //...). Findings are warnings.
+build:lint --aspects=//bazel/lint:linters.bzl%buf
+build:lint --output_groups=rules_lint_report
+# CI lint: fail the build on violations.
+build:ci --config=lint
+build:ci --@aspect_rules_lint//lint:fail_on_violation
+build:ci --color=yes
+common:ci --noshow_progress
+common:ci --noshow_loading_progress
+test:ci --test_output=errors
+
+# LLM-friendly output (usage: --config=llm)
+common:llm --color=no
+common:llm --curses=no
+build:llm --verbose_failures
+test:llm --test_summary=detailed
+
+# User-specific overrides (gitignored): remote cache, disk cache, output roots.
+try-import %workspace%/user.bazelrc

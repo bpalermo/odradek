@@ -1,0 +1,55 @@
+load("@rules_java//java:defs.bzl", "java_binary", "java_library")
+load("//bazel/java:defs.bzl", "JAVACOPTS")
+load("//bazel/java:junit.bzl", "java_junit_test")
+
+package(default_visibility = ["//visibility:private"])
+
+java_library(
+    name = "sidecar_lib",
+    srcs = glob(["src/main/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    deps = [
+        "//api/odradek/kafka/v1:sidecar_java_grpc",
+        "//api/odradek/kafka/v1:sidecar_java_proto",
+        "@grpc-java//api",
+        "@grpc-java//netty",
+        "@grpc-java//stub",
+        "@maven//:org_slf4j_slf4j_api",
+    ],
+)
+
+# Netty's epoll transport (needed for AF_UNIX) ships its native code in a
+# per-architecture classifier jar; pick the one for the target CPU.
+java_library(
+    name = "netty_epoll_native",
+    visibility = ["//visibility:private"],
+    exports = ["@maven//:io_netty_netty_transport_native_unix_common"] + select({
+        "@platforms//cpu:aarch64": ["@maven//:io_netty_netty_transport_native_epoll_linux_aarch_64"],
+        "//conditions:default": ["@maven//:io_netty_netty_transport_native_epoll_linux_x86_64"],
+    }),
+)
+
+java_binary(
+    name = "sidecar",
+    main_class = "io.github.bpalermo.odradek.sidecar.Main",
+    visibility = ["//visibility:public"],
+    runtime_deps = [
+        ":netty_epoll_native",
+        ":sidecar_lib",
+        "@maven//:ch_qos_logback_logback_classic",
+    ],
+)
+
+java_junit_test(
+    name = "main_test",
+    size = "small",
+    srcs = glob(["src/test/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    test_classes = ["io.github.bpalermo.odradek.sidecar.MainTest"],
+    deps = [
+        ":sidecar_lib",
+        "//api/odradek/kafka/v1:sidecar_java_grpc",
+        "@maven//:org_assertj_assertj_core",
+        "@maven//:org_junit_jupiter_junit_jupiter_api",
+    ],
+)

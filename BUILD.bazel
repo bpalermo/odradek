@@ -1,0 +1,15 @@
+exports_files([
+    ".bazelversion",
+    "buf.yaml",
+])
+
+# `bazel run //:format` rewrites files; `bazel run //:format.check` only checks.
+alias(
+    name = "format",
+    actual = "//bazel/format",
+)
+
+alias(
+    name = "format.check",
+    actual = "//bazel/format:format.check",
+)

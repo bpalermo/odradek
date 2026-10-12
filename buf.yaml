@@ -1,0 +1,11 @@
+version: v2
+lint:
+  use:
+    - STANDARD
+  except:
+    # Protos live under ./api/<package path>, so the directory never matches the
+    # package from the buf root.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - PACKAGE

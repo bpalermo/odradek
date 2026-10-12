@@ -1,0 +1,40 @@
+load("@aspect_rules_lint//format:defs.bzl", "format_multirun")
+load("@rules_java//java:defs.bzl", "java_binary")
+
+package(default_visibility = ["//:__subpackages__"])
+
+# google-java-format reaches into javac internals; JDK 16+ needs these exports.
+java_binary(
+    name = "java-format",
+    jvm_flags = [
+        "--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
+    ],
+    main_class = "com.google.googlejavaformat.java.Main",
+    runtime_deps = ["@google_java_format//jar"],
+)
+
+# buildifier's linter rides the Starlark formatter: `-lint=warn` reports in check
+# mode, `-lint=fix` applies the mechanical fixes. (rules_lint's buildifier *aspect*
+# only visits bzl_library targets, so it would lint nothing in a repo like this.)
+_BUILDIFIER_WARNINGS = "-warnings=default"
+
+format_multirun(
+    name = "format",
+    java = ":java-format",
+    protocol_buffer = "//bazel/lint:buf",
+    starlark = "@buildifier_prebuilt//:buildifier",
+    starlark_check_args = [
+        "-mode=check",
+        "-lint=warn",
+        _BUILDIFIER_WARNINGS,
+    ],
+    starlark_fix_args = [
+        "-mode=fix",
+        "-lint=fix",
+        _BUILDIFIER_WARNINGS,
+    ],
+)

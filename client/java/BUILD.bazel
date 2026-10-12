@@ -1,0 +1,16 @@
+load("@rules_java//java:defs.bzl", "java_library")
+load("//bazel/java:defs.bzl", "JAVACOPTS")
+
+# Thin client library for applications that talk to the odradek sidecar.
+java_library(
+    name = "client",
+    srcs = glob(["src/main/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//api/odradek/kafka/v1:sidecar_java_grpc",
+        "//api/odradek/kafka/v1:sidecar_java_proto",
+        "@grpc-java//api",
+        "@grpc-java//stub",
+    ],
+)

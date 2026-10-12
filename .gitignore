@@ -1,0 +1,24 @@
+# Bazel convenience symlinks (named after the workspace directory)
+/bazel-*
+
+# IDE project files (Bazel IntelliJ plugin, IntelliJ, VS Code, Eclipse)
+/.ijwb/
+/.aswb/
+/.clwb/
+.idea/
+.vscode/
+.bazelbsp/
+.project
+.classpath
+.settings/
+
+# Per-developer Bazel overrides (see the try-import at the end of .bazelrc)
+user.bazelrc
+
+# Local Claude Code state
+.claude/settings.local.json
+.claude/projects/
+.claude/scheduled_tasks.lock
+
+# OS noise
+.DS_Store

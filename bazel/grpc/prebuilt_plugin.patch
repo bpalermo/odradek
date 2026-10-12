@@ -1,0 +1,19 @@
+--- a/compiler/BUILD.bazel	2026-10-11 21:01:35.107856854 -0300
++++ b/compiler/BUILD.bazel	2026-10-11 21:01:35.107856854 -0300
+@@ -44,14 +44,14 @@
+ 
+ java_rpc_toolchain(
+     name = "java_grpc_library_toolchain",
+-    plugin = "//compiler:grpc_java_plugin",
++    plugin = "@@//bazel/grpc:protoc_gen_grpc_java",
+     runtime = [":java_grpc_library_deps__do_not_reference"],
+     visibility = ["//visibility:public"],
+ )
+ 
+ java_rpc_toolchain(
+     name = "java_lite_grpc_library_toolchain",
+-    plugin = "//compiler:grpc_java_plugin",
++    plugin = "@@//bazel/grpc:protoc_gen_grpc_java",
+     plugin_arg = "lite",
+     runtime = [":java_lite_grpc_library_deps__do_not_reference"],
+     visibility = ["//visibility:public"],

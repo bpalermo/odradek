@@ -1,0 +1,9 @@
+# Machine-managed files: collapsed in PR diffs, excluded from language stats.
+#
+# rules_lint's format multirun SKIPS every file with `linguist-generated`,
+# `gitlab-generated` or `rules-lint-ignored` set, so nothing meant to be
+# formatted may be listed here. Anchor every pattern with a leading `/`: a bare
+# name matches that basename at EVERY depth and would hide those files from the
+# formatter. BUILD.bazel and MODULE.bazel are hand-written and stay formatted.
+/MODULE.bazel.lock linguist-generated=true
+/maven_install.json linguist-generated=true

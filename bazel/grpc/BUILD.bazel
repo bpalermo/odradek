@@ -1,0 +1,45 @@
+load("@bazel_skylib//rules:native_binary.bzl", "native_binary")
+load(":protoc.bzl", "exec_protoc")
+
+package(default_visibility = ["//visibility:public"])
+
+# The prebuilt protoc-gen-grpc-java for the exec platform. grpc-java's own plugin
+# is a C++ cc_binary, which would need a host C++ toolchain; bazel/grpc/
+# prebuilt_plugin.patch (applied to grpc-java in MODULE.bazel) points its codegen
+# toolchains here instead, and likewise at :protoc below. Selected under the exec configuration, so the binary
+# matches the machine running protoc, not the target the Java runs on.
+native_binary(
+    name = "protoc_gen_grpc_java",
+    src = select({
+        "//bazel/grpc:linux_aarch64": "@protoc_gen_grpc_java_linux_aarch_64//file",
+        "//bazel/grpc:linux_x86_64": "@protoc_gen_grpc_java_linux_x86_64//file",
+        "//bazel/grpc:macos": "@protoc_gen_grpc_java_osx//file",
+    }),
+    out = "protoc-gen-grpc-java",
+)
+
+# protoc as chosen by proto toolchain resolution (the prebuilt binary).
+exec_protoc(
+    name = "protoc",
+)
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+config_setting(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+)
+
+config_setting(
+    name = "macos",
+    constraint_values = ["@platforms//os:macos"],
+)

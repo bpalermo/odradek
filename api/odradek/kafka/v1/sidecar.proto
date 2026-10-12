@@ -1,0 +1,247 @@
+syntax = "proto3";
+
+package odradek.kafka.v1;
+
+option java_multiple_files = true;
+option java_outer_classname = "SidecarProto";
+option java_package = "io.github.bpalermo.odradek.kafka.v1";
+
+// OdradekService is the app-facing API of the Kafka client sidecar. It is served
+// on a Unix domain socket shared between the app and sidecar containers.
+//
+// Both RPCs are long-lived bidirectional streams. The first message on each
+// stream must be the handshake (ProduceOpen / Subscribe); the sidecar answers
+// with ProduceReady / Subscribed before anything else.
+service OdradekService {
+  // Produce sends records to Kafka. Every ProduceRecord gets exactly one
+  // ProduceResult, emitted only after the broker has acknowledged (or
+  // definitively failed) the record. Records on one stream are handed to the
+  // Kafka producer in arrival order.
+  rpc Produce(stream ProduceRequest) returns (stream ProduceResponse);
+
+  // Consume joins a consumer group and delivers records, assignments and
+  // revocations. Offsets are committed only for records the app has acked.
+  rpc Consume(stream ConsumeRequest) returns (stream ConsumeResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Common
+// ---------------------------------------------------------------------------
+
+// Header is a Kafka record header. Headers are ordered and keys may repeat,
+// so they are a list rather than a map.
+message Header {
+  string key = 1;
+  optional bytes value = 2;
+}
+
+message TopicPartition {
+  string topic = 1;
+  int32 partition = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  // The outcome is unknown: the record may or may not have been written
+  // (e.g. delivery.timeout.ms expired). Resending may duplicate.
+  ERROR_CODE_OUTCOME_UNKNOWN = 1;
+  // The record was definitively not written and never will be as-is
+  // (too large, invalid topic, ...).
+  ERROR_CODE_INVALID_RECORD = 2;
+  ERROR_CODE_UNKNOWN_TOPIC_OR_PARTITION = 3;
+  ERROR_CODE_AUTHORIZATION_FAILED = 4;
+  // The underlying Kafka client was fenced and must be recreated.
+  ERROR_CODE_FENCED = 5;
+  // The app violated the protocol (window exceeded, seq went backwards, ...).
+  ERROR_CODE_PROTOCOL_VIOLATION = 6;
+  ERROR_CODE_INTERNAL = 7;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+  // Simple class name of the originating Kafka exception, for diagnostics.
+  string kafka_exception = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Produce
+// ---------------------------------------------------------------------------
+
+message ProduceRequest {
+  oneof msg {
+    ProduceOpen open = 1;
+    ProduceRecord record = 2;
+  }
+}
+
+message ProduceOpen {
+  // App-chosen identifier, stable for the lifetime of the app process. `seq`
+  // values are scoped to it. Reopening a stream with the same session_id
+  // against the same sidecar_epoch resumes deduplication.
+  string session_id = 1;
+  // Name of a Kafka cluster from the sidecar configuration. Empty selects the
+  // sidecar's default cluster. A stream is bound to one cluster for its whole
+  // life; `seq` values are scoped to (cluster, session_id). An unknown name
+  // fails the stream with NOT_FOUND, an unreachable cluster with UNAVAILABLE.
+  string cluster = 2;
+}
+
+message ProduceRecord {
+  // Strictly increasing per session, starting at 1. A resend after a stream
+  // reconnect reuses the original seq.
+  uint64 seq = 1;
+  // Lowest seq for which the app has not yet received a ProduceResult. The
+  // sidecar discards retained results below it.
+  uint64 low_watermark = 2;
+  string topic = 3;
+  // Unset lets the sidecar's partitioner decide.
+  optional int32 partition = 4;
+  optional bytes key = 5;
+  // Unset is a tombstone.
+  optional bytes value = 6;
+  repeated Header headers = 7;
+  optional int64 timestamp_ms = 8;
+}
+
+message ProduceResponse {
+  oneof msg {
+    ProduceReady ready = 1;
+    ProduceResult result = 2;
+  }
+}
+
+message ProduceReady {
+  // Changes whenever the sidecar process restarts. If it differs from the one
+  // the app saw before, every record without a result is "outcome unknown".
+  string sidecar_epoch = 1;
+  // Flow-control window: the app must not have more than this many records
+  // (or bytes of key+value+headers) awaiting a result. Each ProduceResult
+  // returns one slot.
+  uint32 max_in_flight_records = 2;
+  uint64 max_in_flight_bytes = 3;
+  // Resolved cluster name (the default's name if the app left it empty).
+  string cluster = 4;
+}
+
+message ProduceResult {
+  uint64 seq = 1;
+  oneof outcome {
+    RecordMetadata metadata = 2;
+    Error error = 3;
+  }
+}
+
+message RecordMetadata {
+  string topic = 1;
+  int32 partition = 2;
+  int64 offset = 3;
+  int64 timestamp_ms = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Consume
+// ---------------------------------------------------------------------------
+
+message ConsumeRequest {
+  oneof msg {
+    Subscribe subscribe = 1;
+    Credits credits = 2;
+    Ack ack = 3;
+    RevokeDone revoke_done = 4;
+  }
+}
+
+message Subscribe {
+  string group_id = 1;
+  repeated string topics = 2;
+  // Longest the app may hold a delivered record without acking it before the
+  // sidecar declares the app hung, leaves the group and fails the stream.
+  // Zero uses the sidecar default; values above the sidecar maximum are
+  // clamped. The effective value is returned in Subscribed.
+  uint32 max_processing_ms = 3;
+  // Name of a Kafka cluster from the sidecar configuration. Empty selects the
+  // sidecar's default cluster. Same failure semantics as ProduceOpen.cluster.
+  string cluster = 4;
+}
+
+// Credits grants the sidecar permission to deliver `records` more records.
+// Grants are additive. With no credits left the sidecar pauses fetching.
+message Credits {
+  uint32 records = 1;
+}
+
+// Ack marks the inclusive offset range [first_offset, last_offset] of one
+// partition as processed. Acks may arrive out of order; the sidecar commits
+// the highest contiguous acked offset.
+message Ack {
+  string topic = 1;
+  int32 partition = 2;
+  // Must match the epoch from the Assigned event; stale acks are ignored.
+  uint64 assignment_epoch = 3;
+  int64 first_offset = 4;
+  int64 last_offset = 5;
+}
+
+message RevokeDone {
+  uint64 revoke_id = 1;
+}
+
+message ConsumeResponse {
+  oneof msg {
+    Subscribed subscribed = 1;
+    Assigned assigned = 2;
+    Revoked revoked = 3;
+    Lost lost = 4;
+    RecordBatch records = 5;
+  }
+}
+
+message Subscribed {
+  string sidecar_epoch = 1;
+  uint32 max_processing_ms = 2;
+  // Resolved cluster name (the default's name if the app left it empty).
+  string cluster = 3;
+}
+
+message PartitionAssignment {
+  string topic = 1;
+  int32 partition = 2;
+  // Unique per (partition, assignment). Echoed in RecordBatch and Ack.
+  uint64 assignment_epoch = 3;
+}
+
+message Assigned {
+  repeated PartitionAssignment partitions = 1;
+}
+
+// Revoked asks the app to stop processing the listed partitions. The app
+// finishes or abandons in-flight records, sends its final Acks, then
+// RevokeDone. After deadline_ms the sidecar proceeds without it; unacked
+// records will be redelivered to the next owner.
+message Revoked {
+  uint64 revoke_id = 1;
+  repeated TopicPartition partitions = 2;
+  uint32 deadline_ms = 3;
+}
+
+// Lost reports partitions that were taken away without a chance to commit.
+// The app must drop any in-flight work for them; acks will be ignored.
+message Lost {
+  repeated TopicPartition partitions = 1;
+}
+
+message RecordBatch {
+  string topic = 1;
+  int32 partition = 2;
+  uint64 assignment_epoch = 3;
+  repeated ConsumedRecord records = 4;
+}
+
+message ConsumedRecord {
+  int64 offset = 1;
+  int64 timestamp_ms = 2;
+  optional bytes key = 3;
+  optional bytes value = 4;
+  repeated Header headers = 5;
+}

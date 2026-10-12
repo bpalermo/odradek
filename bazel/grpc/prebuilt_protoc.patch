@@ -1,0 +1,11 @@
+--- a/java_grpc_library.bzl	2026-10-11 21:01:35.107856854 -0300
++++ b/java_grpc_library.bzl	2026-10-11 21:01:35.108856855 -0300
+@@ -41,7 +41,7 @@
+         "plugin_arg": attr.string(),
+         "_protoc": attr.label(
+             cfg = "exec",
+-            default = Label("@com_google_protobuf//:protoc"),
++            default = Label("@@//bazel/grpc:protoc"),
+             executable = True,
+         ),
+         "java_plugins": attr.label_list(
