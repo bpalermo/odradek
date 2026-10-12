@@ -396,4 +396,9 @@ message ConsumedRecord {
   bytes value = 4;
   // Record headers, in order.
   repeated Header headers = 5;
+  // Set when the topic's codec could not decode the record and the consumer
+  // is configured to deliver such records. `key`, `value` and `headers` then
+  // hold the record exactly as stored in Kafka, not the form the app
+  // normally receives. The text describes the failure and is meant for logs.
+  string decode_error = 6;
 }

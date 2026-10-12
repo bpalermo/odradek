@@ -9,14 +9,19 @@ import build.buf.protovalidate.exceptions.ValidationException;
 import com.google.protobuf.Duration;
 import io.github.bpalermo.odradek.config.v1.Admin;
 import io.github.bpalermo.odradek.config.v1.Cluster;
+import io.github.bpalermo.odradek.config.v1.Codec;
 import io.github.bpalermo.odradek.config.v1.Consume;
+import io.github.bpalermo.odradek.config.v1.Contracts;
 import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.Listener;
+import io.github.bpalermo.odradek.config.v1.OnDecodeError;
+import io.github.bpalermo.odradek.config.v1.Pipeline;
 import io.github.bpalermo.odradek.config.v1.ProduceTarget;
 import io.github.bpalermo.odradek.config.v1.Producer;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.config.v1.SpiffeSource;
 import io.github.bpalermo.odradek.config.v1.Tls;
+import io.github.bpalermo.odradek.config.v1.Transform;
 import java.util.List;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
@@ -377,5 +382,159 @@ class ServerConfigValidationTest {
             .clearConsumers()
             .build();
     assertViolates(config, "string.pattern");
+  }
+
+  private static Producer.Builder ordersProducer() {
+    return Producer.newBuilder().addClusters(target("main"));
+  }
+
+  private static io.github.bpalermo.odradek.config.v1.Consumer.Builder ordersConsumer() {
+    return io.github.bpalermo.odradek.config.v1.Consumer.newBuilder()
+        .setCluster("main")
+        .setGroupId("orders-group");
+  }
+
+  private static Codec textCodec() {
+    return Codec.newBuilder()
+        .setValue(
+            Pipeline.newBuilder()
+                .setSerializer("com.example.TextSerializer")
+                .setDeserializer("com.example.TextDeserializer")
+                .putProperties("schema.registry.url", "https://registry.example:8081")
+                .addTransforms(
+                    Transform.newBuilder()
+                        .setClassName("com.example.Outer$AesGcmTransform")
+                        .putProperties("key.uri", "kms://orders")))
+        .build();
+  }
+
+  @Test
+  void codecsWithDefaultOverrideAndContractsPass() throws ValidationException {
+    ServerConfig config =
+        valid()
+            .setContracts(Contracts.newBuilder().addDescriptorSets("/etc/odradek/acme.binpb"))
+            .setExtensionsDir("/opt/odradek/ext")
+            .setDefaultCodec("text")
+            .putCodecs("text", textCodec())
+            .putProducers(
+                "orders", ordersProducer().setValueType("acme.orders.v1.OrderCreated").build())
+            .putConsumers(
+                "orders",
+                ordersConsumer()
+                    .setValueType("acme.orders.v1.OrderCreated")
+                    .setOnDecodeError(OnDecodeError.ON_DECODE_ERROR_DELIVER_UNDECODED)
+                    .build())
+            .putProducers("raw", ordersProducer().setCodec("passthrough").build())
+            .build();
+    assertThat(ruleIds(config)).isEmpty();
+  }
+
+  @Test
+  void passthroughIsAValidDefaultCodec() throws ValidationException {
+    assertThat(ruleIds(valid().setDefaultCodec("passthrough").build())).isEmpty();
+  }
+
+  @Test
+  void defaultCodecMustExist() throws ValidationException {
+    assertViolates(
+        valid().setDefaultCodec("missing").build(), "server_config.default_codec_exists");
+  }
+
+  @Test
+  void producerCodecMustExist() throws ValidationException {
+    assertViolates(
+        valid().putProducers("orders", ordersProducer().setCodec("missing").build()).build(),
+        "server_config.producer_codec_exists");
+  }
+
+  @Test
+  void consumerCodecMustExist() throws ValidationException {
+    assertViolates(
+        valid().putConsumers("orders", ordersConsumer().setCodec("missing").build()).build(),
+        "server_config.consumer_codec_exists");
+  }
+
+  @Test
+  void passthroughCannotBeRedefined() throws ValidationException {
+    assertViolates(
+        valid().putCodecs("passthrough", textCodec()).build(),
+        "server_config.passthrough_reserved");
+  }
+
+  @Test
+  void producedAndConsumedTopicMustAgreeOnContractTypes() throws ValidationException {
+    ServerConfig config =
+        valid()
+            .setContracts(Contracts.newBuilder().addDescriptorSets("/etc/odradek/acme.binpb"))
+            .putProducers("orders", ordersProducer().setValueType("acme.Order").build())
+            .putConsumers("orders", ordersConsumer().setValueType("acme.Other").build())
+            .build();
+    assertViolates(config, "server_config.contract_types_match");
+  }
+
+  @Test
+  void contractTypesNeedDescriptorSets() throws ValidationException {
+    ServerConfig config =
+        valid()
+            .putProducers("events", ordersProducer().setKeyType("acme.EventKey").build())
+            .build();
+    assertViolates(config, "server_config.contracts_required");
+  }
+
+  @Test
+  void serializerAndDeserializerComeTogether() throws ValidationException {
+    Codec codec =
+        Codec.newBuilder()
+            .setKey(Pipeline.newBuilder().setSerializer("com.example.TextSerializer"))
+            .build();
+    assertViolates(valid().putCodecs("half", codec).build(), "pipeline.serializer_pair");
+  }
+
+  @Test
+  void transformNeedsAClass() throws ValidationException {
+    Codec codec =
+        Codec.newBuilder()
+            .setValue(Pipeline.newBuilder().addTransforms(Transform.getDefaultInstance()))
+            .build();
+    assertViolates(valid().putCodecs("bad", codec).build(), "required");
+  }
+
+  @Test
+  void classNamesMustBeJavaNames() throws ValidationException {
+    Codec codec =
+        Codec.newBuilder()
+            .setValue(
+                Pipeline.newBuilder()
+                    .addTransforms(Transform.newBuilder().setClassName("com.example.1Bad")))
+            .build();
+    assertViolates(valid().putCodecs("bad", codec).build(), "string.pattern");
+  }
+
+  @Test
+  void contractTypeNamesMustBeProtobufNames() throws ValidationException {
+    ServerConfig config =
+        valid()
+            .setContracts(Contracts.newBuilder().addDescriptorSets("/etc/odradek/acme.binpb"))
+            .putProducers("events", ordersProducer().setValueType(".acme.Leading").build())
+            .build();
+    assertViolates(config, "string.pattern");
+  }
+
+  @Test
+  void descriptorSetsMustBeAbsolutePaths() throws ValidationException {
+    assertViolates(
+        valid().setContracts(Contracts.newBuilder().addDescriptorSets("acme.binpb")).build(),
+        "string.prefix");
+  }
+
+  @Test
+  void codecNamesMustBeDnsLabels() throws ValidationException {
+    assertViolates(valid().putCodecs("Bad_Name", textCodec()).build(), "string.pattern");
+  }
+
+  @Test
+  void transformClassIsWrittenAsClassInTheFile() {
+    assertThat(Transform.getDescriptor().findFieldByName("class_name").getJsonName())
+        .isEqualTo("class");
   }
 }
