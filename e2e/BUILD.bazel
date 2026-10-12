@@ -1,0 +1,32 @@
+load("//bazel/java:defs.bzl", "JAVACOPTS")
+load("//bazel/java:junit.bzl", "java_junit_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# End-to-end tests need real Kafka brokers, so they are not part of `bazel test
+# //...` (.bazelrc: `test --test_tag_filters=-e2e`). Run them with
+#
+#   ODRADEK_E2E_KAFKA_A=localhost:9092 ODRADEK_E2E_KAFKA_B=localhost:9093 \
+#     bazel test //e2e/... --config=e2e
+#
+# Tags: `e2e` selects (and excludes) them; `external` and `requires-network`
+# say they talk to something outside the build, so Bazel never caches the result
+# or sandboxes the network away.
+java_junit_test(
+    name = "broker_smoke_test",
+    size = "medium",
+    srcs = glob(["src/test/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    tags = [
+        "e2e",
+        "external",
+        "requires-network",
+    ],
+    test_classes = ["io.github.bpalermo.odradek.e2e.BrokerSmokeTest"],
+    runtime_deps = ["@maven//:ch_qos_logback_logback_classic"],
+    deps = [
+        "@maven//:org_apache_kafka_kafka_clients",
+        "@maven//:org_assertj_assertj_core",
+        "@maven//:org_junit_jupiter_junit_jupiter_api",
+    ],
+)

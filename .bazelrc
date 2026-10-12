@@ -22,11 +22,26 @@ build --tool_java_runtime_version=remotejdk_25
 # source here and would fail them. First-party targets opt in with JAVACOPTS from
 # //bazel/java:defs.bzl.
 
+# The git commit goes into the push tag (//sidecar:image_push) and nowhere else.
+# Stamping is left to the targets that ask for it (image_push); there is no global
+# --stamp, so every other target's action key is unaffected by the commit.
+build --workspace_status_command=bazel/workspace_status.sh
+
 # Deterministic, hermetic-ish test runs.
 test --test_output=errors
 test --test_verbose_timeout_warnings
 # JUnit tests get a clean env; add --test_env=NAME explicitly when one needs it.
 test --incompatible_strict_action_env
+
+# End-to-end tests need live Kafka brokers and are excluded from plain
+# `bazel test //...`; `--config=e2e` selects them instead (and, since a later
+# --test_tag_filters wins, replaces the exclusion). Results are never cached, and
+# the broker addresses are passed through from the invoking shell.
+test --test_tag_filters=-e2e
+test:e2e --test_tag_filters=e2e
+test:e2e --nocache_test_results
+test:e2e --test_env=ODRADEK_E2E_KAFKA_A
+test:e2e --test_env=ODRADEK_E2E_KAFKA_B
 
 # Reproducible dependency state: pin the resolved Maven tree and let CI refuse
 # any drift of the module lockfile instead of silently rewriting it.

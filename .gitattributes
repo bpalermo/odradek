@@ -7,3 +7,4 @@
 # formatter. BUILD.bazel and MODULE.bazel are hand-written and stay formatted.
 /MODULE.bazel.lock linguist-generated=true
 /maven_install.json linguist-generated=true
+/api/baseline.binpb binary linguist-generated=true

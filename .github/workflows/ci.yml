@@ -1,0 +1,192 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Third-party actions are pinned to commit SHAs, not tags; the version each SHA
+# corresponds to is in the comment beside it. Dependabot keeps them current.
+#
+# Caches: every job RESTORES the Bazel caches, but only runs on main SAVE them
+# (cache-save below), so only reviewed code populates a cache that a later
+# trusted build consumes. Gated on the ref rather than the event, because
+# workflow_dispatch can target any branch.
+jobs:
+  # Build, unit tests, formatting and lint. Proto lint and the proto
+  # breaking-change check are ordinary test targets, so `bazel test //...`
+  # covers them; there is no separate proto job.
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # No version is pinned here: bazelisk reads .bazelversion, so the
+      # checkout is the single source of the Bazel version.
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # --config=ci refuses lockfile drift and fails on lint violations.
+      - name: bazel build //...
+        run: bazel build //... --config=ci
+
+      - name: bazel test //...
+        run: bazel test //... --config=ci
+
+      - name: Sources are formatted
+        run: bazel run --config=ci //:format.check
+
+  # The container image, built for both architectures but not pushed, then
+  # loaded and started. A change that breaks the image fails here on the pull
+  # request instead of in publish.yml after the merge.
+  image:
+    name: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-image
+          repository-cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # Everything publish.yml runs, so it cannot be the first place these
+      # targets are built.
+      - name: Build the image, the push target and the signing tools
+        run: |
+          bazel build --config=ci \
+            //sidecar:image_index //sidecar:image_push \
+            //bazel/cosign //bazel/cosign:verify_image
+
+      - name: Load the image and start it
+        run: |
+          set -euo pipefail
+          bazel run --config=ci //sidecar:image_load
+          docker run --rm localhost/odradek:e2e | tee image-run.log
+          grep -q "odradek sidecar starting" image-run.log
+
+  # End to end against real Kafka in KRaft mode (no ZooKeeper). Two
+  # independent single-node clusters, so the multi-cluster cases run in the
+  # same suite. After `build`, so a change that does not compile or fails its
+  # unit tests never gets as far as starting brokers.
+  e2e:
+    name: e2e (kafka kraft)
+    needs: [build]
+    runs-on: ubuntu-latest
+    services:
+      # Each broker is a combined broker+controller node. The listener port
+      # inside the container equals the published one, because the advertised
+      # listener is what a client is told to reconnect to.
+      kafka-a:
+        image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:19092
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:19092
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 24
+      kafka-b:
+        image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+        ports:
+          - 9093:9093
+        env:
+          KAFKA_NODE_ID: 2
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9093,CONTROLLER://:19093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9093
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 2@localhost:19093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9093"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 24
+    env:
+      ODRADEK_E2E_KAFKA_A: localhost:9092
+      ODRADEK_E2E_KAFKA_B: localhost:9093
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-e2e
+          repository-cache: true
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      # The suite is tagged e2e and excluded from `bazel test //...`;
+      # --config=e2e selects it, forwards the two addresses above and never
+      # caches a result.
+      - name: bazel test //e2e/...
+        run: bazel test //e2e/... --config=ci --config=e2e
+
+  # The single check the main ruleset requires, and the only reason this job
+  # exists.
+  #
+  # A required status check is matched by check-run name, so requiring the
+  # jobs themselves ties the ruleset to their names: rename or split one and
+  # the required check can never report again, which blocks every pull request
+  # instead of failing it. Requiring one aggregate leaves the jobs free to
+  # change.
+  #
+  # if: always() so it runs even when a job fails; a skipped job reports
+  # nothing, and a required check that never reports blocks the pull request.
+  ci:
+    name: ci
+    needs: [build, image, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # Reads the results rather than naming the jobs, so adding a job to
+      # `needs` above is enough to have it gate merges.
+      - name: every job this depends on must have succeeded
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "results: ${results}"
+          for result in ${results}; do
+            if [ "${result}" != "success" ]; then
+              echo "::error::a required job reported '${result}'" >&2
+              exit 1
+            fi
+          done

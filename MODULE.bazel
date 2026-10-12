@@ -12,6 +12,15 @@ bazel_dep(name = "rules_jvm_external", version = "7.1")
 bazel_dep(name = "protobuf", version = "36.2")
 bazel_dep(name = "grpc-java", version = "1.84.0")
 
+# Container image (//sidecar:image_*) and the cosign CLI that verifies it.
+bazel_dep(name = "rules_img", version = "0.3.21")
+bazel_dep(name = "rules_img_signer_cosign", version = "0.0.1")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
+# Transitive dependency of rules_img pinned for Bazel 9: older versions (via
+# rules_pkg) use the removed incompatible_use_toolchain_transition keyword.
+bazel_dep(name = "rules_foreign_cc", version = "0.16.0")
+
 # buf.validate protos (buf/validate/validate.proto) for protovalidate rules in config protos.
 bazel_dep(name = "protovalidate", version = "1.2.2")
 
@@ -128,4 +137,18 @@ http_file(
     executable = True,
     sha256 = "49aab9e56a30a8484e9c32d36be12a351d5783e00bdaafe9ec2c2fd8c9029504",
     url = "https://repo1.maven.org/maven2/io/grpc/protoc-gen-grpc-java/1.84.0/protoc-gen-grpc-java-1.84.0-osx-aarch_64.exe",
+)
+
+# The image base: distroless Java 25 runtime on Debian 13, nonroot variant
+# (user 65532). Pinned by INDEX digest -- a tag would let the contents of a
+# release change without the build changing. Layers are fetched lazily, only
+# when an image is pushed or loaded.
+pull = use_repo_rule("@rules_img//img:pull.bzl", "pull")
+
+pull(
+    name = "distroless_java25",
+    digest = "sha256:28a3986989d7d74cb5cfd6ba369e64d3d634f83ac9fa562dac8db2d20827f90e",
+    layer_handling = "lazy",
+    registry = "gcr.io",
+    repository = "distroless/java25-debian13",
 )
