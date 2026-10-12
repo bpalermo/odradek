@@ -1,16 +1,27 @@
 load("@rules_java//java:defs.bzl", "java_library")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
 
-# Thin client library for applications that talk to the odradek server.
+package(default_visibility = ["//visibility:private"])
+
+# The Java client: the shared protocol core (//client/core) bound to grpc-java.
 java_library(
     name = "client",
     srcs = glob(["src/main/java/**/*.java"]),
     javacopts = JAVACOPTS,
     visibility = ["//visibility:public"],
+    exports = ["//api/odradek/kafka/v1:odradek_java_proto"],
     deps = [
+        "//api/odradek/client/v1:core_java_proto",
         "//api/odradek/kafka/v1:odradek_java_grpc",
         "//api/odradek/kafka/v1:odradek_java_proto",
+        "//client/core",
         "@grpc-java//api",
+        "@grpc-java//netty",
         "@grpc-java//stub",
+        "@maven//:io_netty_netty_transport",
+        "@maven//:io_netty_netty_transport_classes_epoll",
+        "@maven//:io_netty_netty_transport_native_unix_common",
+        "@maven//:org_slf4j_slf4j_api",
+        "@protobuf//java/core",
     ],
 )

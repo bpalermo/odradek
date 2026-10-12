@@ -2,10 +2,21 @@
 
 load("@protobuf//bazel/common:proto_info.bzl", "ProtoInfo")
 
+def _import_path(info, file):
+    """The name a .proto has inside its descriptor set: its path below the proto source root.
+
+    That root is "." for a plain proto_library and a _virtual_imports directory
+    for one that sets strip_import_prefix or import_prefix.
+    """
+    root = info.proto_source_root
+    if root == ".":
+        return file.short_path
+    return file.path.removeprefix(root + "/")
+
 def _proto_image_impl(ctx):
     infos = [t[ProtoInfo] for t in ctx.attr.protos]
     sets = depset(transitive = [i.transitive_descriptor_sets for i in infos])
-    files = [f.short_path for i in infos for f in i.direct_sources]
+    files = [_import_path(i, f) for i in infos for f in i.direct_sources]
     out = ctx.actions.declare_file(ctx.label.name + ".binpb")
     ctx.actions.run(
         executable = ctx.executable._protoc,

@@ -8,7 +8,9 @@ odradek moves the Kafka client out of the application. Its server is a Java proc
 | --- | --- |
 | `api/odradek/kafka/v1/` | The `OdradekService` protobuf/gRPC API and its generated Java targets |
 | `server/` | The server `java_binary` (`src/main/java`, `src/test/java`) |
+| `client/core/` | The client protocol without I/O, shared by the JVM clients (ADR 1) |
 | `client/java/` | Java client library for applications |
+| `conformance/` | Scenarios every client core must pass |
 | `extension/java/` | Interfaces for extension jars: `RecordTransform`, the byte-to-byte codec step (encryption and similar) |
 | `bazel/` | Shared build code: formatter, linters, JUnit 6 macro, gRPC codegen shims |
 | `docs/` | The design (`design.md`) and architecture decision records (`adr/`) |

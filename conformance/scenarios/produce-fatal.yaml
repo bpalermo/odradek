@@ -1,0 +1,28 @@
+name: produce-fatal
+description: >-
+  A stream refused in a way a new stream would meet again ends the producer.
+  Outstanding records are failed, saying whether they were ever sent.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 1, maxInFlightBytes: 1000}}}
+    - event: {send: {topic: t, value: YQ==}}
+      expect:
+        - accepted: {seq: 1}
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+    - event: {streamEnded: {statusCode: ABORTED, message: another stream opened session s1}}
+      expect:
+        - completed:
+            result:
+              seq: 1
+              error:
+                code: ERROR_CODE_OUTCOME_UNKNOWN
+                message: the stream ended with ABORTED before the record was answered; it may have been produced
+        - fatal: {statusCode: ABORTED, message: another stream opened session s1}
+    - event: {send: {topic: t, value: Yg==}}
+      expect:
+        - rejected: {reason: SEND_REJECTION_CLOSED}
+    - event: {streamOpened: {}}

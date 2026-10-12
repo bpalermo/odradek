@@ -1,0 +1,265 @@
+edition = "2024";
+
+// The client protocol core, as data.
+//
+// A client library has two parts. The binding owns the gRPC streams, the
+// threads and the timers. The core owns the protocol on top of the streams:
+// sequence numbers, the in-flight window, resends after a reconnect, credits,
+// acknowledgements and the revoke handshake. The core does no I/O: the
+// binding hands it events and carries out the actions it returns.
+//
+// This file defines those events and actions, and the scenario files that
+// say which actions a core must return for a given sequence of events. Every
+// implementation of the core, in any language, must pass every scenario.
+package odradek.client.v1;
+
+import "odradek/kafka/v1/odradek.proto";
+
+option java_outer_classname = "CoreProto";
+option java_package = "io.github.bpalermo.odradek.client.v1";
+
+// ---------------------------------------------------------------------------
+// Common
+// ---------------------------------------------------------------------------
+
+// StreamOpened says the binding has opened a gRPC stream and it is ready to
+// carry messages.
+message StreamOpened {}
+
+// StreamEnded says the stream is gone: it failed, was cancelled, or the
+// server completed it.
+message StreamEnded {
+  // Name of the gRPC status code the stream ended with, such as
+  // "UNAVAILABLE" or "ABORTED". "OK" when the server completed the stream.
+  string status_code = 1;
+  // The status description, for logs.
+  string message = 2;
+}
+
+// Close says the app is done with the producer or consumer.
+message Close {}
+
+// OpenStream asks the binding to open a new gRPC stream and report it with
+// StreamOpened. The binding chooses when (it owns backoff).
+message OpenStream {}
+
+// HalfClose asks the binding to complete its side of the stream.
+message HalfClose {}
+
+// Fatal says the producer or consumer cannot continue: the server refused it
+// in a way that retrying will not change. The binding closes the stream if it
+// is open and surfaces the failure to the app.
+message Fatal {
+  // The status code that caused it; see StreamEnded.status_code.
+  string status_code = 1;
+  // Human-readable detail.
+  string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Produce
+// ---------------------------------------------------------------------------
+
+// ProduceSetup is what a produce core is created with.
+message ProduceSetup {
+  // The session identifier sent in ProduceOpen. Required.
+  string session_id = 1;
+  // Sent in ProduceOpen.client.
+  odradek.kafka.v1.ClientInfo client = 2;
+  // How many records the core holds without a result before the server has
+  // announced its window (before the first ProduceReady). Afterwards the
+  // server's window applies. Default: 1000.
+  uint32 max_buffered_records = 3;
+  // The same limit in bytes of key, value and headers. Default: 16 MiB.
+  uint64 max_buffered_bytes = 4;
+}
+
+// ProduceEvent is something that happened, told to the produce core.
+message ProduceEvent {
+  // Exactly one is set.
+  oneof kind {
+    // The stream is open.
+    StreamOpened stream_opened = 1;
+    // A message arrived on the stream.
+    odradek.kafka.v1.ProduceResponse received = 2;
+    // The stream is gone.
+    StreamEnded stream_ended = 3;
+    // The app wants to send a record. `seq` and `low_watermark` are ignored:
+    // the core assigns them.
+    odradek.kafka.v1.ProduceRecord send = 4;
+    // The app closed the producer.
+    Close close = 5;
+  }
+}
+
+// SendRejection is why the core did not take a record.
+enum SendRejection {
+  // Not set.
+  SEND_REJECTION_UNSPECIFIED = 0;
+  // The window is full. Nothing changed; the same record may be offered
+  // again after a result has arrived.
+  SEND_REJECTION_WINDOW_FULL = 1;
+  // The record alone exceeds the byte window and can never be sent.
+  SEND_REJECTION_TOO_LARGE = 2;
+  // The producer was closed or has failed.
+  SEND_REJECTION_CLOSED = 3;
+}
+
+// SendAccepted answers a `send` event the core took.
+message SendAccepted {
+  // The sequence number assigned to the record. Its outcome arrives later as
+  // SendCompleted with the same seq.
+  uint64 seq = 1;
+}
+
+// SendRejected answers a `send` event the core did not take.
+message SendRejected {
+  // Why.
+  SendRejection reason = 1;
+}
+
+// SendCompleted is the final outcome of an accepted record.
+message SendCompleted {
+  // The outcome, with the record's seq. `error` is unset on success. When
+  // the core itself gives up on a record (the server restarted and lost its
+  // session), it builds this with ERROR_CODE_OUTCOME_UNKNOWN.
+  odradek.kafka.v1.ProduceResult result = 1;
+}
+
+// ProduceAction is something the binding must do for the produce core.
+// Actions are carried out in the order returned.
+message ProduceAction {
+  // Exactly one is set.
+  oneof kind {
+    // Write this message to the stream.
+    odradek.kafka.v1.ProduceRequest transmit = 1;
+    // The record of the `send` event was taken.
+    SendAccepted accepted = 2;
+    // The record of the `send` event was not taken.
+    SendRejected rejected = 3;
+    // A record reached its final outcome.
+    SendCompleted completed = 4;
+    // Open a stream.
+    OpenStream open_stream = 5;
+    // Complete the stream.
+    HalfClose half_close = 6;
+    // Give up.
+    Fatal fatal = 7;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Consume
+// ---------------------------------------------------------------------------
+
+// ConsumeSetup is what a consume core is created with.
+message ConsumeSetup {
+  // Sent in Subscribe.topics. At least one.
+  repeated string topics = 1;
+  // Sent in Subscribe.max_processing_ms. Zero uses the server default.
+  uint32 max_processing_ms = 2;
+  // Sent in Subscribe.client.
+  odradek.kafka.v1.ClientInfo client = 3;
+  // How many delivered records the app may hold unacked. The core grants the
+  // server credits so that this is never exceeded. Default: 500.
+  uint32 max_unacked_records = 4;
+}
+
+// ConsumeEvent is something that happened, told to the consume core.
+message ConsumeEvent {
+  // Exactly one is set.
+  oneof kind {
+    // The stream is open.
+    StreamOpened stream_opened = 1;
+    // A message arrived on the stream.
+    odradek.kafka.v1.ConsumeResponse received = 2;
+    // The stream is gone.
+    StreamEnded stream_ended = 3;
+    // The app processed these records.
+    odradek.kafka.v1.Ack ack = 4;
+    // The app has stopped working on the partitions of a revocation.
+    odradek.kafka.v1.RevokeDone revoke_done = 5;
+    // The app closed the consumer.
+    Close close = 6;
+  }
+}
+
+// ConsumeAction is something the binding must do for the consume core.
+// Actions are carried out in the order returned.
+message ConsumeAction {
+  // Exactly one is set.
+  oneof kind {
+    // Write this message to the stream.
+    odradek.kafka.v1.ConsumeRequest transmit = 1;
+    // Tell the app it now owns these partitions.
+    odradek.kafka.v1.Assigned assigned = 2;
+    // Hand these records to the app.
+    odradek.kafka.v1.RecordBatch deliver = 3;
+    // Tell the app to stop working on these partitions and answer with a
+    // `revoke_done` event before the deadline.
+    odradek.kafka.v1.Revoked revoking = 4;
+    // Tell the app these partitions are gone: drop any work in progress for
+    // them. Also returned for every owned partition when the stream ends.
+    odradek.kafka.v1.Lost lost = 5;
+    // Open a stream.
+    OpenStream open_stream = 6;
+    // Complete the stream.
+    HalfClose half_close = 7;
+    // Give up.
+    Fatal fatal = 8;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Conformance scenarios
+// ---------------------------------------------------------------------------
+
+// Scenario is one conformance case: a core is created, events are applied in
+// order, and after each event the core must return exactly the listed
+// actions, in order. Scenario files are YAML in the protobuf JSON mapping.
+message Scenario {
+  // Short identifier, unique among scenarios.
+  string name = 1;
+  // What the scenario establishes, in a sentence or two.
+  string description = 2;
+
+  // Exactly one is set.
+  oneof subject {
+    // A scenario for the produce core.
+    ProduceScenario produce = 3;
+    // A scenario for the consume core.
+    ConsumeScenario consume = 4;
+  }
+}
+
+// ProduceScenario drives a produce core.
+message ProduceScenario {
+  // What the core is created with.
+  ProduceSetup setup = 1;
+  // The events, in order.
+  repeated ProduceStep steps = 2;
+}
+
+// ProduceStep is one event and the actions it must produce.
+message ProduceStep {
+  // The event.
+  ProduceEvent event = 1;
+  // The actions the core must return for it. Empty means none.
+  repeated ProduceAction expect = 2;
+}
+
+// ConsumeScenario drives a consume core.
+message ConsumeScenario {
+  // What the core is created with.
+  ConsumeSetup setup = 1;
+  // The events, in order.
+  repeated ConsumeStep steps = 2;
+}
+
+// ConsumeStep is one event and the actions it must produce.
+message ConsumeStep {
+  // The event.
+  ConsumeEvent event = 1;
+  // The actions the core must return for it. Empty means none.
+  repeated ConsumeAction expect = 2;
+}

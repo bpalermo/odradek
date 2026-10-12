@@ -15,6 +15,7 @@ _JAVA_CONSUMERS = [
 proto_library(
     name = "odradek_proto",
     srcs = ["odradek.proto"],
+    strip_import_prefix = "/api",
     visibility = ["//visibility:public"],
 )
 

@@ -16,6 +16,7 @@ _DEPS = [
     "//api/odradek/config/v1:config_java_proto",
     "//api/odradek/kafka/v1:odradek_java_grpc",
     "//api/odradek/kafka/v1:odradek_java_proto",
+    "//client/java:client",
     "//server:server_lib",
     "@grpc-java//api",
     "@grpc-java//netty",
@@ -38,12 +39,13 @@ _TAGS = [
 # The server assembled inside the test JVM. Fastest to run and to debug.
 java_junit_test(
     name = "e2e_test",
-    size = "medium",
+    size = "large",
     srcs = glob(["src/test/java/**/*.java"]),
     javacopts = JAVACOPTS,
     tags = _TAGS,
     test_classes = [
         "io.github.bpalermo.odradek.e2e.BrokerSmokeTest",
+        "io.github.bpalermo.odradek.e2e.ClientE2eTest",
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
     ],
@@ -58,13 +60,14 @@ java_junit_test(
 # with a configuration file and stopped with SIGTERM: what a pod runs.
 java_junit_test(
     name = "e2e_jvm_binary_test",
-    size = "medium",
+    size = "large",
     srcs = glob(["src/test/java/**/*.java"]),
     data = ["//server"],
     env = {"ODRADEK_E2E_SERVER": "$(rootpath //server)"},
     javacopts = JAVACOPTS,
     tags = _TAGS,
     test_classes = [
+        "io.github.bpalermo.odradek.e2e.ClientE2eTest",
         "io.github.bpalermo.odradek.e2e.ConsumeE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
     ],

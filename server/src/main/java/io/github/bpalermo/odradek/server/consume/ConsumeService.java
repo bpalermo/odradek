@@ -273,6 +273,13 @@ public final class ConsumeService {
               Duration.ofMillis(commitIntervalMs),
               nanoClock,
               sessions::remove);
+      LOG.info(
+          "consume stream opened: topics {} group {} cluster {} client {} {}",
+          topics,
+          first.getGroupId(),
+          clusterName,
+          subscribe.getClient().getLanguage(),
+          subscribe.getClient().getVersion());
       sessions.add(started);
       session = started;
       started.start("odradek-consume-" + first.getGroupId() + "-" + streamCounter.get());

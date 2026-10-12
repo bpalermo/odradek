@@ -1,0 +1,34 @@
+name: produce-server-restarted
+description: >-
+  A different server epoch means the server lost the session. Records it was
+  sent are failed as outcome unknown, because resending could duplicate.
+  Records it never saw are sent.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+    - event: {send: {topic: t, value: YQ==}}
+      expect:
+        - accepted: {seq: 1}
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+    - event: {streamEnded: {statusCode: UNAVAILABLE}}
+      expect:
+        - openStream: {}
+    - event: {send: {topic: t, value: Yg==}}
+      expect:
+        - accepted: {seq: 2}
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e2, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+      expect:
+        - completed:
+            result:
+              seq: 1
+              error:
+                code: ERROR_CODE_OUTCOME_UNKNOWN
+                message: the server restarted before answering; the record may have been produced
+        - transmit: {record: {seq: 2, lowWatermark: 2, topic: t, value: Yg==}}

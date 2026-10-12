@@ -1,0 +1,30 @@
+name: produce-window-smaller-than-buffer
+description: >-
+  Records accepted before the handshake can outnumber the window the server
+  then announces. They are transmitted only as the window allows, in order.
+produce:
+  setup: {sessionId: s1, maxBufferedRecords: 3}
+  steps:
+    - event: {send: {topic: t, value: YQ==}}
+      expect:
+        - accepted: {seq: 1}
+    - event: {send: {topic: t, value: Yg==}}
+      expect:
+        - accepted: {seq: 2}
+    - event: {send: {topic: t, value: Yw==}}
+      expect:
+        - accepted: {seq: 3}
+    - event: {send: {topic: t, value: ZA==}}
+      expect:
+        - rejected: {reason: SEND_REJECTION_WINDOW_FULL}
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 2, maxInFlightBytes: 1000}}}
+      expect:
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+        - transmit: {record: {seq: 2, lowWatermark: 1, topic: t, value: Yg==}}
+    - event: {received: {result: {seq: 2}}}
+      expect:
+        - completed: {result: {seq: 2}}
+        - transmit: {record: {seq: 3, lowWatermark: 1, topic: t, value: Yw==}}

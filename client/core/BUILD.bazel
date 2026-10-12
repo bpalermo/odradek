@@ -1,0 +1,44 @@
+load("@rules_java//java:defs.bzl", "java_library")
+load("//bazel/java:defs.bzl", "JAVACOPTS")
+load("//bazel/java:junit.bzl", "java_junit_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# The client protocol without I/O (ADR 1): events in, actions out. Shared by
+# the Java and Clojure clients; other languages port it and pass the same
+# conformance scenarios (//conformance).
+java_library(
+    name = "core",
+    srcs = glob(["src/main/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    visibility = [
+        "//client:__subpackages__",
+        "//e2e:__pkg__",
+    ],
+    exports = [
+        "//api/odradek/client/v1:core_java_proto",
+        "//api/odradek/kafka/v1:odradek_java_proto",
+    ],
+    deps = [
+        "//api/odradek/client/v1:core_java_proto",
+        "//api/odradek/kafka/v1:odradek_java_proto",
+        "@protobuf//java/core",
+    ],
+)
+
+java_junit_test(
+    name = "conformance_test",
+    size = "small",
+    srcs = glob(["src/test/java/**/*.java"]),
+    data = ["//conformance:scenarios"],
+    javacopts = JAVACOPTS,
+    test_classes = ["io.github.bpalermo.odradek.client.core.ConformanceTest"],
+    deps = [
+        ":core",
+        "@maven//:org_assertj_assertj_core",
+        "@maven//:org_junit_jupiter_junit_jupiter_api",
+        "@maven//:org_snakeyaml_snakeyaml_engine",
+        "@protobuf//java/core",
+        "@protobuf//java/util",
+    ],
+)

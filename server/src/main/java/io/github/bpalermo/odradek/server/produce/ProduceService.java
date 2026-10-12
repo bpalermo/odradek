@@ -142,6 +142,11 @@ public final class ProduceService {
                 .build());
       }
       // Ready goes out before the stream can receive a result of an earlier stream's record.
+      LOG.info(
+          "produce stream opened: session {} client {} {}",
+          id,
+          request.getOpen().getClient().getLanguage(),
+          request.getOpen().getClient().getVersion());
       session = session(id);
       session.attach(
           sink,

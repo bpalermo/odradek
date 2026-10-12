@@ -60,6 +60,17 @@ message Header {
   bytes value = 2;
 }
 
+// ClientInfo identifies the client library on the other end of a stream. It
+// is informational: the server reports it in logs and metrics and never
+// changes behaviour because of it.
+message ClientInfo {
+  // Implementation language of the client library, in lower case: "java",
+  // "clojure", "python".
+  string language = 1;
+  // Version of the client library.
+  string version = 2;
+}
+
 // TopicPartition identifies one partition of one topic.
 message TopicPartition {
   // Topic name.
@@ -136,6 +147,8 @@ message ProduceOpen {
   // stream with the same session_id against the same server_epoch resumes
   // deduplication. Required.
   string session_id = 1;
+  // The client library sending this stream. Optional.
+  ClientInfo client = 2;
 }
 
 // ProduceRecord is one record to write to Kafka.
@@ -263,6 +276,8 @@ message Subscribe {
   // above the server maximum are clamped. The effective value is returned
   // in Subscribed.
   uint32 max_processing_ms = 2;
+  // The client library sending this stream. Optional.
+  ClientInfo client = 3;
 }
 
 // Credits grants the server permission to deliver more records. Grants are

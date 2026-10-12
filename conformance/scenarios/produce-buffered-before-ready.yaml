@@ -1,0 +1,27 @@
+name: produce-buffered-before-ready
+description: >-
+  Records sent before the server is ready are accepted and held, then
+  transmitted in order. The low watermark is the oldest record without a result.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {send: {topic: t, value: YQ==}}
+      expect:
+        - accepted: {seq: 1}
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {send: {topic: t, value: Yg==}}
+      expect:
+        - accepted: {seq: 2}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 10, maxInFlightBytes: 1000}}}
+      expect:
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+        - transmit: {record: {seq: 2, lowWatermark: 1, topic: t, value: Yg==}}
+    - event: {received: {result: {seq: 1}}}
+      expect:
+        - completed: {result: {seq: 1}}
+    - event: {send: {topic: t, value: Yw==}}
+      expect:
+        - accepted: {seq: 3}
+        - transmit: {record: {seq: 3, lowWatermark: 2, topic: t, value: Yw==}}

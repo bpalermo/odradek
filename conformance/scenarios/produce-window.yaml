@@ -1,0 +1,31 @@
+name: produce-window
+description: >-
+  The core never has more records awaiting a result than the server's window.
+  A record that does not fit is refused without side effects and can be
+  offered again once a result has freed a slot.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {received: {ready: {serverEpoch: e1, maxInFlightRecords: 2, maxInFlightBytes: 10}}}
+    - event: {send: {topic: t, value: YQ==}}
+      expect:
+        - accepted: {seq: 1}
+        - transmit: {record: {seq: 1, lowWatermark: 1, topic: t, value: YQ==}}
+    - event: {send: {topic: t, value: Yg==}}
+      expect:
+        - accepted: {seq: 2}
+        - transmit: {record: {seq: 2, lowWatermark: 1, topic: t, value: Yg==}}
+    - event: {send: {topic: t, value: Yw==}}
+      expect:
+        - rejected: {reason: SEND_REJECTION_WINDOW_FULL}
+    - event: {received: {result: {seq: 2}}}
+      expect:
+        - completed: {result: {seq: 2}}
+    # The refused record was not given a seq: the next one accepted is 3.
+    - event: {send: {topic: t, value: Yw==}}
+      expect:
+        - accepted: {seq: 3}
+        - transmit: {record: {seq: 3, lowWatermark: 1, topic: t, value: Yw==}}

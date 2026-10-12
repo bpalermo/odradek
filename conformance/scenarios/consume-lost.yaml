@@ -1,0 +1,26 @@
+name: consume-lost
+description: >-
+  Lost partitions are dropped at once: the app is told, acks for them are
+  swallowed, and the records it held are released.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 2}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 2}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0}, {offset: 1}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 0}, {offset: 1}]}
+    - event: {received: {lost: {partitions: [{topic: orders, partition: 0}]}}}
+      expect:
+        - lost: {partitions: [{topic: orders, partition: 0}]}
+        - transmit: {credits: {records: 2}}
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 0, lastOffset: 1}}

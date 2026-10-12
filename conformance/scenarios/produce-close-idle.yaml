@@ -1,0 +1,15 @@
+name: produce-close-idle
+description: >-
+  Closing with nothing outstanding completes the stream at once; with no
+  stream there is nothing to do, and the producer does not reconnect.
+produce:
+  setup: {sessionId: s1}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {open: {sessionId: s1}}
+    - event: {close: {}}
+      expect:
+        - halfClose: {}
+    - event: {streamEnded: {statusCode: OK}}
+    - event: {close: {}}
