@@ -138,6 +138,10 @@ class TelemetryE2eTest {
         "odradek.consume.records",
         "odradek.consume.streams",
         "odradek.ready",
+        // The Kafka clients' own: lag once the consumer has fetched, the producer's after a send.
+        "odradek.kafka.consumer.records.lag",
+        "odradek.kafka.consumer.connections",
+        "odradek.kafka.producer.request.latency.avg",
         topic,
         "group-" + id,
         "pod-" + id);

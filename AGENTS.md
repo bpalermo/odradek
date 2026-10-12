@@ -44,7 +44,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 - **Client behaviour.** Protocol logic belongs in the core, not in a language binding. A change to it needs a scenario in `conformance/scenarios/`, and both cores must pass: `//client/core:conformance_test` and `//client/python:conformance_test`.
 - **New message types.** The native image needs reflection metadata for them in `server/native-image/reachability-metadata.json`; `NativeMetadataTest` fails until it is there.
 - **Dependencies.** After editing `maven.install` in `MODULE.bazel`, run `REPIN=1 bazel run @maven//:pin`. gRPC, Netty and protobuf-java have one pin each, in `MODULE.bazel`; the Clojure and Python clients must not bring their own copies (`//client/clojure:classpath_test` checks).
-- **Metrics.** Every metric is declared in `ServerMetrics` and listed in `docs/design.md`. Names and attributes are a contract with dashboards: add, do not rename.
+- **Metrics.** Every metric is declared in `ServerMetrics`, or in `KafkaClientMetrics` when it is one of the Kafka clients' own, and listed in `docs/design.md`. Names and attributes are a contract with dashboards: add, do not rename.
 - **Version.** One version for everything, in `bazel/version.bzl`. Do not edit it by hand; the release workflow sets it from the tag with `scripts/set-version.sh`.
 - **Tests that create topics** must wait for partition leaders before producing (see `ServerHarness.createTopic`); producing sooner can wedge Kafka's idempotent producer for minutes.
 - **Design changes.** Update `docs/design.md` in the same change. A decision that constrains future work gets a new ADR in `docs/adr/`, in the format of the existing ones.

@@ -131,7 +131,7 @@ public final class Main {
 
     ClusterProducers producers;
     try {
-      producers = ClusterProducers.create(config, tls);
+      producers = ClusterProducers.create(config, tls, metrics);
     } catch (RuntimeException e) {
       LOG.error("configuration {} rejected: {}", file, e.getMessage());
       tls.close();
