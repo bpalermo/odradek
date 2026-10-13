@@ -125,6 +125,8 @@ public final class RequiredClusters {
    * One attempt with a client of its own, so that an address that did not resolve, which fails the
    * creation of a client, is retried like a broker that did not answer.
    */
+  // The cluster's name is part of the shape await() takes; this implementation has no use for it.
+  @SuppressWarnings("PMD.UnusedFormalParameter")
   private static void describe(String cluster, Map<String, Object> properties) throws Exception {
     Admin admin = Admin.create(properties);
     try {

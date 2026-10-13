@@ -24,14 +24,14 @@ final class ProduceErrors {
    */
   static ErrorCode classify(Throwable failure) {
     return switch (failure) {
-      case RecordTooLargeException e -> ErrorCode.ERROR_CODE_INVALID_RECORD;
-      case InvalidTopicException e -> ErrorCode.ERROR_CODE_INVALID_RECORD;
-      case SerializationException e -> ErrorCode.ERROR_CODE_INVALID_RECORD;
-      case UnknownTopicOrPartitionException e -> ErrorCode.ERROR_CODE_UNKNOWN_TOPIC_OR_PARTITION;
-      case AuthorizationException e -> ErrorCode.ERROR_CODE_AUTHORIZATION_FAILED;
-      case ProducerFencedException e -> ErrorCode.ERROR_CODE_FENCED;
-      case InvalidProducerEpochException e -> ErrorCode.ERROR_CODE_FENCED;
-      case KafkaException e -> ErrorCode.ERROR_CODE_OUTCOME_UNKNOWN;
+      case RecordTooLargeException _ -> ErrorCode.ERROR_CODE_INVALID_RECORD;
+      case InvalidTopicException _ -> ErrorCode.ERROR_CODE_INVALID_RECORD;
+      case SerializationException _ -> ErrorCode.ERROR_CODE_INVALID_RECORD;
+      case UnknownTopicOrPartitionException _ -> ErrorCode.ERROR_CODE_UNKNOWN_TOPIC_OR_PARTITION;
+      case AuthorizationException _ -> ErrorCode.ERROR_CODE_AUTHORIZATION_FAILED;
+      case ProducerFencedException _ -> ErrorCode.ERROR_CODE_FENCED;
+      case InvalidProducerEpochException _ -> ErrorCode.ERROR_CODE_FENCED;
+      case KafkaException _ -> ErrorCode.ERROR_CODE_OUTCOME_UNKNOWN;
       default -> ErrorCode.ERROR_CODE_INTERNAL;
     };
   }

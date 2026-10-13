@@ -1,6 +1,7 @@
 exports_files([
     ".bazelversion",
     "buf.yaml",
+    "pmd.xml",
     "ruff.toml",
 ])
 

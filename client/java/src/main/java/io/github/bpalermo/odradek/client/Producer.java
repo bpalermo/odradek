@@ -116,7 +116,7 @@ public final class Producer implements AutoCloseable {
             TimeUnit.NANOSECONDS.timedWait(lock, remaining);
           } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new BufferFullException("interrupted while waiting for room in the window");
+            throw new BufferFullException("interrupted while waiting for room in the window", e);
           }
         }
       }

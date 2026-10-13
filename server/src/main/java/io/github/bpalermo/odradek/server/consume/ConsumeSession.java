@@ -285,12 +285,11 @@ final class ConsumeSession implements ConsumerRebalanceListener, AppStream {
       case Credit credit -> credits += credit.records();
       case Acked acked -> applyAck(acked.ack());
       // Outside a revocation there is nothing to answer; a late RevokeDone is harmless.
-      case RevokeDone done -> {}
-      case HalfClose close -> exit = Status.OK;
-      case Cancel cancel -> exit = Status.CANCELLED;
+      case RevokeDone _ -> {}
+      case HalfClose _ -> exit = Status.OK;
+      case Cancel _ -> exit = Status.CANCELLED;
       case Fail fail -> exit = fail.status();
-      case Shutdown shutdown ->
-          exit = Status.UNAVAILABLE.withDescription("the server is shutting down");
+      case Shutdown _ -> exit = Status.UNAVAILABLE.withDescription("the server is shutting down");
     }
   }
 

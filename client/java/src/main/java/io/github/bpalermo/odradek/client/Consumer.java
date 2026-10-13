@@ -164,7 +164,7 @@ public final class Consumer implements AutoCloseable {
             listener.failed(failure.cause());
             return;
           }
-          case Stop stop -> {
+          case Stop _ -> {
             // close() puts Stop at the head of the queue, possibly ahead of a failure the app
             // has not been told about yet.
             for (Work pending : work) {

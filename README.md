@@ -55,7 +55,7 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 | Build the Python wheel | `bazel build //client/python:wheel` (pure Python, with the generated API code; in `bazel-bin/client/python/odradek-<version>-py3-none-any.whl`). Nothing uploads it. |
 | Re-lock Python dependencies | `uv pip compile --universal --generate-hashes --python-version 3.13 --no-header client/python/requirements.in -o client/python/requirements_lock.txt` after editing `requirements.in` (needs [uv](https://docs.astral.sh/uv/)), then `bazel mod deps` to update `MODULE.bazel.lock` |
 
-Formatting covers Java (google-java-format), Python (ruff), Starlark (buildifier, including its lint) and protobuf (buf). Java is linted by Error Prone inside every `javac` action, with warnings as errors for first-party code; protos are linted by buf and Python by ruff (`ruff.toml`).
+Formatting covers Java (google-java-format), Python (ruff), Starlark (buildifier, including its lint) and protobuf (buf). Java is linted by Error Prone inside every `javac` action, with warnings as errors for first-party code and by PMD as a `rules_lint` aspect (`pmd.xml`); protos are linted by buf and Python by ruff (`ruff.toml`).
 
 ## Versions and Maven artifacts
 

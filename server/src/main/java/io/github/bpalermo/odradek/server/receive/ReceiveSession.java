@@ -466,10 +466,10 @@ final class ReceiveSession implements AppStream {
     switch (event) {
       case AppCredit credit -> split.appGranted(credit.records());
       case AppAck acked -> acked(acked.ack());
-      case AppHalfClose close -> exit = Status.OK;
-      case AppCancel cancel -> exit = Status.CANCELLED;
+      case AppHalfClose _ -> exit = Status.OK;
+      case AppCancel _ -> exit = Status.CANCELLED;
       case AppFail fail -> exit = fail.status();
-      case Stop stop -> exit = Status.UNAVAILABLE.withDescription("the server is shutting down");
+      case Stop _ -> exit = Status.UNAVAILABLE.withDescription("the server is shutting down");
       case FromDispatcher message -> received(message.link(), message.response());
       case LinkEnded ended -> ended(ended.link(), ended.status());
     }
