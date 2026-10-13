@@ -55,6 +55,11 @@ message ServerConfig {
     expression: "this.dispatch.policy.all(rule, rule.cluster in this.clusters)"
   };
   option (buf.validate.message).cel = {
+    id: "server_config.coordination_cluster_exists"
+    message: "dispatch.coordination.cluster must reference an entry in clusters, and must be set when there are several"
+    expression: "!has(this.dispatch) || (this.dispatch.coordination.cluster != '' ? this.dispatch.coordination.cluster in this.clusters : size(this.clusters) == 1)"
+  };
+  option (buf.validate.message).cel = {
     id: "server_config.default_codec_exists"
     message: "default_codec must be passthrough or reference an entry in codecs"
     expression: "this.default_codec == '' || this.default_codec == 'passthrough' || this.default_codec in this.codecs"
@@ -176,8 +181,14 @@ message Dispatch {
   // The address, as host:port, at which sidecars reach this replica. The
   // other replicas hand it to every sidecar, which connects to it as given,
   // so it must be this replica's own address and not that of a Service in
-  // front of all of them. Default: the address of the pod's network
-  // interface, with `port`. Not hot-reloadable.
+  // front of all of them. It is therefore different in every replica: set it
+  // only in a configuration that one replica reads, which is to say in tests.
+  // Replicas that share a configuration file leave it unset and, when the
+  // default is not the address sidecars can reach, are each given their host
+  // in the environment variable ODRADEK_ADVERTISED_HOST (in Kubernetes, from
+  // the pod's `status.podIP`), to which the port being served is added.
+  // Setting both is an error. Default: the address of the pod's network
+  // interface, with the port being served. Not hot-reloadable.
   string advertised_address = 2 [(buf.validate.field).string.host_and_port = true];
   // How long the dispatcher keeps consuming a topic after the last sidecar
   // that declared it has gone. It keeps a rollout of the application, during
@@ -214,6 +225,39 @@ message Dispatch {
   // tests and for a machine nobody else can reach, and the server says so
   // loudly every time it starts. Not hot-reloadable.
   ListenerTls tls = 6;
+  // How the replicas of this dispatcher find each other. Required.
+  Coordination coordination = 7 [(buf.validate.field).required = true];
+}
+
+// Coordination names the Kafka consumer group through which the replicas of
+// one dispatcher find each other. Every replica joins it when it starts and
+// attaches the address it advertises; the group's membership is the list of
+// replicas that every sidecar is sent, and it changes when a replica starts
+// or stops. The group consumes nothing, subscribes to no topic and commits no
+// offset. It uses Kafka's classic group protocol whatever the cluster's
+// properties say, because the addresses travel through a client-side
+// assignor.
+//
+// Whoever can join this group can add an address to the list sidecars are
+// sent. On a cluster with ACLs, allow only the dispatcher's principal to
+// read the group; and have sidecars accept the dispatcher by SPIFFE ID
+// (Tls.accepted_spiffe_ids under Dispatcher.tls) rather than by trust
+// domain, so that an address added by anybody else is connected to and then
+// refused.
+message Coordination {
+  // Name of an entry in ServerConfig.clusters: the cluster the group lives
+  // on. Every replica must name the same one. May be left unset when there is
+  // exactly one cluster. Not hot-reloadable; changing it with a rolling
+  // update splits the replicas into two lists until the update is complete.
+  string cluster = 1;
+  // The consumer group. It must be this dispatcher's alone: two dispatcher
+  // deployments that shared a group on one cluster would hand their sidecars
+  // each other's replicas. Required. Not hot-reloadable; changing it splits
+  // the replicas as changing `cluster` does.
+  string group_id = 2 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).string.min_len = 1
+  ];
 }
 
 // ListenerTls configures the credentials of a port the server listens on

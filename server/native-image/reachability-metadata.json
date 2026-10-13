@@ -602,6 +602,14 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Coordination"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.Coordination$Builder"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.config.v1.Dispatch"
     },
     {
@@ -1127,6 +1135,15 @@
     {
       "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.kafka.v1.TopicPartition$Builder"
+    },
+    {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "io.github.bpalermo.odradek.server.dispatch.ReplicaAssignor"
     },
     {
       "methods": [

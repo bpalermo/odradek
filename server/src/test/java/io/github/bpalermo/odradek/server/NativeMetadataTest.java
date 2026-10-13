@@ -114,6 +114,18 @@ class NativeMetadataTest {
   }
 
   @Test
+  void theClassesKafkaMakesFromTheirNamesAreRegistered() {
+    // Named in a client's configuration by the server itself, and instantiated by Kafka through
+    // reflection: the assignor of the coordination group among them.
+    assertThat(TYPES)
+        .contains(
+            "io.github.bpalermo.odradek.server.dispatch.ReplicaAssignor",
+            "io.github.bpalermo.odradek.server.telemetry.KafkaMetricsReporter",
+            "io.github.bpalermo.odradek.server.tls.ReloadingSslEngineFactory",
+            "org.apache.kafka.clients.consumer.CooperativeStickyAssignor");
+  }
+
+  @Test
   void everyFirstPartyAndKafkaTypeNamedExists() throws ClassNotFoundException {
     for (String type : TYPES) {
       if (type.startsWith("io.github.bpalermo.")

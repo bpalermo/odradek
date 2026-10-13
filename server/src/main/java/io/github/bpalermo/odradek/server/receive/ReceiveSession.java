@@ -77,10 +77,44 @@ final class ReceiveSession implements AppStream {
   /** Rejections are logged at most this often per topic. */
   private static final long REJECT_LOG_NANOS = TimeUnit.SECONDS.toNanos(10);
 
-  /** Opens the connection to one address, as host:port. Tests substitute in-process channels. */
+  /**
+   * Where a session gets its connections, by address as host:port. A session asks once for each
+   * address it uses and gives each connection back when it has no stream left for it. Tests
+   * substitute in-process channels.
+   */
   @FunctionalInterface
   interface Channels {
+    /** A connection to this address for one session to open streams on. */
     ManagedChannel connect(String address);
+
+    /**
+     * The session has no more use for the connection it was given: every stream it opened on it has
+     * ended or is half-closed. Here the connection was the session's own, and is closed once those
+     * streams have ended.
+     */
+    default void release(String address, ManagedChannel channel) {
+      channel.shutdown();
+    }
+
+    /**
+     * The session ends and has released these connections: waits up to {@code timeout} for the
+     * dispatcher to close the streams that were half-closed on them. Here they were the session's
+     * own, and what is left after that is cut.
+     */
+    default void drained(Collection<ManagedChannel> released, Duration timeout) {
+      long deadline = System.nanoTime() + timeout.toNanos();
+      for (ManagedChannel channel : released) {
+        try {
+          if (!channel.awaitTermination(
+              Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+            channel.shutdownNow();
+          }
+        } catch (InterruptedException e) {
+          channel.shutdownNow();
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
   }
 
   /**
@@ -1055,8 +1089,8 @@ final class ReceiveSession implements AppStream {
         all.hasNext(); ) {
       Map.Entry<String, ManagedChannel> entry = all.next();
       if (!used.contains(entry.getKey())) {
-        // Not shutdownNow: a stream just closed on it finishes in good order.
-        entry.getValue().shutdown();
+        // Not cut: a stream just closed on it finishes in good order.
+        connector.release(entry.getKey(), entry.getValue());
         all.remove();
       }
     }
@@ -1091,19 +1125,8 @@ final class ReceiveSession implements AppStream {
         call.onError(end.asRuntimeException());
       }
     }
-    channels.values().forEach(ManagedChannel::shutdown);
-    long deadline = System.nanoTime() + options.drain().toNanos();
-    for (ManagedChannel channel : channels.values()) {
-      try {
-        if (!channel.awaitTermination(
-            Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
-          channel.shutdownNow();
-        }
-      } catch (InterruptedException e) {
-        channel.shutdownNow();
-        Thread.currentThread().interrupt();
-      }
-    }
+    channels.forEach(connector::release);
+    connector.drained(List.copyOf(channels.values()), options.drain());
     channels.clear();
   }
 }

@@ -185,6 +185,7 @@ class DeliveryTlsTest {
             },
             System::nanoTime);
     delivery = DeliveryServer.start(config.getDispatch(), service, listenerCredentials);
+    service.replicas(ReplicaAssignor.self(delivery.advertisedAddress(), 1));
   }
 
   @AfterEach

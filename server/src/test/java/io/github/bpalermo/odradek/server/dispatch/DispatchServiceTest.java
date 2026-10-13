@@ -21,6 +21,7 @@ import io.github.bpalermo.odradek.delivery.v1.Record;
 import io.github.bpalermo.odradek.delivery.v1.RecordBatch;
 import io.github.bpalermo.odradek.delivery.v1.Reject;
 import io.github.bpalermo.odradek.delivery.v1.Replica;
+import io.github.bpalermo.odradek.delivery.v1.ReplicaList;
 import io.github.bpalermo.odradek.delivery.v1.Settings;
 import io.github.bpalermo.odradek.server.Version;
 import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
@@ -188,6 +189,14 @@ class DispatchServiceTest {
   }
 
   private void start(ServerConfig.Builder config) throws Exception {
+    start(config, true);
+  }
+
+  /**
+   * @param joined whether the replica has been told its replicas, as it is once it has joined the
+   *     coordination group
+   */
+  private void start(ServerConfig.Builder config, boolean joined) throws Exception {
     service =
         new DispatchService(
             config.build(),
@@ -201,6 +210,10 @@ class DispatchServiceTest {
             },
             System::nanoTime);
     service.advertise("10.1.2.3:9465");
+    if (joined) {
+      // What the coordination group would have settled on with one replica.
+      service.replicas(ReplicaAssignor.self("10.1.2.3:9465", 1));
+    }
     String name = InProcessServerBuilder.generateName();
     server = InProcessServerBuilder.forName(name).addService(service).build().start();
     channel = InProcessChannelBuilder.forName(name).build();
@@ -373,6 +386,68 @@ class DispatchServiceTest {
     assertThat(accepted.getAddress()).isEqualTo("10.1.2.3:9465");
     assertThat(accepted.getDispatcher().getVersion()).isEqualTo(Version.VERSION).isNotEmpty();
     eventually("subscribed", () -> consumers.get(0).subscriptions.contains(Set.of("orders")));
+  }
+
+  private static ReplicaList list(long generation, String... addresses) {
+    ReplicaList.Builder list = ReplicaList.newBuilder().setGeneration(generation);
+    for (String address : addresses) {
+      list.addReplicas(Replica.newBuilder().setAddress(address));
+    }
+    return list.build();
+  }
+
+  @Test
+  void aReplicaThatDoesNotKnowItsReplicasYetRefusesDeclarationsForTheTimeBeing() throws Exception {
+    // It has a port and an address, and has not joined the coordination group: answering with
+    // itself alone would have the sidecar miss the partitions of every other replica.
+    start(config(), false);
+    Sidecar early = stream();
+    early.declare(declare("orders"));
+    Status status = early.status();
+    assertThat(status.getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(consumers).isEmpty();
+
+    service.replicas(list(4, "10.1.2.3:9465", "10.1.2.4:9465"));
+    Sidecar sidecar = stream();
+    sidecar.declare(declare("orders"));
+    assertThat(sidecar.accepted().getReplicas())
+        .isEqualTo(list(4, "10.1.2.3:9465", "10.1.2.4:9465"));
+  }
+
+  @Test
+  void aNewListOfReplicasIsSentOnEveryOpenStreamAndAnswersTheNextHandshake() throws Exception {
+    start(config());
+    // Two topics of one group and a second group: every stream there is, whoever owns it.
+    Sidecar orders = declared(declare("orders"));
+    Sidecar payments = declared(declare("payments"));
+    Sidecar other = declared(declare("orders").setGroupId("audit"));
+
+    ReplicaList two = list(2, "10.1.2.3:9465", "10.1.2.4:9465");
+    service.replicas(two);
+    for (Sidecar sidecar : List.of(orders, payments, other)) {
+      DeliverResponse response = sidecar.next();
+      assertThat(response.hasReplicas()).as("%s", response).isTrue();
+      assertThat(response.getReplicas()).isEqualTo(two);
+    }
+
+    // A sidecar that connects now is answered with the same list, by a replica that still gives
+    // its own address as the one it was reached at.
+    Accepted accepted = declaredAccepted(declare("orders"));
+    assertThat(accepted.getReplicas()).isEqualTo(two);
+    assertThat(accepted.getAddress()).isEqualTo("10.1.2.3:9465");
+
+    // A replica that left: the list shrinks under a higher generation.
+    ReplicaList one = list(3, "10.1.2.3:9465");
+    service.replicas(one);
+    assertThat(orders.next().getReplicas()).isEqualTo(one);
+    assertThat(payments.next().getReplicas()).isEqualTo(one);
+    assertThat(other.next().getReplicas()).isEqualTo(one);
+  }
+
+  private Accepted declaredAccepted(Declare.Builder declare) throws InterruptedException {
+    Sidecar sidecar = stream();
+    sidecar.declare(declare);
+    return sidecar.accepted();
   }
 
   @Test

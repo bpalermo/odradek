@@ -15,6 +15,7 @@ import io.github.bpalermo.odradek.server.config.ConfigLoader;
 import io.github.bpalermo.odradek.server.consume.ConsumeService;
 import io.github.bpalermo.odradek.server.dispatch.DeliveryServer;
 import io.github.bpalermo.odradek.server.dispatch.DispatchService;
+import io.github.bpalermo.odradek.server.dispatch.Membership;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
@@ -170,6 +171,7 @@ public final class Main {
     OdradekServer server = null;
     DispatchService dispatch = null;
     DeliveryServer delivery = null;
+    Membership membership = null;
     try {
       readiness.starting("listening");
       if (servesApp(config)) {
@@ -180,6 +182,12 @@ public final class Main {
       if (config.hasDispatch()) {
         dispatch = new DispatchService(config, tls, metrics);
         delivery = DeliveryServer.start(config.getDispatch(), dispatch, tls);
+        // The replicas find each other through a consumer group. Until this one is a member and
+        // knows the others it refuses every declaration, and it is not ready: the Service must
+        // not send it a sidecar it would answer with less than every replica.
+        membership =
+            Membership.start(
+                config, tls, metrics, delivery.advertisedAddress(), dispatch::replicas);
       }
     } catch (IOException | CredentialException e) {
       LOG.error("could not start", e);
@@ -195,7 +203,13 @@ public final class Main {
     OdradekServer app = server;
     DispatchService dispatcher = dispatch;
     DeliveryServer sidecars = delivery;
-    readiness.started(tls);
+    Membership replicas = membership;
+    if (replicas != null) {
+      readiness.starting(
+          "joining coordination group " + replicas.group() + " on cluster " + replicas.cluster());
+    } else {
+      readiness.started(tls);
+    }
     metrics.observe(tls, readiness, Clock.systemUTC());
     LOG.info("server epoch {}", produce.serverEpoch());
     Runtime.getRuntime()
@@ -219,6 +233,9 @@ public final class Main {
                   receive.close();
                   if (dispatcher != null) {
                     dispatcher.shutdown(dispatcher.shutdownTimeout());
+                    // Only now: a sidecar closes its streams to a replica that is no longer
+                    // listed, and until here they carried the acknowledgements waited for.
+                    replicas.close();
                     sidecars.close();
                   }
                   if (app != null) {
@@ -232,6 +249,20 @@ public final class Main {
                   telemetry.close();
                 },
                 "shutdown"));
+    if (replicas != null) {
+      // After the shutdown hook, so that a replica told to stop while it waits still stops in
+      // good order. It waits as long as it takes, as for a required cluster: the startup probe's
+      // failure threshold is what bounds it.
+      LOG.info("joining coordination group {} on cluster {}", replicas.group(), replicas.cluster());
+      while (!replicas.awaitJoined(Duration.ofSeconds(30))) {
+        LOG.warn(
+            "still joining coordination group {} on cluster {}: every declaration is refused"
+                + " until then",
+            replicas.group(),
+            replicas.cluster());
+      }
+      readiness.started(tls);
+    }
     if (app != null) {
       app.awaitTermination();
     } else {

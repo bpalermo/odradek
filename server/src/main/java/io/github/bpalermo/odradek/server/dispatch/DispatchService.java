@@ -9,7 +9,6 @@ import io.github.bpalermo.odradek.delivery.v1.DeliverRequest;
 import io.github.bpalermo.odradek.delivery.v1.DeliverResponse;
 import io.github.bpalermo.odradek.delivery.v1.DeliveryServiceGrpc;
 import io.github.bpalermo.odradek.delivery.v1.PeerInfo;
-import io.github.bpalermo.odradek.delivery.v1.Replica;
 import io.github.bpalermo.odradek.delivery.v1.ReplicaList;
 import io.github.bpalermo.odradek.server.Version;
 import io.github.bpalermo.odradek.server.consume.ConsumeService;
@@ -166,7 +165,13 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
 
   private boolean stopping;
 
-  /** What every handshake answers, but for the settings; null until {@link #advertise}. */
+  /** Where sidecars reach this replica; null until {@link #advertise}. Guarded by the lock. */
+  private String advertised;
+
+  /**
+   * What every handshake answers, but for the settings: the newest list of replicas and this
+   * replica's own address. Null until the first list is known ({@link #replicas}).
+   */
   private volatile Accepted accepted;
 
   public DispatchService(ServerConfig config, TlsSources tls, ServerMetrics metrics) {
@@ -215,21 +220,45 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
   }
 
   /**
-   * Says where sidecars reach this replica, once its listener is bound: what {@code Accepted} tells
-   * them. The list is this replica alone, under one generation that never changes, until the
-   * replicas know of each other (step 6 of the ADR's plan). Declarations are refused with
-   * UNAVAILABLE until this is called.
+   * Says where sidecars reach this replica, once its listener is bound: the address {@code
+   * Accepted} gives as its own, which is also how the replica appears in the lists. Declarations
+   * are still refused with UNAVAILABLE until the first list arrives ({@link #replicas}): a replica
+   * that answered with itself alone would have its sidecars miss the partitions of the others.
    */
   public void advertise(String address) {
-    accepted =
-        Accepted.newBuilder()
-            .setReplicas(
-                ReplicaList.newBuilder()
-                    .setGeneration(1)
-                    .addReplicas(Replica.newBuilder().setAddress(address)))
-            .setDispatcher(PeerInfo.newBuilder().setVersion(Version.VERSION))
-            .setAddress(address)
-            .build();
+    synchronized (lock) {
+      advertised = address;
+    }
+  }
+
+  /**
+   * The dispatcher's replicas changed, or are known for the first time: {@code list} is what the
+   * coordination group settled on ({@link Membership}). From here on every handshake answers with
+   * it, and it is sent on every open stream, so that each sidecar opens a stream to a replica that
+   * started and closes those to one that is gone.
+   */
+  public void replicas(ReplicaList list) {
+    List<DispatchGroup> open;
+    synchronized (lock) {
+      if (advertised == null) {
+        throw new IllegalStateException("the replicas are known before this one's own address");
+      }
+      accepted =
+          Accepted.newBuilder()
+              .setReplicas(list)
+              .setDispatcher(PeerInfo.newBuilder().setVersion(Version.VERSION))
+              .setAddress(advertised)
+              .build();
+      // After `accepted`, under the lock declarations are queued under: a stream that joins a
+      // group before this is queued there is sent the list; one that joins after is answered
+      // with it.
+      open = List.copyOf(running.keySet());
+      open.forEach(group -> group.submit(new DispatchGroup.Announce(list)));
+    }
+    LOG.info(
+        "the dispatcher's replicas, generation {}: {}",
+        Long.toUnsignedString(list.getGeneration()),
+        ReplicaAssignor.addresses(list));
   }
 
   @Override

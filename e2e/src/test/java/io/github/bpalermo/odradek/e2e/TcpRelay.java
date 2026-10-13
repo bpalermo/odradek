@@ -8,6 +8,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * A TCP port that stays where it is while what is behind it comes and goes: what the address of a
@@ -15,13 +16,17 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>A dispatcher under test listens on a port the system picks, so a restarted one is somewhere
  * else, and one that has not started is nowhere. Sidecars are configured with this relay's port
- * instead. Connections are passed on, byte for byte, to the port set with {@link #target}; while
- * there is none, or nothing listens there, a connection is closed at once.
+ * instead. Connections are passed on, byte for byte, to one of the ports set with {@link #target},
+ * each new connection to the next of them, as a Service spreads connections over its pods; a port
+ * where nothing listens is passed over. While there is none, or nothing listens at any, a
+ * connection is closed at once.
  */
 final class TcpRelay implements Closeable {
   private final ServerSocket server;
   private final Set<Socket> open = ConcurrentHashMap.newKeySet();
-  private volatile int target = -1;
+  private volatile int[] targets = {};
+  private int next;
+  private final AtomicInteger accepted = new AtomicInteger();
 
   TcpRelay() throws IOException {
     server = new ServerSocket(0);
@@ -35,9 +40,17 @@ final class TcpRelay implements Closeable {
     return server.getLocalPort();
   }
 
-  /** Passes new connections on to this local port; -1 refuses them. */
-  void target(int port) {
-    target = port;
+  /** Passes new connections on to these local ports, in turn; none, or -1, refuses them. */
+  void target(int... ports) {
+    targets = ports.length == 1 && ports[0] < 0 ? new int[0] : ports.clone();
+  }
+
+  /**
+   * How many connections were made to this port so far, passed on or not: whether anything came
+   * back to the address of the Service.
+   */
+  int accepted() {
+    return accepted.get();
   }
 
   private void accept() {
@@ -48,14 +61,22 @@ final class TcpRelay implements Closeable {
       } catch (IOException e) {
         return;
       }
-      int port = target;
+      accepted.incrementAndGet();
+      int[] ports = targets;
       Socket out = null;
-      try {
-        if (port < 0) {
-          in.close();
-          continue;
+      // The next backend in turn, and after it the others, until one answers.
+      for (int attempt = 0; attempt < ports.length && out == null; attempt++) {
+        try {
+          out = new Socket("localhost", ports[Math.floorMod(next++, ports.length)]);
+        } catch (IOException e) {
+          // Nothing listens there, as behind a Service whose pod has just gone.
         }
-        out = new Socket("localhost", port);
+      }
+      if (out == null) {
+        closeQuietly(in);
+        continue;
+      }
+      try {
         in.setTcpNoDelay(true);
         out.setTcpNoDelay(true);
       } catch (IOException e) {

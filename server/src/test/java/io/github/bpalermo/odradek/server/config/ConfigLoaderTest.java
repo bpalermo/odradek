@@ -91,6 +91,8 @@ class ConfigLoaderTest {
           properties:
             bootstrap.servers: orders-kafka:9093
       dispatch:
+        coordination:
+          groupId: odradek-dispatcher
         port: 9465
         advertisedAddress: 10.0.0.7:9465
         idleGrace: 600s
@@ -255,6 +257,8 @@ class ConfigLoaderTest {
                 properties:
                   bootstrap.servers: k:9092
             dispatch:
+              coordination:
+                groupId: odradek-dispatcher
               tls:
                 files:
                   dir: /etc/odradek/delivery

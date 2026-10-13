@@ -21,9 +21,19 @@ import io.netty.channel.epoll.EpollSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import java.io.Closeable;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -54,6 +64,110 @@ public final class ReceiveService implements DispatcherSource, Closeable {
    * second time.
    */
   private static final int MAX_MESSAGE_BYTES = 256 << 20;
+
+  /**
+   * The connections to the dispatcher, shared by every Consume stream of this server: one to each
+   * address, the Service's and each replica's, for as long as a stream uses it. A pod with several
+   * Consume streams, or several topics on one, therefore makes one TLS handshake per replica and
+   * not one per stream; each stream still has Deliver streams of its own on it.
+   */
+  static final class Pool implements ReceiveSession.Channels {
+    /** One connection and how many sessions hold it. */
+    private static final class Shared {
+      final ManagedChannel channel;
+      int users;
+
+      Shared(ManagedChannel channel) {
+        this.channel = channel;
+      }
+    }
+
+    private final Function<String, ManagedChannel> connect;
+    private final ScheduledExecutorService timer;
+    private final Duration drain;
+    private final Map<String, Shared> shared = new HashMap<>();
+
+    /** Given back by their last session: closing in good order, and cut if that takes too long. */
+    private final Set<ManagedChannel> closing = new HashSet<>();
+
+    /**
+     * @param connect makes the connection to an address
+     * @param timer runs what cuts a connection that does not close
+     * @param drain how long a connection nobody uses any more is given to close in good order
+     */
+    Pool(Function<String, ManagedChannel> connect, ScheduledExecutorService timer, Duration drain) {
+      this.connect = connect;
+      this.timer = timer;
+      this.drain = drain;
+    }
+
+    @Override
+    public synchronized ManagedChannel connect(String address) {
+      Shared entry = shared.get(address);
+      if (entry == null) {
+        entry = new Shared(connect.apply(address));
+        shared.put(address, entry);
+      }
+      entry.users++;
+      return entry.channel;
+    }
+
+    @Override
+    public synchronized void release(String address, ManagedChannel channel) {
+      Shared entry = shared.get(address);
+      if (entry == null || entry.channel != channel) {
+        throw new IllegalStateException("a connection to " + address + " was given back twice");
+      }
+      if (--entry.users > 0) {
+        return;
+      }
+      shared.remove(address);
+      // The streams half-closed on it end when the dispatcher answers; one that never does must
+      // not keep the connection for ever.
+      channel.shutdown();
+      closing.add(channel);
+      try {
+        timer.schedule(() -> cut(channel), drain.toMillis(), TimeUnit.MILLISECONDS);
+      } catch (RejectedExecutionException e) {
+        // The server is stopping and its event loop with it: nothing is left to wait for.
+        cut(channel);
+      }
+    }
+
+    private synchronized void cut(ManagedChannel channel) {
+      if (closing.remove(channel)) {
+        channel.shutdownNow();
+      }
+    }
+
+    /** The connections close by themselves, in good order; {@link #close} waits for them. */
+    @Override
+    public void drained(Collection<ManagedChannel> released, Duration timeout) {}
+
+    /** The server stops: waits a moment for the connections that are closing, then cuts all. */
+    void close() {
+      List<ManagedChannel> all = new ArrayList<>();
+      synchronized (this) {
+        shared.values().forEach(entry -> all.add(entry.channel));
+        shared.clear();
+        all.addAll(closing);
+        closing.clear();
+      }
+      all.forEach(ManagedChannel::shutdown);
+      long deadline = System.nanoTime() + drain.toNanos();
+      for (ManagedChannel channel : all) {
+        try {
+          if (!channel.awaitTermination(
+              Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
+            channel.shutdownNow();
+          }
+        } catch (InterruptedException e) {
+          channel.shutdownNow();
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
+  }
 
   private final ReceiveSession.Options options;
   private final ServerMetrics metrics;
@@ -113,7 +227,8 @@ public final class ReceiveService implements DispatcherSource, Closeable {
     ReceiveSession.Options options =
         new ReceiveSession.Options(
             address, Version.VERSION, REJECT_PAUSE, DRAIN, System::nanoTime, Backoff::new);
-    return new ReceiveService(options, metrics, target -> connect(target, loops, context), loops);
+    return new ReceiveService(
+        options, metrics, new Pool(target -> connect(target, loops, context), loops, DRAIN), loops);
   }
 
   private static String accepted(PeerPolicy policy) {
@@ -132,7 +247,8 @@ public final class ReceiveService implements DispatcherSource, Closeable {
   }
 
   /**
-   * The one place a connection to a dispatcher is made, bootstrap address and replicas alike.
+   * The one place a connection to a dispatcher is made, bootstrap address and replicas alike, and
+   * it is made once per address: see {@link Pool}.
    *
    * @param context the TLS context of {@code dispatcher.tls}, or null for plaintext. It is asked
    *     for an engine at every connection, with the credentials of that moment, and verifies the
@@ -177,9 +293,16 @@ public final class ReceiveService implements DispatcherSource, Closeable {
         metrics);
   }
 
-  /** Releases the event loop. The streams must have ended: see {@code ConsumeService.shutdown}. */
+  /**
+   * Closes the connections to the dispatcher, giving it a moment to close the streams the Consume
+   * streams half-closed, and releases the event loop. The streams must have ended: see {@code
+   * ConsumeService.shutdown}.
+   */
   @Override
   public void close() {
+    if (connector instanceof Pool pool) {
+      pool.close();
+    }
     if (loops != null) {
       loops.shutdownGracefully(0, 1, TimeUnit.SECONDS);
     }

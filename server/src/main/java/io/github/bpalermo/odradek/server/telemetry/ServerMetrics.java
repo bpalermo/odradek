@@ -1,5 +1,6 @@
 package io.github.bpalermo.odradek.server.telemetry;
 
+import io.github.bpalermo.odradek.delivery.v1.ReplicaList;
 import io.github.bpalermo.odradek.server.admin.Readiness;
 import io.github.bpalermo.odradek.server.tls.CredentialSource;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
@@ -12,6 +13,7 @@ import io.opentelemetry.api.metrics.Meter;
 import java.time.Clock;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * Every metric the server reports, in one place; the Kafka clients' own are listed in {@link
@@ -321,6 +323,33 @@ public final class ServerMetrics {
   /** The receiving-side metrics of one topic of one group on one cluster. */
   public ReceiveTopic receiveTopic(String cluster, String group, String topic) {
     return new ReceiveTopic(cluster, group, topic);
+  }
+
+  /**
+   * Reports, on every collection, the list of replicas a dispatcher replica holds: how many they
+   * are and the list's generation. The replicas of one dispatcher should agree on both; one that
+   * reports fewer replicas, or an older generation, than the others for long has fallen out of the
+   * coordination group named by the attributes.
+   */
+  public void observeReplicas(String cluster, String group, Supplier<ReplicaList> current) {
+    Attributes attributes = Attributes.of(CLUSTER, cluster, GROUP, group);
+    meter
+        .gaugeBuilder("odradek.dispatch.replicas")
+        .ofLongs()
+        .setDescription(
+            "Dispatcher replicas in the list this replica holds and sends to sidecars; 0 until"
+                + " it has joined the coordination group.")
+        .setUnit("{replica}")
+        .buildWithCallback(
+            measurement -> measurement.record(current.get().getReplicasCount(), attributes));
+    meter
+        .gaugeBuilder("odradek.dispatch.replicas.generation")
+        .ofLongs()
+        .setDescription(
+            "Generation of the list of replicas this replica holds. It grows with every change of"
+                + " the dispatcher's replicas.")
+        .buildWithCallback(
+            measurement -> measurement.record(current.get().getGeneration(), attributes));
   }
 
   /**

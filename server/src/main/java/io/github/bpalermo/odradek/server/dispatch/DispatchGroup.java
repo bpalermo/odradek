@@ -6,6 +6,7 @@ import io.github.bpalermo.odradek.delivery.v1.Accepted;
 import io.github.bpalermo.odradek.delivery.v1.DeliverResponse;
 import io.github.bpalermo.odradek.delivery.v1.OffsetReset;
 import io.github.bpalermo.odradek.delivery.v1.Record;
+import io.github.bpalermo.odradek.delivery.v1.ReplicaList;
 import io.github.bpalermo.odradek.delivery.v1.Settings;
 import io.github.bpalermo.odradek.kafka.v1.Header;
 import io.github.bpalermo.odradek.server.dispatch.Declarations.Declared;
@@ -142,7 +143,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   }
 
   /** Something a stream, or the dispatcher, asks of the group's thread. */
-  sealed interface Command permits Join, Credit, Acked, Reject, Leave, Shutdown {}
+  sealed interface Command permits Join, Credit, Acked, Reject, Leave, Announce, Shutdown {}
 
   /** A declaration that is well formed and names this group. */
   record Join(Stream stream) implements Command {}
@@ -159,6 +160,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
    * sidecar already has.
    */
   record Leave(Stream stream, Status status) implements Command {}
+
+  /** The dispatcher's replicas changed: every stream is sent the new list. */
+  record Announce(ReplicaList replicas) implements Command {}
 
   /** The dispatcher is stopping. */
   record Shutdown() implements Command {}
@@ -446,6 +450,17 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       case Leave leave -> {
         left(leave.stream());
         end(leave.stream(), leave.status());
+      }
+      case Announce announce -> {
+        // Handled while partitions are handed over too: a sidecar learns of a replica that
+        // started without waiting for the group it made rebalance.
+        DeliverResponse response =
+            DeliverResponse.newBuilder().setReplicas(announce.replicas()).build();
+        for (Topic topic : topics.values()) {
+          for (Stream stream : topic.receivers.values()) {
+            send(stream, response);
+          }
+        }
       }
       case Shutdown shutdown -> stopping = true;
     }

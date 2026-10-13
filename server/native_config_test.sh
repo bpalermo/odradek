@@ -207,17 +207,23 @@ grep -q "acks must be all" violations.log || fail "violations: the CEL rule on a
 
 # A dispatcher (ADR 6) with neither producers nor consumers and no TLS: it serves the delivery
 # port, says that the port is open to whoever reaches it, and does not open the socket of an app
-# that is not there. (With TLS it is the end-to-end suite's: that needs certificates.)
+# that is not there. (With TLS it is the end-to-end suite's: that needs certificates.) No broker
+# answers at its cluster's address, so it never joins its coordination group and is never ready:
+# told to stop while it waits, it must still stop in good order.
 config dispatch <<'EOF'
 clusters:
   main:
     properties:
-      bootstrap.servers: localhost:9092
+      bootstrap.servers: localhost:1
 dispatch:
   port: 0
+  coordination:
+    groupId: odradek-native-config-test
 EOF
-runs dispatch "delivery service on port [0-9]*, advertised as .*, PLAINTEXT" \
+runs dispatch "joining coordination group odradek-native-config-test on cluster main" \
   "delivery service stopped"
+grep -q "delivery service on port [0-9]*, advertised as .*, PLAINTEXT" dispatch.log ||
+  fail "dispatch: did not serve the delivery port"
 grep -q "THE DELIVERY PORT IS PLAINTEXT AND UNAUTHENTICATED" dispatch.log ||
   fail "dispatch: no warning about the plaintext port"
 [ ! -e dispatch.sock ] || fail "dispatch: opened the app's socket"
@@ -231,6 +237,8 @@ clusters:
       bootstrap.servers: localhost:9092
 dispatch:
   port: 0
+  coordination:
+    groupId: odradek-native-config-test
   policy:
     - trustDomain: example.org
       cluster: main
@@ -247,6 +255,8 @@ clusters:
       bootstrap.servers: localhost:9092
 dispatch:
   port: 0
+  coordination:
+    groupId: odradek-native-config-test
   tls:
     files:
       dir: /nonexistent/odradek-delivery
@@ -318,6 +328,7 @@ for message in \
   "dispatcher must be set when a consumer's source is CONSUMER_SOURCE_DISPATCHER" \
   "dead_letter_topic must be set when on_exhausted is ON_EXHAUSTED_DEAD_LETTER" \
   "dispatch.advertised_address: " \
+  "dispatch.coordination: " \
   'dispatch.policy\[0\].topics\[0\]: '; do
   grep -q -- "${message}" dispatch-violations.log ||
     fail "dispatch-violations: expected '${message}' in the log"
