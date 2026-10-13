@@ -43,6 +43,7 @@ import java.util.function.Consumer;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -832,7 +833,8 @@ class ReceiveE2eTest {
                     FAILING_CODEC,
                     "codec: text",
                     "ordering: ORDERING_PARTITION",
-                    "maxAttempts: 2")))
+                    "maxAttempts: 2",
+                    "redeliveryBackoff: 0.2s")))
             .working();
     app.credits(10);
     produce(topic, 0, "good-1", null);
@@ -861,6 +863,55 @@ class ReceiveE2eTest {
     // And it still works: a record for the other partition arrives.
     produce(topic, 1, "elsewhere-3", null);
     await("the stream still delivers", () -> app.received.size() == 4);
+  }
+
+  @Test
+  void aRecordNoSidecarCanDecodeEndsInTheDeadLetterTopicAndItsPartitionGoesOn() throws Exception {
+    String deadLetters = "odradek-e2e-receive-dlq-" + id;
+    createTopic(topic, 1);
+    createTopic(deadLetters, 1);
+    int port = startDispatcher().port();
+    // ON_DECODE_ERROR_FAIL, two attempts, and then the dead-letter topic: all of it written in
+    // the application's own configuration, and none in the dispatcher's.
+    App app =
+        app(sidecarWith(
+                sidecarYaml(
+                    port,
+                    FAILING_CODEC,
+                    "codec: text",
+                    "ordering: ORDERING_PARTITION",
+                    "maxAttempts: 2",
+                    "onExhausted: ON_EXHAUSTED_DEAD_LETTER",
+                    "deadLetterTopic: " + deadLetters,
+                    "redeliveryBackoff: 0.2s")))
+            .working();
+    app.credits(10);
+    produce(topic, 0, "good-1", null);
+    long bad = produce(topic, 0, "bad", "cannot be decoded");
+    produce(topic, 0, "behind", null);
+
+    // The partition goes on past the record, and the commit with it.
+    awaitCommitted(topic, 1);
+    assertThat(app.received).extracting(Got::key).containsExactly("good-1", "behind");
+    assertThat(app.received).allMatch(record -> record.decodeError() == null);
+    assertThat(app.closed).isNotDone();
+
+    List<ConsumerRecord<String, String>> letters =
+        ServerHarness.read(ServerHarness.KAFKA_A, deadLetters, 1, 1);
+    assertThat(letters).as("dead letters").hasSize(1);
+    ConsumerRecord<String, String> letter = letters.get(0);
+    assertThat(letter.key()).isEqualTo("bad");
+    assertThat(letter.value())
+        .as("as stored: the dispatcher decodes nothing")
+        .isEqualTo("cannot be decoded");
+    assertThat(ServerHarness.header(letter, "odradek-source-topic")).isEqualTo(topic);
+    assertThat(ServerHarness.header(letter, "odradek-source-partition")).isEqualTo("0");
+    assertThat(ServerHarness.header(letter, "odradek-source-offset")).isEqualTo("" + bad);
+    assertThat(ServerHarness.header(letter, "odradek-source-group")).isEqualTo(group);
+    assertThat(ServerHarness.header(letter, "odradek-attempts")).isEqualTo("2");
+    assertThat(ServerHarness.header(letter, "odradek-failure")).isEqualTo("rejected");
+    // What the sidecar said of it: why its codec could not decode it.
+    assertThat(ServerHarness.header(letter, "odradek-failure-detail")).contains("codec text value");
   }
 
   @Test

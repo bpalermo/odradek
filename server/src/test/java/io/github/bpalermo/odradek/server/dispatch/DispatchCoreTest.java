@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server.dispatch;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.google.protobuf.ByteString;
+import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Cause;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Commit;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.DeadLetter;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Deliver;
@@ -45,6 +46,13 @@ class DispatchCoreTest {
   private int maxBufferedRecords = 1000;
   private long maxBufferedBytes = 1_000_000;
 
+  /** The waits before a redelivery and before a dead letter is written again; none by default. */
+  private long backoff;
+
+  private long backoffMax;
+  private long retry;
+  private long retryMax;
+
   private DispatchCore<String> core;
   private long now;
 
@@ -57,17 +65,34 @@ class DispatchCoreTest {
     core =
         new DispatchCore<>(
             new DispatchSettings(
-                ordering,
-                Duration.ofNanos(DEADLINE),
-                maxAttempts,
-                onExhausted,
-                window,
-                maxBufferedRecords,
-                maxBufferedBytes,
-                Duration.ofNanos(GRACE)));
+                    ordering,
+                    Duration.ofNanos(DEADLINE),
+                    maxAttempts,
+                    onExhausted,
+                    window,
+                    maxBufferedRecords,
+                    maxBufferedBytes,
+                    Duration.ofNanos(GRACE))
+                .withRedeliveryBackoff(Duration.ofNanos(backoff), Duration.ofNanos(backoffMax))
+                .withDeadLetterRetry(Duration.ofNanos(retry), Duration.ofNanos(retryMax)));
   }
 
+  /**
+   * What the core answers, with why a record is sent again left out: most scenarios are about what
+   * is sent, to whom and under which attempt number. {@link #raw} keeps it.
+   */
   private List<DispatchAction<String>> on(DispatchEvent<String> event) {
+    List<DispatchAction<String>> actions = new ArrayList<>();
+    for (DispatchAction<String> action : raw(event)) {
+      actions.add(
+          action instanceof Deliver<String> d
+              ? new Deliver<>(d.receiver(), d.partition(), d.offset(), d.payload(), d.attempt())
+              : action);
+    }
+    return actions;
+  }
+
+  private List<DispatchAction<String>> raw(DispatchEvent<String> event) {
     return core.handle(event, now);
   }
 
@@ -106,7 +131,17 @@ class DispatchCoreTest {
   }
 
   private List<DispatchAction<String>> reject(String receiver, int partition, long offset) {
-    return on(new Rejected<>(receiver, partition, offset));
+    return on(new Rejected<>(receiver, partition, offset, "bad"));
+  }
+
+  /** The dead letter of a record that was rejected last, asked for the first time. */
+  private static DeadLetter<String> letter(int partition, long offset, int attempts) {
+    return new DeadLetter<>(
+        partition, offset, payload(partition, offset), attempts, Cause.REJECTED, "bad", 0);
+  }
+
+  private static PartitionReleased<String> released(int partition) {
+    return new PartitionReleased<>(partition, true, 0);
   }
 
   private List<DispatchAction<String>> after(long nanos) {
@@ -562,10 +597,11 @@ class DispatchCoreTest {
     assertThat(fetch(0, "0:x", "1:x", "2")).containsExactly(deliver("a", 0, 0), deliver("a", 0, 2));
     assertThat(ack("a", 0, 2)).isEmpty();
     assertThat(reject("a", 0, 0)).containsExactly(deliver("a", 0, 0, 2));
-    assertThat(reject("a", 0, 0)).containsExactly(new DeadLetter<>(0, 0, "0/0", 2));
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 2));
     // Until it is written it is unacknowledged: nothing is committed, its key waits.
     assertThat(core.committable(0)).isEqualTo(OptionalLong.of(0));
-    assertThat(on(new DeadLetterFailed<>(0, 0))).containsExactly(new DeadLetter<>(0, 0, "0/0", 2));
+    assertThat(on(new DeadLetterFailed<>(0, 0)))
+        .containsExactly(new DeadLetter<>(0, 0, "0/0", 2, Cause.REJECTED, "bad", 1));
     assertThat(on(new DeadLetterWritten<>(0, 5))).isEmpty();
     assertThat(on(new DeadLetterWritten<>(0, 0))).containsExactly(commit(0, 1), deliver("a", 0, 1));
     assertThat(on(new DeadLetterWritten<>(0, 0))).isEmpty();
@@ -587,7 +623,7 @@ class DispatchCoreTest {
     on(new ReceiverJoined<>("b"));
     assertThat(credits("b", 10)).containsExactly(deliver("b", 0, 0, 2));
     assertThat(after(DEADLINE)).containsExactly(deliver("b", 0, 0, 3));
-    assertThat(reject("b", 0, 0)).containsExactly(new DeadLetter<>(0, 0, "0/0", 3));
+    assertThat(reject("b", 0, 0)).containsExactly(letter(0, 0, 3));
     assertThat(on(new DeadLetterWritten<>(0, 0))).containsExactly(commit(0, 1), deliver("b", 0, 1));
   }
 
@@ -718,7 +754,8 @@ class DispatchCoreTest {
     assign(0, 0);
     receiver("a", 10);
     fetch(0, "0");
-    assertThat(after(DEADLINE)).containsExactly(new DeadLetter<>(0, 0, "0/0", 1));
+    assertThat(after(DEADLINE))
+        .containsExactly(new DeadLetter<>(0, 0, "0/0", 1, Cause.DEADLINE, null, 0));
     assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
     assertThat(on(new DeadLetterFailed<>(0, 0))).isEmpty();
     assertThat(on(new DeadLetterWritten<>(0, 0))).isEmpty();
@@ -824,7 +861,7 @@ class DispatchCoreTest {
     assertThat(ack("a", 0, 0)).containsExactly(commit(0, 2));
     // 2 and 3 were never sent: nothing to wait for, nothing new to commit, nobody to tell.
     assertThat(on(new PartitionsRevoked<>(List.of(0, 9))))
-        .containsExactly(new PartitionReleased<>(9), new PartitionReleased<>(0));
+        .containsExactly(released(9), released(0));
     assertThat(core.committable(0)).isEmpty();
     assertThat(credits("a", 5)).isEmpty();
   }
@@ -843,8 +880,7 @@ class DispatchCoreTest {
             deliver("a", 0, 2),
             deliver("b", 0, 3),
             deliver("a", 0, 4));
-    assertThat(on(new PartitionsRevoked<>(List.of(0, 1))))
-        .containsExactly(new PartitionReleased<>(1));
+    assertThat(on(new PartitionsRevoked<>(List.of(0, 1)))).containsExactly(released(1));
     assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE));
     // Sending has stopped: a rejected record is not tried again, new records are dropped.
     assertThat(reject("b", 0, 3)).isEmpty();
@@ -854,7 +890,8 @@ class DispatchCoreTest {
     assertThat(ack("b", 0, 1)).containsExactly(commit(0, 2));
     assertThat(ack("a", 0, 4)).isEmpty();
     // The last acknowledgement in flight ends the wait. 3 was given back, so the position stops.
-    assertThat(ack("a", 0, 2)).containsExactly(commit(0, 3), new PartitionReleased<>(0));
+    // 3, sent and given back, and 4, acknowledged above it, are the next owner's to send again.
+    assertThat(ack("a", 0, 2)).containsExactly(commit(0, 3), new PartitionReleased<>(0, true, 2));
     assertThat(core.nextDeadlineNanos()).isEmpty();
   }
 
@@ -876,7 +913,10 @@ class DispatchCoreTest {
     // b and c still hold records of it; a holds only a record of partition 1.
     assertThat(after(1))
         .containsExactly(
-            new Drop<>("b", List.of(0)), new Drop<>("c", List.of(0)), new PartitionReleased<>(0));
+            new Drop<>("b", List.of(0)),
+            new Drop<>("c", List.of(0)),
+            // The wait ended with two records unanswered.
+            new PartitionReleased<>(0, false, 2));
     assertThat(ack("b", 0, 1)).isEmpty();
     assertThat(core.inFlight()).isEqualTo(1);
     assertThat(after(DEADLINE)).containsExactly(deliver("b", 1, 0, 2));
@@ -923,7 +963,7 @@ class DispatchCoreTest {
     assertThat(reject("a", 0, 0)).containsExactly(deliver("a", 0, 0, 2));
     assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
     assertThat(after(GRACE))
-        .containsExactly(new Drop<>("a", List.of(0)), new PartitionReleased<>(0));
+        .containsExactly(new Drop<>("a", List.of(0)), new PartitionReleased<>(0, false, 1));
     // Its next owner, here the same replica, counts attempts from one.
     assign(0, 0);
     assertThat(ack("a", 0, 0)).isEmpty();
@@ -950,11 +990,263 @@ class DispatchCoreTest {
     assign(0, 0);
     receiver("a", 10);
     fetch(0, "0", "1");
-    assertThat(reject("a", 0, 0)).containsExactly(new DeadLetter<>(0, 0, "0/0", 1));
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 1));
     assertThat(ack("a", 0, 1)).isEmpty();
     assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
-    assertThat(on(new DeadLetterWritten<>(0, 0)))
-        .containsExactly(commit(0, 2), new PartitionReleased<>(0));
+    assertThat(on(new DeadLetterWritten<>(0, 0))).containsExactly(commit(0, 2), released(0));
+  }
+
+  @Test
+  void aDeadLetterWhoseWriteFailsDuringAHandOverIsLeftToTheNextOwner() {
+    maxAttempts = 1;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0", "1");
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 1));
+    assertThat(ack("a", 0, 1)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    // Not written again by a replica that is giving the partition up, and not committed past:
+    // both records were sent, and both are the next owner's.
+    assertThat(on(new DeadLetterFailed<>(0, 0)))
+        .containsExactly(new PartitionReleased<>(0, true, 2));
+    assertThat(core.committable(0)).isEmpty();
+    assertThat(on(new DeadLetterWritten<>(0, 0))).isEmpty();
+  }
+
+  @Test
+  void aDeadLetterWaitingToBeWrittenAgainIsNotWaitedForOnHandOver() {
+    maxAttempts = 1;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    retry = 30;
+    retryMax = 100;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0");
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 1));
+    assertThat(on(new DeadLetterFailed<>(0, 0))).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0))))
+        .containsExactly(new PartitionReleased<>(0, true, 1));
+    assertThat(core.nextDeadlineNanos()).isEmpty();
+    assertThat(after(1000)).isEmpty();
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Waits
+  // -------------------------------------------------------------------------------------------
+
+  @Test
+  void aFailedRecordWaitsLongerEachTimeBeforeItIsSentAgain() {
+    backoff = 10;
+    backoffMax = 35;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 100);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    long[] waits = {10, 20, 35, 35};
+    for (int failed = 1; failed <= waits.length; failed++) {
+      assertThat(reject("a", 0, 0)).as("after %s failed attempts", failed).isEmpty();
+      assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(now + waits[failed - 1]));
+      assertThat(core.inFlight()).isZero();
+      assertThat(core.committable(0)).isEqualTo(OptionalLong.of(0));
+      assertThat(after(waits[failed - 1] - 1)).isEmpty();
+      assertThat(after(1)).containsExactly(deliver("a", 0, 0, failed + 1));
+    }
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+    assertThat(core.nextDeadlineNanos()).isEmpty();
+  }
+
+  @Test
+  void aMissedDeadlineWaitsToo() {
+    backoff = 10;
+    backoffMax = 10;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    fetch(0, "0");
+    assertThat(after(DEADLINE)).isEmpty();
+    assertThat(after(9)).isEmpty();
+    assertThat(raw(new TimePassed<>())).isEmpty();
+    now += 1;
+    assertThat(raw(new TimePassed<>()))
+        .containsExactly(new Deliver<>("b", 0, 0, "0/0", 2, Cause.DEADLINE));
+  }
+
+  @Test
+  void whileARecordWaitsItsKeyWaitsBehindItAndOtherKeysGoOn() {
+    backoff = 50;
+    backoffMax = 50;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 100);
+    assertThat(fetch(0, "0:x", "1:x", "2:y", "3"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 2), deliver("a", 0, 3));
+    assertThat(reject("a", 0, 0)).isEmpty();
+    // The other keys are not held up, in what is fetched and in what follows an acknowledgement.
+    assertThat(fetch(0, "4:y", "5:z", "6:x")).containsExactly(deliver("a", 0, 5));
+    assertThat(ack("a", 0, 2)).containsExactly(deliver("a", 0, 4));
+    assertThat(ack("a", 0, 3, 5)).isEmpty();
+    // Nothing is committed past the record that waits, and its key waits behind it, in order.
+    assertThat(core.committable(0)).isEqualTo(OptionalLong.of(0));
+    assertThat(after(49)).isEmpty();
+    assertThat(after(1)).containsExactly(deliver("a", 0, 0, 2));
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 6), deliver("a", 0, 6));
+  }
+
+  @Test
+  void whileARecordWaitsItsPartitionWaitsUnderPartitionOrdering() {
+    backoff = 50;
+    backoffMax = 50;
+    start(Ordering.PARTITION);
+    assign(0, 0);
+    assign(1, 0);
+    receiver("a", 100);
+    assertThat(fetch(0, "0", "1")).containsExactly(deliver("a", 0, 0));
+    assertThat(reject("a", 0, 0)).isEmpty();
+    assertThat(fetch(0, "2")).isEmpty();
+    // The other partition is not concerned.
+    assertThat(fetch(1, "0")).containsExactly(deliver("a", 1, 0));
+    assertThat(after(50)).containsExactly(deliver("a", 0, 0, 2));
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+  }
+
+  @Test
+  void whileARecordWaitsTheWindowStillBoundsWhatIsSent() {
+    backoff = 50;
+    backoffMax = 50;
+    window = 3;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 100);
+    assertThat(fetch(0, "0", "1", "2", "3", "4"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 1), deliver("a", 0, 2));
+    assertThat(core.atWindow()).isEqualTo(1);
+    assertThat(core.windowPauses()).isEqualTo(1);
+    assertThat(reject("a", 0, 0)).isEmpty();
+    assertThat(ack("a", 0, 1, 2)).isEmpty();
+    assertThat(core.atWindow()).isEqualTo(1);
+    assertThat(after(50)).containsExactly(deliver("a", 0, 0, 2));
+    assertThat(ack("a", 0, 0))
+        .containsExactly(commit(0, 3), deliver("a", 0, 3), deliver("a", 0, 4));
+    assertThat(core.atWindow()).isZero();
+    assertThat(core.windowPauses()).isEqualTo(1);
+  }
+
+  @Test
+  void aRecordWhoseReceiverLeftDoesNotWait() {
+    backoff = 50;
+    backoffMax = 50;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    fetch(0, "0");
+    assertThat(raw(new ReceiverLeft<>("a")))
+        .containsExactly(new Deliver<>("b", 0, 0, "0/0", 1, Cause.RECEIVER_LEFT));
+    assertThat(raw(new Rejected<>("b", 0, 0, ""))).isEmpty();
+    now += 50;
+    assertThat(raw(new TimePassed<>()))
+        .containsExactly(new Deliver<>("b", 0, 0, "0/0", 2, Cause.REJECTED));
+  }
+
+  @Test
+  void aLateAcknowledgementEndsTheWait() {
+    backoff = 50;
+    backoffMax = 50;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:x")).containsExactly(deliver("a", 0, 0));
+    assertThat(after(DEADLINE)).isEmpty();
+    // The receiver still had it, and finished.
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(now + DEADLINE));
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 2));
+    assertThat(after(1000)).isEmpty();
+  }
+
+  @Test
+  void aRecordThatWaitsIsDroppedByAHandOverAndByALoss() {
+    backoff = 50;
+    backoffMax = 50;
+    start(Ordering.NONE);
+    assign(0, 0);
+    assign(1, 0);
+    receiver("a", 10);
+    fetch(0, "0");
+    fetch(1, "0");
+    assertThat(reject("a", 0, 0)).isEmpty();
+    assertThat(reject("a", 1, 0)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0))))
+        .containsExactly(new PartitionReleased<>(0, true, 1));
+    assertThat(on(new PartitionsLost<>(List.of(1)))).isEmpty();
+    assertThat(core.nextDeadlineNanos()).isEmpty();
+    assertThat(after(1000)).isEmpty();
+  }
+
+  @Test
+  void theLastAttemptDoesNotWaitBeforeItIsGivenUpOn() {
+    backoff = 50;
+    backoffMax = 50;
+    maxAttempts = 2;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0");
+    assertThat(reject("a", 0, 0)).isEmpty();
+    assertThat(after(50)).containsExactly(deliver("a", 0, 0, 2));
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 2));
+  }
+
+  @Test
+  void aDeadLetterThatFailsIsWrittenAgainAfterAWaitThatGrowsAndNothingIsCommittedPastIt() {
+    maxAttempts = 1;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    retry = 10;
+    retryMax = 25;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0", "1")).hasSize(2);
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 1));
+    assertThat(ack("a", 0, 1)).isEmpty();
+    long[] waits = {10, 20, 25, 25};
+    for (int failures = 1; failures <= waits.length; failures++) {
+      assertThat(on(new DeadLetterFailed<>(0, 0))).isEmpty();
+      // A second answer to the same write changes nothing.
+      assertThat(on(new DeadLetterFailed<>(0, 0))).isEmpty();
+      assertThat(core.committable(0)).isEqualTo(OptionalLong.of(0));
+      assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(now + waits[failures - 1]));
+      assertThat(after(waits[failures - 1] - 1)).isEmpty();
+      assertThat(after(1))
+          .containsExactly(new DeadLetter<>(0, 0, "0/0", 1, Cause.REJECTED, "bad", failures));
+    }
+    assertThat(on(new DeadLetterWritten<>(0, 0))).containsExactly(commit(0, 2));
+    assertThat(core.nextDeadlineNanos()).isEmpty();
+  }
+
+  @Test
+  void aDeadLetterSaysHowTheLastAttemptFailed() {
+    maxAttempts = 2;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0", "1");
+    assertThat(raw(new Rejected<>("a", 0, 0, "cannot decode")))
+        .containsExactly(new Deliver<>("a", 0, 0, "0/0", 2, Cause.REJECTED));
+    now += DEADLINE;
+    // Rejected first and timed out last: the dead letter says the last, and not what the sidecar
+    // said of the attempt before.
+    assertThat(raw(new TimePassed<>()))
+        .containsExactly(
+            new DeadLetter<>(0, 0, "0/0", 2, Cause.DEADLINE, null, 0),
+            new Deliver<>("a", 0, 1, "0/1", 2, Cause.DEADLINE));
   }
 
   @Test

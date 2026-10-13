@@ -1,0 +1,187 @@
+# The dispatcher: a plain Deployment. Its replicas are the members of the
+# consumer groups it consumes for, with dynamic membership: a replica that
+# stops leaves its groups and its partitions move to the others at once, and a
+# new one joins and takes its share. It is not a StatefulSet: nothing needs a
+# stable name, since replicas advertise their pod IP through the coordination
+# group (docs/adr/0006, "Not chosen: a StatefulSet").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: odradek-dispatcher
+  labels:
+    app.kubernetes.io/name: odradek-dispatcher
+    app.kubernetes.io/part-of: odradek
+spec:
+  # A replica owns partitions, so more replicas than the busiest group has
+  # partitions adds nothing, and one replica means that nothing is consumed
+  # while it restarts. See "Operating a dispatcher" in docs/design.md.
+  replicas: 3
+  # A new replica is ready once it knows the other replicas. Sidecars then
+  # learn of it, declare to it, and it joins the groups and takes partitions.
+  # This gives that time to settle before the next replica is taken down.
+  minReadySeconds: 30
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One replica at a time. Each replica replaced rebalances every group it
+      # consumes for twice, whichever way it is done. Without surge, as here,
+      # the old replica hands its partitions to the others, and the new one
+      # then takes a share from them. With surge the new replica first takes a
+      # share from every replica, the old one included, and the old one's
+      # remaining partitions are spread again when it stops: a partition can
+      # move twice, and the groups briefly have one member more.
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: odradek-dispatcher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: odradek-dispatcher
+        app.kubernetes.io/part-of: odradek
+    spec:
+      serviceAccountName: odradek-dispatcher
+      # On SIGTERM a replica stops sending, waits up to consume.revokeDeadline
+      # (10 s in configmap.yaml) for the acknowledgements of what its sidecars
+      # hold and for the dead letters being written, commits, and leaves its
+      # groups; the server allows itself 15 s beyond the deadline for that.
+      # Then it closes its dead-letter producers and leaves the coordination
+      # group. A replica killed before it is done committed nothing for what
+      # was acknowledged since its last commit, and that is delivered again.
+      # Keep this at consume.revokeDeadline + 35 s or more.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: odradek-dispatcher
+      containers:
+        - name: odradek
+          # `dev` is the tip of main, a tag that moves: the only kind published
+          # until there is a release. Pin a digest, or X.Y.Z once released
+          # (see "Releasing" in the README). `dev-native` is the GraalVM image.
+          image: quay.io/odradek/odradek:dev
+          # It reads /etc/odradek/odradek.yaml unless told otherwise.
+          env:
+            # Where sidecars reach this replica: the other replicas hand it to
+            # every sidecar, which connects to it as given. The delivery port
+            # is added by the server.
+            - name: ODRADEK_ADVERTISED_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # The SPIRE agent's Workload API, for `spiffe: {}` in the
+            # configuration. The name of the socket is the agent's to choose.
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///spiffe-workload-api/spire-agent.sock
+            # The JVM image only: the share of the memory limit the heap may
+            # take. Records in flight and fetched are held on the heap.
+            - name: JAVA_TOOL_OPTIONS
+              value: -XX:MaxRAMPercentage=60
+          ports:
+            - name: delivery
+              containerPort: 9465
+              protocol: TCP
+            - name: health
+              containerPort: 9464
+              protocol: TCP
+          # The gRPC health service on the admin port. Service "" answers
+          # SERVING once the replica has loaded its credentials, reached its
+          # required clusters, bound the delivery port, joined the coordination
+          # group and learned the list of replicas.
+          startupProbe:
+            grpc:
+              port: 9464
+              service: ""
+            periodSeconds: 2
+            # The server waits as long as it takes; this is what bounds it.
+            # Three minutes: a replica that starts while the brokers still wait
+            # for one that was killed is a member only once that one's session
+            # has run out (session.timeout.ms, 45 s) or 30 s have passed.
+            failureThreshold: 90
+          # Readiness is what puts a replica behind the Service's address, so a
+          # sidecar is never sent to one that would answer with less than every
+          # replica. It also turns false when the certificate in use has
+          # expired, and when shutdown begins.
+          readinessProbe:
+            grpc:
+              port: 9464
+              service: ""
+            periodSeconds: 5
+            failureThreshold: 1
+          # SERVING while the process runs, whatever its brokers do: a broker
+          # that is away must not restart every replica.
+          livenessProbe:
+            grpc:
+              port: 9464
+              service: liveness
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            # A starting point, not a measurement. Memory is what to watch: a
+            # replica holds, per partition it owns, up to 4 MiB or 1000 fetched
+            # records waiting to be sent, and every record in flight or waiting
+            # to be delivered again, up to dispatch.partitionWindow offsets.
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # The whole directory, never a subPath: a subPath mount is not
+            # updated when the ConfigMap changes.
+            - name: config
+              mountPath: /etc/odradek
+              readOnly: true
+            - name: spiffe-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+            # Netty and the Kafka clients' compression codecs unpack native
+            # libraries here.
+            - name: tmp
+              mountPath: /tmp
+            # With `files` instead of `spiffe` in the configuration:
+            # - name: delivery-tls
+            #   mountPath: /etc/odradek/tls/delivery
+            #   readOnly: true
+            # - name: orders-tls
+            #   mountPath: /etc/odradek/tls/orders
+            #   readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: odradek-dispatcher
+        # The SPIFFE CSI driver (https://github.com/spiffe/spiffe-csi) mounts
+        # the agent's socket. The private key never touches a disk, and a
+        # rotated SVID is used from the next handshake on without a restart.
+        - name: spiffe-workload-api
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        # With `files`: Secrets holding tls.crt, tls.key and ca.crt, written
+        # and renewed by something else (cert-manager, spiffe-helper). None is
+        # created by these manifests. The certificate of the delivery port
+        # must carry the dispatcher's SPIFFE ID as its one URI SAN: that is
+        # how sidecars know it, and how the policy knows them.
+        # - name: delivery-tls
+        #   secret:
+        #     secretName: odradek-dispatcher-delivery-tls
+        # - name: orders-tls
+        #   secret:
+        #     secretName: odradek-dispatcher-orders-tls

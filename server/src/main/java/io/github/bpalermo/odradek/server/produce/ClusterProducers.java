@@ -93,9 +93,10 @@ public final class ClusterProducers implements Closeable {
   /**
    * The producer configuration of a cluster: its shared and producer properties, with the settings
    * the delivery guarantees rest on set last. Validation already rejected weaker values, so this
-   * only fills in what the file left out.
+   * only fills in what the file left out. Also what a dispatcher's dead-letter producer is built
+   * from.
    */
-  static Map<String, Object> properties(String name, Cluster cluster) {
+  public static Map<String, Object> properties(String name, Cluster cluster) {
     Map<String, Object> properties = new HashMap<>();
     properties.putAll(cluster.getPropertiesMap());
     properties.putAll(cluster.getProducerPropertiesMap());

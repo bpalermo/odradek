@@ -73,6 +73,7 @@ flowchart LR
   - One `KafkaConsumer` per Consume stream, owned by a dedicated poll thread. gRPC control messages (`Credits`, `Ack`, `RevokeDone`) are queued to that thread; nothing else touches the consumer.
   - In a dispatcher, one `KafkaConsumer` per cluster and consumer group that sidecars have declared, owned by a thread of its own together with the group's dispatch cores and `Deliver` streams (see Dispatcher).
   - In a dispatcher, one more `KafkaConsumer`, which consumes nothing: the replica's membership of the coordination group. A member has to be polled to stay one, so it has a thread that does nothing else (see Replicas).
+  - In a dispatcher that has dead-lettered a record, one `KafkaProducer` per cluster it did so on, and one thread per producer that calls `send()`: a group's thread never waits, and `send()` can (see Redelivery, limits and dead letters).
   - A Consume stream whose topics are received from a dispatcher has no `KafkaConsumer`. It has a thread of its own all the same, which owns the stream's `Deliver` streams to the dispatcher and everything it knows about them (see What a receiving sidecar does).
 
 ### Lifecycle
@@ -92,7 +93,7 @@ flowchart LR
 - **App readiness**: the client library reports ready only while it holds a session whose handshake has completed.
 - **Shutdown**: the server receives SIGTERM after the app container exits. It stops accepting streams, completes in-flight produce results, `flush()`es, commits acked offsets, leaves its groups and exits. `terminationGracePeriodSeconds` must cover app drain plus `delivery.timeout.ms`.
 - **Shutdown of a server that receives from a dispatcher**: for each Consume stream it grants the dispatcher nothing more, passes on the acknowledgements the app has sent, half-closes its `Deliver` streams and ends the app's stream with `UNAVAILABLE`. The half-close is a clean leave: the dispatcher delivers again, under the same attempt numbers, what the app held. It waits up to 5 seconds for the dispatcher to close the streams.
-- **Shutdown of a dispatcher**: it stops accepting `Deliver` streams, stops sending, waits up to `consume.revokeDeadline` for the acknowledgements of what its sidecars hold, commits, ends the streams with `UNAVAILABLE` and leaves the groups it consumes for, whose partitions go to the other replicas. Only then does it leave the coordination group, which is what tells the other replicas, and through them every sidecar, that it is gone: a sidecar closes its streams to a replica that is no longer listed, and until then those streams carried the acknowledgements being waited for. `terminationGracePeriodSeconds` must cover `consume.revokeDeadline` plus the commits (the server allows itself 15 seconds more).
+- **Shutdown of a dispatcher**: it stops accepting `Deliver` streams, stops sending, waits up to `consume.revokeDeadline` for the acknowledgements of what its sidecars hold and for the dead letters being written, commits, ends the streams with `UNAVAILABLE` and leaves the groups it consumes for, whose partitions go to the other replicas. It then closes its dead-letter producers, and only then leaves the coordination group, which is what tells the other replicas, and through them every sidecar, that it is gone: a sidecar closes its streams to a replica that is no longer listed, and until then those streams carried the acknowledgements being waited for. `terminationGracePeriodSeconds` must cover `consume.revokeDeadline`, the commits (the server allows itself 15 seconds beyond the deadline) and the producers and the coordination group after them: `consume.revokeDeadline` plus 35 seconds is safe.
 - **Server restart with the app alive**: the app reconnects, sees a new `server_epoch`, and fails every unacknowledged send with *outcome unknown*. Consumers get a fresh assignment; unacked records are redelivered.
 - **App restart with the server alive**: produce sessions idle out; consume streams close, which triggers a commit of acked offsets and a group leave.
 
@@ -109,15 +110,23 @@ Metrics are pushed over OTLP/gRPC to the collector named by `telemetry.endpoint`
 | `odradek.consume.decode.errors` | counter | `topic` | Records the topic's codec could not decode |
 | `odradek.consume.streams` | up-down counter | `cluster`, `group` | Open Consume streams. Each is a Kafka consumer in its group, unless its topics are received from a dispatcher |
 | `odradek.consume.stream.ends` | counter | `cluster`, `group`, `reason` | Consume streams ended, by gRPC status. `ABORTED` is an app that stopped acknowledging; `FAILED_PRECONDITION`, `PERMISSION_DENIED` and `UNIMPLEMENTED` include a declaration the dispatcher refused |
-| `odradek.consume.rebalances` | counter | `cluster`, `group`, `event` | Rebalance callbacks: `assigned`, `revoked`, `lost` |
-| `odradek.dispatch.receivers` | up-down counter | `cluster`, `group`, `topic` | Open `Deliver` streams: the sidecars a dispatcher hands the topic's records to |
+| `odradek.consume.rebalances` | counter | `cluster`, `group`, `event` | Rebalance callbacks: `assigned`, `revoked`, `lost`. A dispatcher reports them for the groups it consumes for, where `lost` is partitions that changed replica with no hand-over |
+| `odradek.dispatch.receivers` | up-down counter | `cluster`, `group`, `topic` | Open `Deliver` streams: the sidecars connected to this replica for the topic |
 | `odradek.dispatch.records` | counter | `cluster`, `group`, `topic` | Records a dispatcher sent to sidecars. A record sent again is counted again |
-| `odradek.dispatch.redeliveries` | counter | `cluster`, `group`, `topic` | Of those, the records that had been sent before: after a missed deadline, a rejection, or a sidecar that went away |
+| `odradek.dispatch.redeliveries` | counter | `cluster`, `group`, `topic`, `reason` | Of those, the records this replica had sent before: `deadline` (the processing deadline passed), `rejected` (a sidecar could not decode it), `receiver_gone` (the sidecar's stream ended; not a failed attempt). What a change of replica delivers again is not in it: the next owner cannot know; see `odradek.dispatch.handover.records` |
 | `odradek.dispatch.in_flight` | up-down counter | `cluster`, `group`, `topic` | Records sent to a sidecar and not yet acknowledged, rejected or expired |
-| `odradek.dispatch.partitions.blocked` | up-down counter | `cluster`, `group`, `topic` | Partitions stopped at a record that used all its attempts |
+| `odradek.dispatch.exhausted` | counter | `cluster`, `group`, `topic`, `action` | Records that used all their attempts: `block` (the partition stops) or `dead_letter`. Counted once per record and owner |
+| `odradek.dispatch.dead_letter.writes` | counter | `cluster`, `group`, `topic`, `outcome` | Writes of a record to its dead-letter topic: `ok` once the brokers acknowledged it, `error` when the write failed for good. `topic` is the topic the record came from. A failed write is made again, so one record can count several errors |
+| `odradek.dispatch.partitions.blocked` | up-down counter | `cluster`, `group`, `topic` | Partitions stopped at a record that used all its attempts (`ON_EXHAUSTED_BLOCK`), on the replica that owns them |
+| `odradek.dispatch.window.pauses` | counter | `cluster`, `group`, `topic` | Times a partition stopped handing out new records because its oldest unacknowledged record was `dispatch.partitionWindow` offsets behind |
+| `odradek.dispatch.partitions.at_window` | up-down counter | `cluster`, `group`, `topic` | Partitions that hand out no new record now for that reason |
+| `odradek.dispatch.handovers` | counter | `cluster`, `group`, `topic`, `outcome` | Partitions this replica gave up in good order: `completed` (everything it had sent was answered first) or `deadline` (`consume.revokeDeadline` ended the wait). A lost partition is not here but under `odradek.consume.rebalances` |
+| `odradek.dispatch.handover.records` | counter | `cluster`, `group`, `topic` | Records this replica had sent and left above the committed offset of a partition it gave up: what the next owner delivers again, acknowledged here or not |
+| `odradek.dispatch.declarations.refused` | counter | `reason` | Declarations a dispatcher refused, by gRPC status. It carries nothing of what was declared: those names are whatever a caller chose to send |
 | `odradek.dispatch.replicas` | gauge | `cluster`, `group` | Replicas on the list this dispatcher replica holds and sends to sidecars; 0 until it has joined the coordination group, which the attributes name |
 | `odradek.dispatch.replicas.generation` | gauge | `cluster`, `group` | Generation of that list. The replicas of one dispatcher agree on both; one that reports fewer replicas or an older generation than the others for long has fallen out of the coordination group |
 | `odradek.receive.streams` | up-down counter | `cluster`, `group`, `topic` | `Deliver` streams this server holds to dispatcher replicas, declaration accepted. Zero with an open Consume stream means the dispatcher cannot be reached |
+| `odradek.receive.streams.wanted` | up-down counter | `cluster`, `group`, `topic` | `Deliver` streams this server should hold: one per replica on the list it acts on, and one while it knows no list. More than `odradek.receive.streams` means a replica that is listed and not reached, whose partitions do not reach this pod |
 | `odradek.receive.records` | counter | `cluster`, `group`, `topic` | Records received from a dispatcher. A record received again is counted again |
 | `odradek.receive.rejects` | counter | `cluster`, `group`, `topic` | Records returned to the dispatcher because the topic's codec could not decode them |
 | `odradek.receive.reconnects` | counter | `cluster`, `group`, `topic` | `Deliver` streams opened again after one was lost, or refused for the time being |
@@ -152,6 +161,8 @@ The Kafka clients' own metrics are exported too, from an allow-list: Kafka has h
 | `odradek.kafka.producer.authentication.failures` | counter | `cluster` | `failed-authentication-total` |
 
 - A dispatcher's consumers report the same `odradek.kafka.consumer.*` metrics, lag included: there the lag of a group is one series per partition, reported by the replica that owns it.
+- A dispatcher's dead-letter producers report the `odradek.kafka.producer.*` metrics under their cluster, from the first record it dead-letters there.
+- The replicas of a dispatcher report under the same attributes, and so do the pods of an application. Nothing in the server names the pod (a ConfigMap is shared, so `telemetry.resourceAttributes` cannot): the collector has to add it, or the series of two replicas are one series in whatever stores them. For the up-down counters that is wrong, not merely coarse.
 - So does a dispatcher's membership of its coordination group, under that group's name: `rebalances` counts the changes of the dispatcher's replicas as this replica saw them, and `last_poll.age` says whether its membership is being kept up. It has no lag and no partitions.
 - The client id is not an attribute: a consumer's changes with every stream. The consumers of one group on one cluster are therefore one series. A counter, `assigned_partitions`, `connections` and `buffer.available` are their sum; every other gauge is the largest among them (the worst consumer).
 - A consumer's gauges stop being reported when its stream ends, and a partition's lag when the partition is revoked. A counter keeps what closed consumers counted, so it only goes up while the server runs.
@@ -161,7 +172,7 @@ The Kafka clients' own metrics are exported too, from an allow-list: Kafka has h
 - A server that receives a topic from a dispatcher reports `odradek.consume.records`, `odradek.consume.decode.errors` (records delivered undecoded), `odradek.consume.streams` and `odradek.consume.stream.ends` for it as for any other, and the `odradek.receive.*` metrics besides. It has no Kafka consumer, so no `odradek.kafka.consumer.*` and no `odradek.consume.rebalances`: lag is the dispatcher's to report. In `odradek.receive.*`, `cluster` is the dispatcher's name for the cluster.
 - The `odradek.tls.*` metrics have one series per set of credentials. Those of a cluster carry `cluster`. Those of the delivery port carry `delivery` instead, with the configuration section as its value: `dispatch.tls` on a dispatcher, `dispatcher.tls` on a server that receives from one.
 
-Not built yet: latency histograms, configuration reload metrics, and the rest of the dispatcher's and of the receiving side's (window pauses, attempts, dead letters, declarations refused, records waiting for the app's credit).
+Not built yet: latency histograms, configuration reload metrics, and, on the receiving side, the records waiting for the app's credit. What each dispatcher metric is for, and which to alert on, is under Operating a dispatcher (section 4).
 
 ## 3. API
 
@@ -245,8 +256,8 @@ The server owns the settings the guarantees rest on. They may be omitted from `p
 
 | Setting | Rule |
 |---|---|
-| `acks` | `all` |
-| `enable.idempotence` | `true` |
+| `acks` | `all`. Also on the producer a dispatcher writes dead letters with |
+| `enable.idempotence` | `true`. The same |
 | `max.in.flight.requests.per.connection` | 1 to 5 |
 | `enable.auto.commit` | `false` |
 | `auto.offset.reset` | Must not be set; the start position is per topic (see Consumers) |
@@ -275,9 +286,9 @@ The server owns the settings the guarantees rest on. They may be omitted from `p
 
 ### Dispatcher
 
-[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. Steps 1 to 6 of its plan exist: the schema, the `odradek.delivery.v1` protocol, the dispatch core, the dispatcher itself, the sidecar's side, mutual TLS with the policy on the delivery port, and several replicas that find each other and hand partitions over. An app whose topics have the dispatcher as their `source` consumes them on the same `Consume` stream as before, and its sidecar has no Kafka consumer for them.
+[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. The seven steps of its plan exist: the schema, the `odradek.delivery.v1` protocol, the dispatch core, the dispatcher itself, the sidecar's side, mutual TLS with the policy on the delivery port, several replicas that find each other and hand partitions over, and limits on redelivery with a dead-letter topic. An app whose topics have the dispatcher as their `source` consumes them on the same `Consume` stream as before, and its sidecar has no Kafka consumer for them. Example manifests are in [`deploy/kubernetes`](../deploy/kubernetes); what running one involves is under Operating a dispatcher.
 
-> **Dead-lettering is step 7**, with the rest of the dispatcher's metrics and its deployment manifests. And **without `dispatch.tls` a dispatcher is for tests**: see Security of the delivery port.
+> **Without `dispatch.tls` a dispatcher is for tests**: see Security of the delivery port.
 
 A server that acts as a dispatcher has a `dispatch` section:
 
@@ -307,12 +318,16 @@ And on each `consumers` entry concerned:
 |---|---|---|
 | `source` | `CONSUMER_SOURCE_KAFKA`: the server reads Kafka itself. `CONSUMER_SOURCE_DISPATCHER`: a dispatcher hands it the records | `CONSUMER_SOURCE_KAFKA` |
 | `ordering` | `ORDERING_KEY`, `ORDERING_PARTITION` or `ORDERING_NONE` | `ORDERING_KEY` |
-| `maxAttempts` | Deliveries of a record before it is given up on | No limit |
+| `maxAttempts` | Failed deliveries of a record before it is given up on, as one replica counts them | No limit |
 | `onExhausted` | `ON_EXHAUSTED_BLOCK` or `ON_EXHAUSTED_DEAD_LETTER`; needs `maxAttempts` | `ON_EXHAUSTED_BLOCK` |
-| `deadLetterTopic` | Where exhausted records are written; set exactly when dead-lettering | — |
+| `deadLetterTopic` | Topic, on the same cluster, that the dispatcher writes exhausted records to; set exactly when dead-lettering | — |
+| `redeliveryBackoff` | How long a record waits before it is delivered again after its first failed delivery; doubled for each further one. `0s` delivers again at once. At most 24 h | 1s, or `redeliveryBackoffMax` when that is less |
+| `redeliveryBackoffMax` | The longest such wait. At most 24 h | 30s, or `redeliveryBackoff` when that is more |
 
-- The last four are rejected on a consumer that reads Kafka itself.
-- A delivery fails, and uses one of `maxAttempts`, when the record is not acknowledged within the processing deadline or cannot be decoded. A record delivered again because its sidecar went away has not used one.
+- The last six are rejected on a consumer that reads Kafka itself.
+- A delivery fails, and uses one of `maxAttempts`, when the record is not acknowledged within the processing deadline or cannot be decoded. A record delivered again because its sidecar went away has not used one, and does not wait.
+- All of them are settings of the group and topic: every pod of the group must say the same (see Settings in force).
+- What they do, and what they do not promise, is under Redelivery, limits and dead letters.
 - `cluster` and `groupId` stay mandatory. On a dispatched consumer `cluster` is a name in the dispatcher's configuration and need not exist under `clusters`.
 - `clusters` needs at least one entry, except in a server with a dispatched consumer: one that receives everything it consumes and produces nothing talks to no broker.
 
@@ -348,6 +363,7 @@ consumers:
     cluster: orders            # resolved by the dispatcher
     groupId: billing
     maxAttempts: 5
+    redeliveryBackoff: 1s      # then 2 s, 4 s and 8 s before the fifth delivery
     onExhausted: ON_EXHAUSTED_DEAD_LETTER
     deadLetterTopic: billing.dlq.orders
 ```
@@ -360,10 +376,10 @@ A server with a `dispatch` section serves `DeliveryService` on `dispatch.port` (
 
   | Status | When |
   |---|---|
-  | `INVALID_ARGUMENT` | The first message is not `Declare`; a name or the processing deadline is missing; a setting has a value the dispatcher does not know; the dead-letter topic and `on_exhausted` contradict each other |
+  | `INVALID_ARGUMENT` | The first message is not `Declare`; a name or the processing deadline is missing; a setting has a value the dispatcher does not know; the dead-letter topic and `on_exhausted` contradict each other, or dead-lettering is asked for without `max_attempts`; the redelivery backoff exceeds its maximum, or a day |
   | `UNAUTHENTICATED` | The delivery port has TLS and the sidecar's certificate carries no SPIFFE ID to authorize. Said before anything else, whatever the first message is |
   | `PERMISSION_DENIED` | The policy has no rule that allows this identity this topic in this group on this cluster, with the dead-letter topic it names; or the cluster is not one of the dispatcher's. One message for every reason (see Security of the delivery port) |
-  | `UNIMPLEMENTED` | `ON_EXHAUSTED_DEAD_LETTER`, until step 7. `ON_EXHAUSTED_BLOCK` works |
+  | `UNIMPLEMENTED` | Nothing today. It is what a dispatcher answers to a declaration it understands and cannot carry out: what a newer sidecar asks of an older dispatcher |
   | `FAILED_PRECONDITION` | The group already consumes the topic with other settings, declared by a sidecar that is still connected. The message gives the settings in force and those declared |
   | `UNAVAILABLE` | The dispatcher is starting, which lasts until it has joined its coordination group and knows its replicas, or stopping; or its consumer for the group failed |
 
@@ -378,18 +394,88 @@ A server with a `dispatch` section serves `DeliveryService` on `dispatch.port` (
 - **Commits** are those of the consume path: asynchronously every `consume.commitInterval`, for the partitions whose position moved; synchronously for partitions being given up and when the consumer is closed. A failed asynchronous commit, which is normal while the group rebalances, is retried at the next interval.
 - **Rebalance.** The replicas that sidecars have declared a group to are its members, and its partitions move between them when a replica starts, stops or is lost. In `onPartitionsRevoked` the cores stop sending for the revoked partitions and wait, up to `consume.revokeDeadline`, for the acknowledgements of what is in flight, which are still handled; then the positions are committed and the sidecars still holding records of those partitions get `Released`. Lost partitions are dropped without a commit. `max.poll.interval.ms` is kept above the revoke deadline plus 30 seconds. What this promises, and what it does not, is under Hand-over between replicas.
 - **Backpressure.** A partition whose fetched and never delivered records reach 1000 records or 4 MiB is paused on the consumer, and resumed at half. These two bounds are constants: what bounds memory and redelivery is `dispatch.partitionWindow`, and how much a fetch brings is Kafka's own `max.partition.fetch.bytes` and `max.poll.records` in the cluster's properties. The poll thread never waits for a sidecar, so the consumer is polled, and stays in the group, whatever the sidecars do.
-- **A blocked partition** is logged and counted (`odradek.dispatch.partitions.blocked`). Nothing resumes it but a change of owner: the partition moving to another replica, which starts it again from its commit position with the attempt counts forgotten, or a restart.
+- **A record that keeps failing** waits before each redelivery, and after `maxAttempts` failed deliveries is written to the dead-letter topic or blocks its partition. See Redelivery, limits and dead letters.
 - **Replicas.** `Accepted` carries the list of every replica, the newest this one holds, and gives the replica's own address as it stands in that list (`Accepted.address`), which is how a sidecar that came through the Service's address knows which of the listed replicas it already has a stream to. A new list is sent on every open stream as `ReplicaList`. See Replicas.
 
-**Threads.** One thread per cluster and group owns the Kafka consumer, the cores of the group's topics and its streams. It is the only one to touch the consumer and the cores, and the only one to write to a stream once its declaration has been checked. gRPC threads check a declaration and queue commands for it. The thread waits on that queue, for at most 10 ms when nothing happens, and polls the consumer without blocking: an acknowledgement is acted on when it arrives, not at the end of a poll, which matters under `ORDERING_KEY`, where the next record of a key waits for it.
+**Threads.** One thread per cluster and group owns the Kafka consumer, the cores of the group's topics and its streams. It is the only one to touch the consumer and the cores, and the only one to write to a stream once its declaration has been checked. gRPC threads check a declaration and queue commands for it, and so does the producer's thread with the answer to a dead letter. The thread waits on that queue, for at most 10 ms when nothing happens, and polls the consumer without blocking: an acknowledgement is acted on when it arrives, not at the end of a poll, which matters under `ORDERING_KEY`, where the next record of a key waits for it. The 10 ms are also how finely a redelivery wait is kept.
 
 **Known limits**, beyond those in the box above:
 
 - The settings in force for a group and topic are each replica's own: the first declaration that replica received. Every sidecar declares to every replica, so they agree, except when two versions of an application with different settings both start with nobody consuming yet: one replica can then fix the settings of one version and another replica those of the other, and each version is refused by one of them.
 - A replica consumes a topic for `dispatch.idleGrace` after its last stream for it, whatever became of the sidecars. If they left that replica alone (it fell off the list of replicas while it kept its place in the groups it consumes for, or they cannot reach it), the partitions it holds wait there, delivered to nobody, until the grace ends or the replica stops.
-- A rejected record is delivered again at once. A sidecar therefore keeps a record it cannot decode for a second before rejecting it (see What a receiving sidecar does); a client of `DeliveryService` that does not would, without `maxAttempts`, send such a record round as fast as the network allows. Rejections are logged at most once per topic every 10 seconds.
+- Rejections, exhausted records and failed dead-letter writes are each logged at most once per topic every 10 seconds, with how many there were since the last line and the last of them. The counters count every one.
 - An error that Kafka reports for one topic of a group (a topic the dispatcher may not read, for example) ends every stream of the group with `UNAVAILABLE`. The sidecars reconnect, and the group fails again while the topic is declared.
 - A sidecar's credit bounds what is written to its stream, not what it reads: a sidecar that grants credit and stops reading holds that many records in the dispatcher's memory until its connection is closed.
+
+#### Redelivery, limits and dead letters
+
+A delivery fails in two ways: the record is not acknowledged within the processing deadline, or a sidecar rejects it because its codec cannot decode it. What follows is decided by five settings of the consumer entry, which travel in the declaration and are settings of the group and topic like `ordering` (`server/dispatch`: `DispatchCore`, `DeadLetters`).
+
+**The wait before a redelivery.**
+
+- A record whose delivery failed is not delivered again before `redeliveryBackoff`, doubled for each failed delivery of that record after the first and at most `redeliveryBackoffMax`. With the defaults, 1 s and 30 s: 1 s before the second delivery, then 2, 4, 8, 16, and 30 s from the seventh on.
+- The wait begins when the delivery fails: when the rejection arrives, or when the deadline passes. A record that times out each time therefore costs its deadline and its wait for each attempt.
+- **Order holds while a record waits**, because a record that waits is an unacknowledged record like any other. Under `ORDERING_KEY` the later records of its key wait behind it, and the other keys of the partition go on. Under `ORDERING_PARTITION` its partition waits. Under `ORDERING_NONE` nothing waits for it.
+- **It holds the commit position**, as any unacknowledged record does, so what the other keys can be sent meanwhile is bounded by `dispatch.partitionWindow`: a record that keeps failing for long stops its partition once the records delivered past it span the window. That is what `maxAttempts` is for; without it, a record that can never be processed is delivered for ever, at most once per `redeliveryBackoffMax`, and its partition stops at the window.
+- A record delivered again because its sidecar went away does not wait: nothing failed.
+- There is no jitter. Each record's wait starts when its own delivery failed, so nothing is lined up that jitter would spread.
+- The waits are kept to the 10 ms of the group's thread.
+
+**The limit.** `maxAttempts` is how many deliveries of a record may fail before it is given up on. The count is the `attempt` a sidecar is sent with each record: one more than the deliveries that failed. A delivery that ended because the sidecar's stream did is not counted.
+
+**Attempt counts are one replica's, and are lost with the partition.** They are kept in the memory of the replica that owns the record's partition, with everything else it knows of the partition, and nothing persists them. They start again from 1 when the partition changes owner: a hand-over to another replica (a replica started, stopped or was rolled), a replica that was lost or restarted, a topic taken up again after no sidecar had declared it for `dispatch.idleGrace`, or a topic declared with other settings once no sidecar held it with the old ones. So:
+
+- **`maxAttempts` bounds the attempts one owner makes, not those of the record's life.** A record can be delivered more than `maxAttempts` times in all, and `attempt` can go back to 1.
+- **A record that always fails may not be given up on while the dispatcher is being rolled.** Exhausting it takes its waits and its attempts (with the defaults and `maxAttempts: 5`, 15 s of waits plus five times as long as a delivery takes to fail, which for a missed deadline is the deadline). If its partition changes owner sooner than that, again and again, the count never gets there. It does once the replicas stay put for that long.
+- **A blocked partition is unblocked by a change of owner**, and blocks again after `maxAttempts` more deliveries unless what made the record fail has been mended.
+- **A record can be dead-lettered twice** (below).
+
+Persisting the counts would take a store or a topic of the dispatcher's own, written on every failed delivery, and the dispatcher has neither. It is not built.
+
+**A blocked partition** (`ON_EXHAUSTED_BLOCK`, the default with `maxAttempts`). The record is not delivered again, nothing is committed past it, and nothing after it in its partition is delivered, for the first time or again; records before it still are, so the committed offset reaches the record and stays there. Other partitions go on. The replica fetches the partition until its buffer is full and then stops fetching it.
+
+- **It shows**: `odradek.dispatch.partitions.blocked` is above zero on the replica that owns the partition, `odradek.dispatch.exhausted` counts the record with `action` `block`, the replica logs a warning naming partition and offset, and the group's lag on the partition grows.
+- **What resumes it**, and nothing else does:
+  - a change of owner, as listed above, after which the record has its attempts again;
+  - an acknowledgement of the record by a sidecar that still holds it: one whose delivery ran past the deadline and whose application finished after all.
+- **To resume it deliberately**, mend what makes the record fail (the application, or the codec of its sidecars) and make the partition change owner: restart the replica that reports it blocked, or roll the dispatcher.
+- **To skip the record**, commit the group's offset past it with Kafka's own tools. The brokers accept that only while the group has no member, which here means that no dispatcher replica consumes for it: the application scaled to zero for `dispatch.idleGrace`, or the dispatcher stopped. There is no admin API that skips a record or resumes a partition, and none is planned in this step; `ON_EXHAUSTED_DEAD_LETTER` is the way to keep going past such records.
+
+**A dead letter** (`ON_EXHAUSTED_DEAD_LETTER`). The dispatcher writes the record to `deadLetterTopic`, on the cluster it was read from, and goes on.
+
+- **What is written** is the record as stored: the same key and value bytes, and the same headers in the same order, followed by the headers of the table below. The dispatcher decodes nothing, here as elsewhere, so a record that no codec could read is written as it is, a tombstone stays one, and whoever reads the dead-letter topic needs the codec of the topic the record came from.
+- **Its timestamp is the time of the write**, not the record's own, which is in a header. The retention of a dead-letter topic then counts from when a record was given up on; a record that was already old would otherwise be removed as soon as it arrived.
+- **Its partition is the producer's choice**: by its key, as for any record, so the dead letters of one key share a partition. Their order there is that of the writes, which is not promised to be that of the source.
+- **It counts as done only once the brokers have acknowledged the write** (`acks=all`). Until then the record is unacknowledged: the committed offset stays at or below it, and under `ORDERING_KEY` the later records of its key wait.
+- **A write that fails is made again**, after 1 s, then 2, 4 and so on up to 30 s, for as long as the replica owns the partition. Each failure is counted (`odradek.dispatch.dead_letter.writes`, `outcome` `error`) and logged, at most one line per topic every 10 seconds. Nothing is committed past the record meanwhile, so **a dead-letter topic that cannot be written stops the partition as a blocked record does**, at the window. These waits are not configuration: the producer has already retried, for its `delivery.timeout.ms`, whatever a retry can mend.
+- **Why a write fails**, most likely first:
+  - The topic does not exist. Brokers that create topics on demand (`auto.create.topics.enable`, on by default) create it, with their default partitions and retention, if the dispatcher's principal may; create it yourself beforehand. Where they do not, each write waits `max.block.ms` (60 s unless the cluster's `producerProperties` say otherwise) for the topic's metadata and fails, and the other dead letters of that cluster wait behind it meanwhile.
+  - The dispatcher's principal may not write to it.
+  - The record is too large for it: a dead letter is its record plus some 300 bytes of headers and the sidecar's reason, of at most 1024 characters, so a record near the source topic's `max.message.bytes` exceeds the same limit on the dead-letter topic. Give dead-letter topics a larger one.
+  - The cluster cannot be reached, which fails a write after `delivery.timeout.ms` (2 minutes by default).
+- **Never lost, possibly twice.** A dead letter is in its topic before the offset past its record is committed, so whatever stops the replica in between, the record is still to be consumed. What is possible is a second copy:
+  - A replica that is killed after the write was acknowledged and before the next commit (at most `consume.commitInterval` later): the next owner delivers the record again, from attempt 1, and dead-letters it again if it still fails.
+  - A hand-over that began while the write was under way waits for it, up to `consume.revokeDeadline`. A write that is acknowledged in time is committed past. One that is not is left to the next owner, as above; if the first write then succeeds after all, there are two.
+  - An application that acknowledges the record late, while it is being written: the record is both processed and in the dead-letter topic.
+  The producer is idempotent, which keeps its own retries from duplicating a write; it does nothing for these.
+- **Who may be written to** is the policy's business: `deadLetterTopics` of the rule that allows the declaration (see Security of the delivery port).
+
+| Header | Value |
+|---|---|
+| `odradek-source-cluster` | The cluster, as the dispatcher's configuration names it |
+| `odradek-source-topic` | The topic the record was consumed from |
+| `odradek-source-partition` | Its partition there |
+| `odradek-source-offset` | Its offset there |
+| `odradek-source-timestamp` | Its timestamp there, in milliseconds since the epoch. Absent when the record has none |
+| `odradek-source-group` | The consumer group that gave it up |
+| `odradek-attempts` | How many deliveries failed, as the replica that wrote the dead letter counted them |
+| `odradek-failure` | How the last delivery failed: `rejected` (a sidecar could not decode the record) or `deadline` (the processing deadline passed) |
+| `odradek-failure-detail` | What the sidecar said when it rejected the record: the codec's error. At most 1024 characters. Absent when it said nothing, and after a missed deadline. Not stable: do not match on it |
+
+- These names are a contract with whoever reads dead-letter topics. Values are UTF-8 text; numbers are decimal.
+- A record that already carries headers of these names (a dead letter that was consumed from its topic and given up on again) keeps them. The new ones follow, so the last header of each name is the one of this write.
+
+**The producer.** A dispatcher has one Kafka producer per cluster for dead letters, of its own, made when the first record is dead-lettered on that cluster. A dispatcher that never dead-letters holds none: no buffer, no connection, and its principal needs no right to write. It is built as the server's other producers are (the cluster's `properties` and `producerProperties`, `acks=all`, idempotence, the cluster's `tls`), under the client id `odradek-<cluster>-dead-letter`, and reports the `odradek.kafka.producer.*` metrics. It is not the producer that a server which also produces for an app has for the same cluster: a dead-letter topic that cannot be written must not hold up an app's records, nor the reverse. `send()` is called from a thread per producer, never from a group's thread, because it can wait for metadata.
 
 #### Replicas
 
@@ -412,13 +498,14 @@ A dispatcher is a Deployment of a few replicas. Each consumes for the groups sid
 
 A group's partitions move between replicas when a replica starts (it takes a share from the others, which give up only the partitions that move: the rebalance is cooperative), when one stops in good order, and when one is lost. In the first two cases the replica that gives a partition up hands it over; in the third nobody does.
 
-**Handing over.** The replica stops sending the partition's records at once, waits up to `consume.revokeDeadline` for the acknowledgements of what it has sent, commits, and tells the sidecars that still hold records of the partition to drop them (`Released`, which the app is told as `Lost`). Kafka gives the partition to its next owner only after that, and the next owner starts at the committed offset.
+**Handing over.** The replica stops sending the partition's records at once, waits up to `consume.revokeDeadline` for the acknowledgements of what it has sent and for a dead letter whose write is under way, tells the sidecars that still hold records of the partition to drop them (`Released`, which the app is told as `Lost`), and commits. Kafka gives the partition to its next owner only after that, and the next owner starts at the committed offset.
 
 **Always**, whichever way a partition changes owner:
 
 - **Nothing is lost.** The committed offset is that of the partition's oldest record that is not acknowledged, so the next owner starts at or before every record that was not processed.
 - **The committed offset never goes back.** An owner commits forward only, and a commit by a replica that is no longer the owner is refused by the brokers.
-- **For each key, records are handed out in order, counting each record the first time it is handed out.** An owner sends a record only when every earlier one of its key is acknowledged, and the next owner begins at or before the first one that is not.
+- **For each key, records are handed out in order, counting each record the first time it is handed out.** An owner sends a record only when every earlier one of its key is acknowledged or written to its dead-letter topic, and the next owner begins at or before the first one that is not.
+- **What an owner knew of a record goes with it**: how many of its deliveries failed, that it blocked its partition, that it was waiting to be delivered or dead-lettered again. The next owner starts each record afresh (see Redelivery, limits and dead letters).
 - **An owner never hands out a record below the partition's committed offset.**
 
 **After a hand-over in good order**, which is one where everything the replica had sent was acknowledged within `consume.revokeDeadline`:
@@ -453,7 +540,7 @@ A sidecar hands the app the records of a partition from one stream at a time, so
 - A certificate without a SPIFFE ID (possible only with a `files` source) names nobody: `UNAUTHENTICATED`.
 - Whatever no rule allows is `PERMISSION_DENIED`, with one message whatever the reason: `<SPIFFE ID> is not allowed to consume topic <t> in group <g> on cluster <c>`, and `with dead-letter topic <d>` when the declaration names one. It is made of who asked and what was asked, so it tells a sidecar nothing of the clusters the dispatcher has, of the rules of other identities, or of which part of its own rule failed. The dispatcher logs each refusal.
 - A malformed declaration is `INVALID_ARGUMENT` before the policy is consulted: that answer is the same for everyone.
-- The dead-letter topic is checked with the rest, before the answer that dead-lettering is not built (step 7).
+- The dead-letter topic is checked with the rest: the dispatcher writes dead letters with its own credentials, so a sidecar that could name any topic could make it write, to wherever its Kafka principal may, a copy of whatever the sidecar may read. A rule lists the topics it allows (`deadLetterTopics`); one that lists none allows no dead-lettering.
 - **A declaration is authorized when it is made.** A stream that was accepted stays until it ends: a policy change needs a restart of the dispatcher anyway (`dispatch` is not hot-reloadable), which ends every stream, and a certificate that expires or is revoked while its connection is open is not looked at again, as TLS does not re-validate a live connection.
 - **Each replica authorizes by its own copy of the policy, and one refusal ends the app's stream.** A sidecar declares to every replica; `PERMISSION_DENIED` from any of them is a refusal for good (see What a receiving sidecar does), with a status that names the address of the replica that refused. While a dispatcher is rolled to a policy that allows something new, its old replicas still refuse it. So **roll a policy that allows more out to every replica before the application that needs it**, and one that allows less after the application that no longer does. An application that arrives early has its Consume stream ended, and consumes once its pods are started again against a dispatcher that is fully rolled; nothing is consumed in part meanwhile, which is the point: a topic that only some replicas hand over would be delivered for some partitions and stall for the others without a word. Rolling the dispatcher with its policy unchanged refuses nobody. The same order holds for `UNIMPLEMENTED`, which an old replica answers to what only a newer one can do.
 
@@ -477,7 +564,7 @@ A sidecar makes a connection when the first of its app's streams needs it and ke
 
 **Plaintext.** Each end is plaintext when its `tls` is unset, and says so in a warning every time it starts. It exists for tests and for a machine nobody else can reach.
 
-- A dispatcher without `dispatch.tls` accepts every well-formed declaration that names one of its clusters: whoever reaches the port reads every topic the dispatcher's Kafka credentials can.
+- A dispatcher without `dispatch.tls` accepts every well-formed declaration that names one of its clusters: whoever reaches the port reads every topic the dispatcher's Kafka credentials can, and has it written to any topic those credentials can write, by naming it as a dead-letter topic.
 - **`dispatch.policy` without `dispatch.tls` is rejected when the configuration is loaded** (`dispatch.policy_requires_tls`), and the server exits with status 2. Nobody has an identity on a plaintext port, so such a policy would either match no one or be ignored. Refusing to start was chosen over refusing every declaration: the mistake shows where it was made, in the dispatcher's rollout, and not as `PERMISSION_DENIED` in every application's logs; and a configuration that reads as protected is never served unprotected.
 - With `dispatch.tls` and no rule, the dispatcher starts, warns, and refuses every declaration.
 - The two ends must agree. A sidecar with `dispatcher.tls` does not talk to a plaintext dispatcher, nor a plaintext sidecar to a dispatcher with TLS: both are handshakes that fail.
@@ -488,12 +575,12 @@ A sidecar makes a connection when the first of its app's streams needs it and ke
 
 A `Subscribe` whose topics have the dispatcher as their `source` is served by `server/receive` (`ReceiveService`, `ReceiveSession`) instead of a Kafka consumer. `Subscribed` is sent at once, with the cluster and group of the consumer entry and the processing deadline resolved as for any stream. The app cannot tell the difference, except by what follows.
 
-- **Streams.** One `Deliver` stream per topic and dispatcher replica, opened when the app subscribes and closed when its stream ends. Each declares the entry's `cluster`, `groupId` and topic, its `ordering`, `offsetReset`, `startTimestamp`, `maxAttempts`, `onExhausted` and `deadLetterTopic` (what the entry leaves unset is left to the dispatcher's defaults), the app's processing deadline, and the server's version.
+- **Streams.** One `Deliver` stream per topic and dispatcher replica, opened when the app subscribes and closed when its stream ends. Each declares the entry's `cluster`, `groupId` and topic, its `ordering`, `offsetReset`, `startTimestamp`, `maxAttempts`, `onExhausted`, `deadLetterTopic`, `redeliveryBackoff` and `redeliveryBackoffMax` (what the entry leaves unset is left to the dispatcher's defaults), the app's processing deadline, and the server's version.
 - **Finding the replicas.** The first stream of each topic goes to `dispatcher.address`. `Accepted` carries the list of replicas and the address of the one that answered (`Accepted.address`): if that address is on the list, the stream is the stream to that replica, and one is opened to each of the others; if it is not, or is missing, every listed replica gets a stream of its own and the first one is closed. A `ReplicaList` that arrives later, on any stream, replaces the list when its generation is higher: streams are opened to replicas that are new, each with its declaration, which is what makes a replica that has just started join the group and take its share; and streams are closed to replicas no longer listed, whose partitions the app is told are `Lost`. A list whose generation is not higher is ignored: every replica sends each list, and a replica that is behind sends an old one. Replica addresses are connected to as given, with the same `dispatcher.tls` as the first connection: every connection is made in one place (`ReceiveService.connect`). After the first connection `dispatcher.address` is not used again unless every stream is lost: a replica that replaces another is found through the list.
 - **Connections.** One to each address, the Service's and each replica's, shared by every Consume stream of the server and held while a stream uses it (`ReceiveService.Pool`): a pod makes one TLS handshake per replica, however many streams and topics its app consumes. The connection to the Service's address is the one to whichever replica answered there, and carries the streams to that replica.
 - **Lost streams.** A stream that ends with `UNAVAILABLE`, which includes every TLS handshake that failed (see Security of the delivery port), or with anything else that is not a refusal for good, is opened again at the same replica while that replica is listed, after a delay that doubles from 100 ms to 5 s, each delay drawn at random from the upper half of its step (the backoff of the client libraries). When no stream is left, open or being opened, the list and its generation are forgotten and the server starts again from `dispatcher.address`. Meanwhile the app's stream stays open and receives nothing.
 - **Refusals for good.** `FAILED_PRECONDITION` (the group consumes the topic with other settings), `PERMISSION_DENIED`, `UNAUTHENTICATED`, `INVALID_ARGUMENT` and `UNIMPLEMENTED` would be met again by a new stream. The app's stream ends with the same status and a message that names the dispatcher's address, the topic, the group and the cluster, followed by what the dispatcher said. The client libraries treat all five as fatal. All five are answers of a dispatcher that was reached, and, with TLS, verified: gRPC itself reports a connection that could not be made or secured as `UNAVAILABLE`, never as one of these.
-- **Decoding.** Records arrive as stored in Kafka and are decoded with the topic's codec, as on the consume path. A record that cannot be decoded follows the entry's `onDecodeError`: with `DELIVER_UNDECODED` it is delivered as stored with `decode_error` set, and acknowledged by the app like any other; with `FAIL`, where a consumer that reads Kafka ends the stream with `DATA_LOSS`, it is rejected to the dispatcher, which counts a failed attempt, and the stream stays. The rejection is sent one second after the record arrived, so that a record nobody can decode, on a topic with no `maxAttempts`, goes round once a second per sidecar and not as fast as the network allows. Rejections are logged at most once per topic every 10 seconds.
+- **Decoding.** Records arrive as stored in Kafka and are decoded with the topic's codec, as on the consume path. A record that cannot be decoded follows the entry's `onDecodeError`: with `DELIVER_UNDECODED` it is delivered as stored with `decode_error` set, and acknowledged by the app like any other; with `FAIL`, where a consumer that reads Kafka ends the stream with `DATA_LOSS`, it is rejected to the dispatcher, which counts a failed attempt, and the stream stays. The rejection is sent at once, with the codec's reason: how long the record then waits before it is delivered again is the dispatcher's `redeliveryBackoff`, so that there is one wait, in one place, for every kind of failure. (Until step 7 the dispatcher had none, and the sidecar held such a record for a second before rejecting it; that pause is gone, since the two would only add up.) Rejections are logged at most once per topic every 10 seconds.
 - **No Kafka client.** The server commits nothing and holds no consumer for these topics. A server whose consumers are all received, and which produces nothing, needs no entry under `clusters`.
 
 **Partitions, epochs and acknowledgements.** The app's protocol speaks of assigned partitions; a pod that receives from a dispatcher owns none. What stands in for ownership is the stream that last delivered a partition's records (`Holdings`):
@@ -520,27 +607,123 @@ A `Subscribe` whose topics have the dispatcher as their `source` is served by `s
 
 **An app that stops acknowledging.** A consumer that reads Kafka ends the stream with `ABORTED` when a record is held past the processing deadline (section 6). Here the dispatcher is the authority: it delivers the record again, to this pod or another, on its own clock, and the app's stream is not ended. What the server does is stop asking: while the app has held any record for longer than the deadline, the dispatcher is granted no more credit on that Consume stream, since every record sent to such an app would wait out its deadline before another pod got it. Credit flows again when the app has acknowledged every overdue record; the change is logged both ways. An app that loses a record and never acknowledges it is therefore not told, as it is by `ABORTED`: its pod receives nothing more until its stream is opened again.
 
-**Threads.** One thread per Consume stream owns the stream's state, the writes to the app and the writes to its `Deliver` streams. gRPC threads, the app's and the dispatcher's, only queue events for it. It waits on that queue, and on the timers of the streams to open again and the rejections to send.
+**Threads.** One thread per Consume stream owns the stream's state, the writes to the app and the writes to its `Deliver` streams. gRPC threads, the app's and the dispatcher's, only queue events for it. It waits on that queue, and on the timers of the streams to open again.
 
 **Known limits** of the receiving side:
 
 - With several streams, a stream that was busy and went quiet keeps what its window had outstanding, up to its share of half the app's budget, until it is opened again.
 - A record waiting in the server for the app's credit is not visible in a metric yet.
-- A replica that is listed and cannot be reached (its address is wrong, or the network does not let the pod through) is tried again for as long as it is listed, and its partitions do not reach this pod. Nothing but the log says so: `odradek.receive.streams` counts the streams that are open, not those that are wanted.
+- A replica that is listed and cannot be reached (its address is wrong, or the network does not let the pod through) is tried again for as long as it is listed, and its partitions do not reach this pod. It shows as `odradek.receive.streams.wanted` above `odradek.receive.streams`, and in the log; the app is told nothing.
 
 #### Dispatch core
 
-`DispatchCore` (`server/dispatch`) is the dispatcher's decision logic with no I/O, in the manner of the client core: events in (partitions assigned, revoked or lost; records fetched; receivers joining, leaving and granting credit; acknowledgements, rejections; dead letters written or failed; time passing), actions out (deliver, commit, dead-letter, pause and resume fetching, tell a receiver to drop a partition's records, partition released, partition blocked or unblocked). One instance covers one topic of one consumer group on one replica. It settles what the ADR left open:
+`DispatchCore` (`server/dispatch`) is the dispatcher's decision logic with no I/O, in the manner of the client core: events in (partitions assigned, revoked or lost; records fetched; receivers joining, leaving and granting credit; acknowledgements, rejections; dead letters written or failed; time passing), actions out (deliver, commit, dead-letter, pause and resume fetching, tell a receiver to drop a partition's records, partition released, partition blocked or unblocked). One instance covers one topic of one consumer group on one replica. It has no clock: every event comes with the time, and it says when it next needs to be told that time has passed. It settles what the ADR left open:
 
 - **Commit position.** The offset of a partition's oldest unacknowledged record, or one past the last fetched record when there is none; offsets that hold no record are not waited for. `Commit` is emitted each time an acknowledgement moves it, and how often to commit is the caller's business.
 - **Window.** A record is delivered for the first time only while its offset is less than the window above the commit position. The oldest unacknowledged record is therefore always deliverable.
 - **Fetching** of a partition pauses when its never-delivered records reach a bound, in records or bytes, and resumes at half.
 - **Redelivery.** After a rejection or a missed deadline the record goes to a different receiver if one has credit at that moment, and back to the same one otherwise. Within a partition the lowest offset is sent first, and under `key` and `partition` ordering a record waiting to be redelivered holds back what it constrains.
-- **Attempts.** A rejection and a missed deadline each use one. A receiver that leaves uses none: what was in flight to it is delivered again under the same attempt number. Otherwise rolling the application, with a limit and `ON_EXHAUSTED_BLOCK`, could block partitions through no fault of the records. An attempt number of 1 therefore does not promise that no application has seen the record.
+- **The wait before a redelivery.** A record whose attempt failed is not sent again before the redelivery backoff, doubled for each failed attempt after the first, up to its maximum. While it waits it is an unacknowledged record like any other, which is all the ordering needs: the later records of its key (under `key`) or of its partition (under `partition`) are behind it already, the commit position stays at or below it, and so the window goes on bounding what the other keys are sent. A record whose receiver left does not wait.
+- **Attempts.** A rejection and a missed deadline each use one. A receiver that leaves uses none: what was in flight to it is delivered again under the same attempt number. Otherwise rolling the application, with a limit and `ON_EXHAUSTED_BLOCK`, could block partitions through no fault of the records. An attempt number of 1 therefore does not promise that no application has seen the record. The counts are the core's: they go with the partition when it is given up.
+- **Dead letters.** An exhausted record under `ON_EXHAUSTED_DEAD_LETTER` stays unacknowledged, holding its key and the commit position, until the caller reports the write done. A write reported failed is asked for again after a wait that doubles, for as long as the core has the partition. A late acknowledgement from a receiver that still held the record settles it too, and the answer to the write is then ignored.
 - **Processing deadline.** The one setting that can change while the core runs. A record keeps the deadline in force when it was sent.
 - **Late acknowledgement.** A receiver whose record passed its deadline still holds it, and its acknowledgement counts for as long as the record is unacknowledged, even if another receiver has been sent it since: the record was processed. The second copy is a duplicate, and its acknowledgement is ignored.
 - **Blocked partition.** An exhausted record with `ON_EXHAUSTED_BLOCK` is not delivered again, the commit position stays at it, and nothing after it in its partition is sent, for the first time or again. Records before it are still delivered and committed. It stays blocked until the partition is revoked or lost, which also resets the attempt counts, or until a receiver that held the record past its deadline acknowledges it.
-- **Hand-over.** A revoked partition stops sending at once and is released when nothing of it is in flight or being dead-lettered, or after a bounded wait; receivers still holding its records are then told to drop them. A lost partition is dropped without a commit.
+- **Hand-over.** A revoked partition stops sending at once and is released when nothing of it is in flight or being written as a dead letter, or after a bounded wait; receivers still holding its records are then told to drop them. A record waiting to be sent again, or a dead letter waiting to be written again, is not waited for: it is the next owner's. A lost partition is dropped without a commit. With each partition it releases the core says whether the wait ran out and how many records it had sent that the next owner will send again.
+
+#### Operating a dispatcher
+
+[`deploy/kubernetes`](../deploy/kubernetes) holds example manifests, as plain YAML with a `kustomization.yaml` each: `dispatcher/` (ServiceAccount, ConfigMap, Deployment, Service, NetworkPolicy, PodDisruptionBudget) and `application/` (an application pod with the server as a native sidecar, consuming through that dispatcher). They are examples to start from. A test loads every configuration they embed with the server's own loader and holds the manifests against it (ports, probes, the time given to stop, the policy against what the application declares); nothing has applied them to a cluster.
+
+**How many replicas.**
+
+- **Replicas are for availability and for moving bytes, not for parallelism.** A replica does not process records; the application's pods do, and there can be as many of those as the work needs. A replica fetches, keeps the books and forwards.
+- **A partition is owned by one replica**, so replicas beyond the partition count of the group with the most partitions own nothing of that group. Two or three is the usual number: one means that nothing is consumed while it restarts.
+- **Memory** is what to size. Per partition it owns, a replica holds up to 1000 fetched records or 4 MiB waiting for a first delivery, and every record delivered and not yet committed past, which `dispatch.partitionWindow` bounds at that many offsets. Per connected pod it holds a TLS connection, and a stream per topic.
+- **Each pod connects to every replica**: pods times replicas connections, and that many times the topics in streams.
+- Under `ORDERING_KEY` a key's records take one round trip each, one after the other, however many replicas and pods there are.
+- None of this has been measured: there is no benchmark and no soak test of the dispatcher yet. The requests in the example manifests are a starting point.
+
+**Rolling the dispatcher.** Sidecars follow by themselves; no application pod needs restarting. For each replica replaced, the applications see this:
+
+- The replica stops sending, waits up to `consume.revokeDeadline` for the acknowledgements of what it has sent, commits, and ends its streams. Each app is told `Lost` for the partitions whose records came from that replica, and drops what it held of them.
+- Its partitions move to the other replicas, which deliver from the committed offsets. **After a hand-over in good order**, under `ORDERING_PARTITION` nothing is delivered twice. Under `ORDERING_KEY` and `ORDERING_NONE`, what had been acknowledged above a partition's first unacknowledged record is delivered again: duplicates, and for a key, a record seen again after a later one. See Hand-over between replicas for exactly what is promised.
+- A handler that was still working when the wait ended goes on working while the record is delivered to another pod: `consume.revokeDeadline` should cover the slowest honest handler. `odradek.dispatch.handovers` with `outcome` `deadline` counts the partitions this happened to.
+- Attempt counts start again, and blocked partitions are tried again (see Redelivery, limits and dead letters).
+- The new replica is ready once it knows the others; sidecars are sent the new list, open a stream to it and declare, and it then joins the groups and takes a share of their partitions: a second rebalance, cooperative, which moves only what changes owner.
+- **Give each replica time before the next** (`minReadySeconds`), and give a stopping replica `terminationGracePeriodSeconds` of `consume.revokeDeadline` plus 35 s or more. A replica killed sooner has not committed, and what was acknowledged since its last commit is delivered again.
+- **A replica that is killed** is waited for by the brokers for `session.timeout.ms` (45 s by default, in the cluster's `consumerProperties`). Until then its partitions are consumed by nobody, it stays on the list sidecars are sent, and no other change of the groups completes. It is the one knob for how fast a dead replica's partitions move; lower also moves them when a replica only paused for that long.
+- With surge, a new replica joins before the old one leaves, so a partition can move twice. The example uses none.
+
+**Rolling the application** rebalances nothing. A pod that stops returns what it held, which is delivered to other pods without using an attempt. What the application consumes is in its own configuration, with two things to know:
+
+- **A new topic** needs nothing but the policy to allow it.
+- **Changing how a topic is consumed** (`ordering`, `maxAttempts`, `onExhausted`, `deadLetterTopic`, the redelivery backoff, the start position) cannot be done by a rolling update: a new pod that declares other settings is refused with `FAILED_PRECONDITION` for as long as an old pod holds the topic, and that ends its Consume stream. Stop the old pods first. The processing deadline is the exception and may differ between versions.
+
+**Rolling out a policy.** Each replica authorizes by its own copy, a sidecar declares to every replica, and one `PERMISSION_DENIED` ends the app's stream. So: **a policy that allows more goes to every replica before the application that needs it**, and one that allows less after the application that no longer does. A new dead-letter topic is such a change. `dispatch` is not reloaded while a replica runs: the pods have to be replaced for it to apply.
+
+**Changing `dispatch.coordination`** (the group, or the cluster it is on) by a rolling update splits the replicas into two sets that do not know each other, and sidecars follow one of them. Replace every replica together: scale to zero and back, or use the `Recreate` strategy for that one change.
+
+**Keep the coordination group on the cluster that is consumed.** A replica cut off from the brokers and not from its sidecars goes on delivering what it had fetched while its partitions are given to another. What ends that is its session in the coordination group running out with the others, after which sidecars close their streams to it. With the coordination group on another cluster, nothing does.
+
+**What the dispatcher needs in Kafka.** On a cluster with ACLs, the dispatcher's principal needs:
+
+| Resource | Operation | For |
+|---|---|---|
+| The coordination group | `Read` | Membership. Allow nobody else: a member of that group can put addresses on the list sidecars connect to, and leave replicas out of it |
+| Each group it consumes for | `Read` | Joining, and committing |
+| Each topic it consumes | `Read` | Fetching; `Describe` comes with it |
+| Each dead-letter topic | `Write` | Dead letters; `Describe` comes with it. It also stands for `IdempotentWrite`, which brokers older than 2.8 want on the cluster besides |
+
+- It needs no right to create topics, and should have none: a consumed topic is never created because a sidecar named it, but a missing dead-letter topic would be, on brokers that create on demand.
+- The principals of the applications' sidecars need nothing in Kafka for the topics they receive. That is the point of the policy, and why a rule that is too wide matters.
+- **These were reasoned from what each request needs, not tested.** The brokers the end-to-end suites run against have no authorizer.
+
+**Timings worth knowing.**
+
+| Setting | Default | What it decides |
+|---|---|---|
+| `session.timeout.ms` (cluster `consumerProperties`) | 45 s | How long a killed replica's partitions wait, and how long it stays listed |
+| `consume.revokeDeadline` | 10 s | How long a replica waits for acknowledgements before it gives partitions up |
+| `consume.commitInterval` | 5 s | How much acknowledged work is delivered again after a replica is killed |
+| `dispatch.idleGrace` | 5 min | How long a topic is consumed with no sidecar connected. **A replica that sidecars have left alone** (they cannot reach it, or it fell off the list while it kept its place in the groups) holds its partitions for that long, delivered to nobody |
+| `dispatch.partitionWindow` | 1000 | How far a partition gets ahead of its oldest unacknowledged record, and so how much one stuck record lets through and how much a restart delivers again |
+| `redeliveryBackoff`, `redeliveryBackoffMax` (consumer entry) | 1 s, 30 s | The waits before a failed record is delivered again |
+
+**What to watch.** Every dispatcher metric of section 2, by what it is for:
+
+| Metric | What it tells | Alert when |
+|---|---|---|
+| `odradek.dispatch.partitions.blocked` | A record used its attempts and its partition is stopped | Above zero. Lag grows until someone acts |
+| `odradek.dispatch.dead_letter.writes`, `outcome` `error` | A dead-letter topic cannot be written; the partitions concerned are held | Increasing |
+| `odradek.dispatch.exhausted` | Records given up on. With `action` `dead_letter`, each is in the dead-letter topic: an application's or a codec's problem to look at | Increasing faster than you expect records to fail |
+| `odradek.dispatch.handovers`, `outcome` `deadline` | A partition was given up with records still unanswered: delivered again while a pod may still be working on them | Increasing. Raise `consume.revokeDeadline`, or look for pods that do not answer |
+| `odradek.dispatch.handover.records` | How much each change of replica cost in records delivered again | — |
+| `odradek.dispatch.partitions.at_window`, `odradek.dispatch.window.pauses` | A partition waits for its oldest unacknowledged record: a slow handler, or a record that keeps failing with no `maxAttempts` | Above zero for longer than the processing deadline and its waits explain |
+| `odradek.dispatch.redeliveries` by `reason` | `deadline`: handlers slower than the deadline, or pods that hang. `rejected`: records a codec cannot read. `receiver_gone`: pods going away, as in every rollout | `deadline` or `rejected` persisting |
+| `odradek.dispatch.in_flight` | Records with applications now | — |
+| `odradek.dispatch.receivers` | Sidecars connected to this replica for a topic | Zero on a replica that owns partitions of the topic (`odradek.kafka.consumer.assigned_partitions`): they are delivered to nobody until `dispatch.idleGrace` ends |
+| `odradek.dispatch.declarations.refused` by `reason` | `PERMISSION_DENIED`, `UNAUTHENTICATED` and `FAILED_PRECONDITION` each ended an application's stream: a policy rolled out in the wrong order, a wrong identity, two versions that disagree | Increasing for those three |
+| `odradek.dispatch.replicas`, `odradek.dispatch.replicas.generation` | The list each replica holds | Replicas that disagree for more than a few minutes |
+| `odradek.consume.rebalances` | Rebalances of the groups consumed. `lost` is a partition taken from a replica that did not hand it over | `lost` increasing |
+| `odradek.kafka.consumer.records.lag`, `odradek.kafka.consumer.last_poll.age` | Lag per partition, from the replica that owns it; and whether the replica's consumer is being polled | As for any consumer |
+| `odradek.receive.streams.wanted` against `odradek.receive.streams` (sidecars) | A pod that does not reach a listed replica receives nothing of that replica's partitions | Wanted above open for more than a few minutes |
+| `odradek.consume.stream.ends` by `reason` (sidecars) | Applications' streams that ended, a refusal by the dispatcher included | `PERMISSION_DENIED`, `FAILED_PRECONDITION` |
+| `odradek.tls.certificate.not_after`, `odradek.ready` | As for any server (section 9) | Time to expiry |
+
+- With no application pod running, nobody declares anything, the dispatcher consumes nothing and reports no lag for the group. Lag for an autoscaler that scales from zero comes from Kafka.
+- The replicas report under the same attributes: add the pod at the collector (see Metrics).
+
+**Dead-letter topics.**
+
+- Create them beforehand, with the retention and the `max.message.bytes` you want (larger than the source topic's by 4 KiB or so), and list them in the policy.
+- A record in one was not processed by the application, with one exception: an application that acknowledged it late, while it was being written.
+- The same record can be there twice. Its source headers say which record it is.
+- Nothing here reads them, alerts on them or replays them. To replay, write the key, value and the headers without the `odradek-` ones back to the source topic; expect the order within a key to be lost.
+
+**Plaintext.** A dispatcher without `dispatch.tls` hands every topic its Kafka credentials can read to whoever reaches its port, and writes to any topic they can write on request. It says so in a warning each time it starts. Outside tests there is no case for it.
+
+**What running it still lacks**, beyond the limits listed in each part of this section: an admin API to skip a record or resume a partition; attempt counts that survive a change of owner; `dispatch` applied without replacing pods; metrics that say which replica they are from without the collector's help; any measurement of throughput or memory, and any soak under rolling restarts; a tested answer to a coordinator failover, to brokers with ACLs, and to these manifests in a cluster.
 
 ## 5. Produce path
 
@@ -923,7 +1106,10 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 | Guarantee | Through a dispatcher |
 |---|---|
 | At least once | Preserved. A record is delivered again after a missed deadline, a rejection, a sidecar or a replica that went away, and a partition that changed replica |
-| Commit only processed offsets | Preserved, by the dispatcher: per partition, the offset below which every record is acknowledged, which never goes back whichever replica owns the partition |
+| Commit only processed offsets | Preserved, by the dispatcher: per partition, the offset below which every record is acknowledged, which never goes back whichever replica owns the partition. With `ON_EXHAUSTED_DEAD_LETTER` "acknowledged" includes "written to the dead-letter topic and acknowledged by its brokers": such a record was not processed, by the application's own choice |
+| A record that fails is retried | New. After a wait that grows (`redeliveryBackoff`), during which its key, or its partition, waits behind it as the ordering says. With no `maxAttempts`, for ever |
+| A limit on retries | `maxAttempts` bounds the failed deliveries **one replica** makes of a record. The count is in that replica's memory and starts again when the partition changes owner, so the record can be delivered more often than that in all, and may not be given up on at all while its partition keeps changing owner |
+| A record given up on | Blocks its partition by default: nothing is lost, nothing later is delivered, and it stays so until the partition changes owner, which gives the record its attempts again, or a pod that still holds it acknowledges it. Or it is written to a dead-letter topic: never lost, and possibly written twice (a replica that stops between the write and the commit) |
 | Order | Per key by default (`ordering`), not per partition. It holds while nothing is delivered again. Across a change of replica, each key's records are handed out in order counting each the first time it is handed out; what is handed out again, and when two pods can hold records of one key at once, is under Hand-over between replicas |
 | Rebalance callbacks | The app's pods are not group members, and scaling them rebalances nothing. The app is never sent `Revoked`: a partition whose records it must drop is `Lost` |
 | Scaling the dispatcher | Rebalances the groups it consumes for, cooperatively, among its replicas. A replica that stops in good order waits for what its sidecars hold before it gives its partitions up |
@@ -945,6 +1131,8 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 | End to end | The server binary and the Java client against real brokers: ordering, commit positions, rebalance with two servers | Kafka in KRaft mode (no ZooKeeper), provided by the environment: service containers in CI, containers started locally. Two brokers, so multi-cluster cases run in the same suite |
 | Fault | Kill the server mid-produce and mid-revoke; hang the app; drop the stream; stop a broker | End-to-end harness; assert no false acks and no committed-but-unprocessed offsets |
 | Dispatcher | The dispatch core against scripted and random events; declarations and batching; the Delivery service against Kafka's mock consumer; and, against a real broker with scripted sidecars (gRPC clients written in the test): more sidecars than partitions, per-key order, a sidecar killed mid-batch, a missed deadline, a blocked partition, a second topic declared while the first is consumed, the idle grace, a restart | Unit tests; `DispatchE2eTest` in the three end-to-end targets, the native image included |
+| Redelivery limits and dead letters | The core against scripted events (the waits and what they hold back under each ordering, a late acknowledgement, a hand-over and a loss while a record waits, a dead letter that fails, during a hand-over too) and against random ones with waits, where the model also checks why each record is sent again and what each hand-over leaves; what a dead letter is made of; the service against Kafka's mock consumer and producer, with the metrics read back by value (blocked, exhausted, dead-letter writes by outcome, redeliveries by reason, the window, hand-overs); and, against a real broker: a record rejected until it is in the dead-letter topic with its bytes, its headers and ours, the waits between its attempts, its partition going on and the commit passing it; one that misses its deadline; a dead-letter topic that refuses the record, until it is mended; a record no sidecar can decode, from a real sidecar to the dead-letter topic; a dead-letter topic the policy does not allow, over TLS; the metrics pushed by the packaged server | Unit tests (`DispatchCoreTest`, `DispatchCoreRandomTest`, `DeadLettersTest`, `DispatchServiceTest`); `DispatchE2eTest`, `ReceiveE2eTest`, `DeliveryTlsE2eTest` and `TelemetryE2eTest` in the end-to-end targets, the native image included. Not tested: a replica killed between a dead-letter write and the commit, a dead-letter topic that does not exist on brokers that do not create topics, and brokers with ACLs |
+| Deployment examples | Every server configuration embedded in the manifests of `deploy/kubernetes` is loaded by the server's loader, and the manifests are held against it: ports and probes, the replica's own address from the pod, the time given to stop, the application's declarations against the dispatcher's policy, the dispatcher's identity as the sidecar accepts it | `ExampleManifestsTest`. Not applied to any cluster |
 | Receiving from a dispatcher | The credit split, the mapping to partitions and epochs with acknowledgements over gaps, the replica list and the backoff, each on its own; the bridge against scripted replicas (in-process gRPC servers written in the test): several replicas, a list that changes, lost streams, refusals, both decode-error modes, an app that stops acknowledging, the three ways a stream ends; conformance scenarios for the client cores with gapped and repeated offsets; and, against a real broker with a real dispatcher and real sidecars, through the app's API: more sidecars than partitions, per-key order across sidecars, a sidecar killed mid-batch, a late acknowledgement, the dispatcher restarted, a sidecar started before the dispatcher, a declaration refused for good, both decode-error modes, mixed sources, two topics on one stream, an app that produces and consumes | Unit tests; `conformance/scenarios`; `ReceiveE2eTest` in the three end-to-end targets, the native image included |
 | Dispatcher replicas | The assignor of the coordination group on its own (what a member joins with, the list every member is answered, its order and its generation, a group played by the test), the membership thread against Kafka's mock consumer (the subscription that names no topic, a consumer that fails and is replaced, the list kept), the list pushed on every stream and the refusal until it is known, the advertised address, the connections a server shares; and, against a real broker with real replicas and real sidecars that know one address, a relay standing in for the Service: one sidecar ends with a stream to each of three replicas, a second Consume stream of the pod makes no new connection, the application scaled up and down with the group's members, partitions and generation unchanged, a replica stopped in good order under a flow of records (nothing lost, nothing twice under `ORDERING_PARTITION`), a replica killed, a replica added (both: nothing lost, each key in order, nothing handed out below a committed offset, no committed offset going back), a replica replaced and found through the list with nothing answering at the Service's address; and with TLS: replicas found, verified and replaced, an address on the list that is not the dispatcher's, a replica whose policy refuses | Unit tests (`ReplicaAssignorTest`, `MembershipTest`, `DispatchServiceTest`, `DeliveryServerTest`, `PoolTest`); `ReplicasE2eTest` and `DeliveryTlsE2eTest` in the three end-to-end targets, the native image included. Not tested: a coordinator failover, and a replica cut off from the brokers but not from its sidecars |
 | Security of the delivery port | Policy matching, rule by rule, and what a refusal says; the TLS context one handshake at a time, in memory: both ends, rotation of a certificate and of an authority, an engine made before a rotation, identities accepted and not, federated trust domains, no host name check; the listener over real connections with a mock consumer: the status a sidecar sees for each refusal and for each handshake that fails; and, against a real broker with a real dispatcher and real sidecars: an allowed sidecar consumes, a topic that is not its own ends the app's stream with `PERMISSION_DENIED`, a certificate without SPIFFE ID with `UNAUTHENTICATED`, no certificate, plaintext, an untrusted authority and an unexpected dispatcher identity get nothing, credentials rotated on both sides under an open stream | Unit tests (`PolicyTest`, `ReloadingSslContextTest`, `DeliveryTlsTest`); `DeliveryTlsE2eTest` in the three end-to-end targets, the native image included |

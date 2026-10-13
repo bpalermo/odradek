@@ -1,0 +1,54 @@
+# The configuration of the server that runs as a sidecar in each pod of an
+# application that consumes through the dispatcher. What the application
+# consumes, and how, is written here and nowhere else: its sidecars declare it
+# to the dispatcher, whose policy must allow it (../dispatcher/configmap.yaml).
+#
+# ExampleManifestsTest (//server:main_test) loads this configuration with the
+# server's own loader.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-odradek
+  labels:
+    app.kubernetes.io/name: billing
+data:
+  odradek.yaml: |
+    listener:
+      socketPath: /var/run/kafka/kafka.sock
+
+    dispatcher:
+      # The dispatcher's Service. Used to find the replicas; the sidecar then
+      # connects to each of them by its pod IP.
+      address: odradek-dispatcher.kafka.svc:9465
+      tls:
+        # This pod's X.509-SVID: the identity the dispatcher's policy goes by.
+        spiffe: {}
+        # Who the dispatcher is. Its own ID rather than its trust domain: every
+        # replica must present it, at the Service's address and at each pod IP.
+        acceptedSpiffeIds:
+          - spiffe://example.org/ns/kafka/sa/odradek-dispatcher
+
+    consumers:
+      orders.created:
+        source: CONSUMER_SOURCE_DISPATCHER
+        # A cluster of the dispatcher's configuration: this server has none.
+        cluster: orders
+        groupId: billing
+        # Records of one key are handled in order, by as many pods as there are.
+        ordering: ORDERING_KEY
+        # Every pod of the group must say the same of what follows; change it
+        # with all the old pods gone, or the new ones are refused.
+        maxAttempts: 5
+        # Waits before a failed record is delivered again: 1 s, 2 s, 4 s, 8 s.
+        redeliveryBackoff: 1s
+        redeliveryBackoffMax: 30s
+        # After the fifth failed attempt the dispatcher writes the record to
+        # this topic, which must exist and be allowed by its policy. Without
+        # these two lines the record would block its partition instead.
+        onExhausted: ON_EXHAUSTED_DEAD_LETTER
+        deadLetterTopic: billing.dlq.orders
+
+    telemetry:
+      endpoint: http://otel-collector.observability.svc:4317
+      resourceAttributes:
+        service.name: billing-odradek

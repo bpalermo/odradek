@@ -58,10 +58,9 @@ service DeliveryService {
   //    once no sidecar of the group holds the topic with the old settings.
   //    Settings.max_processing_ms is never a reason: see Settings.
   //  - UNIMPLEMENTED: the declaration is well formed and asks for something
-  //    this dispatcher cannot do. Today that is ON_EXHAUSTED_DEAD_LETTER,
-  //    which is not built yet; later, whatever a newer sidecar asks of an
-  //    older dispatcher. Retrying unchanged fails until the dispatcher is
-  //    replaced.
+  //    this dispatcher cannot do: what a newer sidecar asks of an older
+  //    dispatcher. Nothing is refused this way today. Retrying unchanged
+  //    fails until the dispatcher is replaced.
   //  - UNAVAILABLE: the dispatcher is starting or stopping, or cannot reach
   //    the cluster; or it was not reached at all, a TLS handshake that either
   //    end refused included. Retry with backoff.
@@ -120,8 +119,10 @@ enum OnExhausted {
   // The record blocks its partition: it is not skipped, the commit position
   // stays below it, and no later record of the partition is delivered.
   ON_EXHAUSTED_BLOCK = 1;
-  // The record is written to Settings.dead_letter_topic by the dispatcher
-  // and then counts as acknowledged.
+  // The record is written to Settings.dead_letter_topic by the dispatcher,
+  // as stored and with headers that say where it came from, and counts as
+  // acknowledged once the brokers have acknowledged that write. Until then
+  // the commit position stays below it.
   ON_EXHAUSTED_DEAD_LETTER = 2;
 }
 
@@ -162,7 +163,9 @@ message Settings {
   // about the record, and rolling the application must not exhaust what
   // happened to be in flight. Unset or zero means there is no limit: the
   // record is delivered again until it is acknowledged, and on_exhausted
-  // never applies.
+  // never applies. The count is the replica's own and starts again when the
+  // partition changes owner (see Record.attempt), so the limit bounds the
+  // attempts one owner makes, not those of the record's whole life.
   uint32 max_attempts = 5;
   // What happens to a record that has used max_attempts attempts. Unset
   // behaves as ON_EXHAUSTED_BLOCK.
@@ -170,6 +173,20 @@ message Settings {
   // Topic, on the same cluster, that exhausted records are written to. Set
   // exactly when on_exhausted is ON_EXHAUSTED_DEAD_LETTER.
   string dead_letter_topic = 7;
+  // How long the dispatcher waits before it sends a record again after its
+  // first failed attempt, in milliseconds. The wait doubles with each
+  // further failed attempt at the same record, up to
+  // redelivery_backoff_max_ms. While a record waits it is unacknowledged, so
+  // it holds back what the ordering makes wait for it. Zero sends again at
+  // once. A record sent again because its stream ended does not wait. Unset
+  // asks for the dispatcher's default: 1000, or redelivery_backoff_max_ms
+  // when that is set and less. Greater than redelivery_backoff_max_ms is
+  // INVALID_ARGUMENT.
+  uint32 redelivery_backoff_ms = 8;
+  // The longest wait before a record is sent again, in milliseconds. Unset
+  // asks for the dispatcher's default: 30000, or redelivery_backoff_ms when
+  // that is set and more.
+  uint32 redelivery_backoff_max_ms = 9;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,15 +261,18 @@ message Ack {
 
 // Reject returns one record that the sidecar could not decode with the
 // topic's codec, so that it never reached the application. It counts as a
-// failed attempt: the record is delivered again, at once, or is exhausted. A
-// reject for a record this stream does not hold is ignored.
+// failed attempt: the record is delivered again after the wait of
+// Settings.redelivery_backoff_ms, or is exhausted. A sidecar rejects as soon
+// as it knows: the wait is the dispatcher's. A reject for a record this
+// stream does not hold is ignored.
 message Reject {
   // Partition of the record.
   int32 partition = 1;
   // Offset of the record.
   int64 offset = 2;
-  // Why the record was rejected, for the dispatcher's logs. Not stable; do
-  // not match on it.
+  // Why the record was rejected, for the dispatcher's logs and, when the
+  // record ends in a dead-letter topic after this attempt, for the header
+  // that says why. Not stable; do not match on it.
   string reason = 3;
 }
 
@@ -352,12 +372,23 @@ message Record {
   bytes value = 4;
   // Record headers, as stored, in order.
   repeated odradek.kafka.v1.Header headers = 5;
-  // Which attempt at this record this is, starting at 1. A value above 1
-  // means an earlier attempt failed, and the application may already have
-  // seen the record. A delivery that ended because its stream did is not an
-  // attempt, so the record is sent again under the same number: 1 does not
-  // promise that no application has seen it. The count is kept in the
-  // dispatcher's memory and starts again when the partition changes owner.
+  // Which attempt at this record this is for the replica sending it,
+  // starting at 1: one more than the attempts of this replica that failed,
+  // by a missed processing deadline or a rejection. It is not the number of
+  // times the record was delivered:
+  //
+  //  - A delivery that ended because its stream did is not an attempt. The
+  //    record is sent again under the same number.
+  //  - The count is kept in the memory of the replica that owns the
+  //    partition and starts again at 1 when the partition changes owner: a
+  //    hand-over to another replica, a replica that restarts, a topic taken
+  //    up again after nobody had declared it for the idle grace, or declared
+  //    with other settings.
+  //
+  // So a value above 1 means an earlier attempt failed and an application
+  // may have seen the record, and 1 promises nothing: the record may have
+  // been delivered before, any number of times. Settings.max_attempts
+  // counts the same way.
   uint32 attempt = 6;
 }
 

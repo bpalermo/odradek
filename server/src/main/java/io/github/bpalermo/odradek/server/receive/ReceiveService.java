@@ -52,9 +52,6 @@ import org.slf4j.LoggerFactory;
 public final class ReceiveService implements DispatcherSource, Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(ReceiveService.class);
 
-  /** How long an undecodable record is kept before it is rejected. */
-  static final Duration REJECT_PAUSE = Duration.ofSeconds(1);
-
   /** How long a stream that ends waits for the dispatcher to close its Deliver streams. */
   static final Duration DRAIN = Duration.ofSeconds(5);
 
@@ -225,8 +222,7 @@ public final class ReceiveService implements DispatcherSource, Closeable {
     }
     EventLoopGroup loops = new MultiThreadIoEventLoopGroup(1, EpollIoHandler.newFactory());
     ReceiveSession.Options options =
-        new ReceiveSession.Options(
-            address, Version.VERSION, REJECT_PAUSE, DRAIN, System::nanoTime, Backoff::new);
+        new ReceiveSession.Options(address, Version.VERSION, DRAIN, System::nanoTime, Backoff::new);
     return new ReceiveService(
         options, metrics, new Pool(target -> connect(target, loops, context), loops, DRAIN), loops);
   }

@@ -10,16 +10,37 @@ import java.util.List;
  */
 public sealed interface DispatchAction<R> {
 
+  /** Why a record is sent again, or was given up on. */
+  enum Cause {
+    /** Nothing happened to it before: a first delivery. */
+    NONE,
+    /** The receiver that had it gave it back. */
+    REJECTED,
+    /** Its processing deadline passed. */
+    DEADLINE,
+    /** The receiver that had it left. Not a failed attempt. */
+    RECEIVER_LEFT
+  }
+
   /**
    * Send one record to a receiver. It uses one of the receiver's credits.
    *
    * <p>Consecutive deliveries to one receiver from one partition may share a batch only while their
    * offsets increase.
    *
-   * @param attempt which delivery of the record this is, from 1
+   * @param attempt which attempt at the record this is, from 1: one more than the attempts that
+   *     failed. A record sent again because its receiver left is sent under the same number
+   * @param cause why it is sent again; {@link Cause#NONE} when this core never sent it before
    */
-  record Deliver<R>(String receiver, int partition, long offset, R payload, int attempt)
-      implements DispatchAction<R> {}
+  record Deliver<R>(
+      String receiver, int partition, long offset, R payload, int attempt, Cause cause)
+      implements DispatchAction<R> {
+
+    /** A first delivery. */
+    public Deliver(String receiver, int partition, long offset, R payload, int attempt) {
+      this(receiver, partition, offset, payload, attempt, Cause.NONE);
+    }
+  }
 
   /**
    * The partition's commit position advanced to {@code offset}: every record below it is
@@ -30,11 +51,17 @@ public sealed interface DispatchAction<R> {
 
   /**
    * Write an exhausted record to the dead-letter topic, then answer with {@link
-   * DispatchEvent.DeadLetterWritten} or {@link DispatchEvent.DeadLetterFailed}.
+   * DispatchEvent.DeadLetterWritten} or {@link DispatchEvent.DeadLetterFailed}. Until the first of
+   * these the record is unacknowledged: the commit position stays at or below it.
    *
-   * @param attempts how many times the record was delivered
+   * @param attempts how many attempts at the record failed: all it had
+   * @param cause how the last of them failed: {@link Cause#REJECTED} or {@link Cause#DEADLINE}
+   * @param detail what the receiver said when it rejected the record; null when it said nothing,
+   *     and after a missed deadline
+   * @param retries how many writes of this record failed before this one; 0 the first time
    */
-  record DeadLetter<R>(int partition, long offset, R payload, int attempts)
+  record DeadLetter<R>(
+      int partition, long offset, R payload, int attempts, Cause cause, String detail, int retries)
       implements DispatchAction<R> {}
 
   /**
@@ -65,6 +92,13 @@ public sealed interface DispatchAction<R> {
   /**
    * The hand-over of a revoked partition is complete: once the last {@link Commit} for it is
    * committed, the partition can be given up. Not emitted for a lost partition.
+   *
+   * @param inTime whether everything sent was answered before the hand-over wait ended; false when
+   *     the wait ended with records still in flight or a dead letter still being written, which the
+   *     next owner then sends again while a receiver may still be working on them
+   * @param resent how many records this core had sent and leaves at or above the commit position:
+   *     what the next owner sends again, whether they were acknowledged here or not
    */
-  record PartitionReleased<R>(int partition) implements DispatchAction<R> {}
+  record PartitionReleased<R>(int partition, boolean inTime, int resent)
+      implements DispatchAction<R> {}
 }

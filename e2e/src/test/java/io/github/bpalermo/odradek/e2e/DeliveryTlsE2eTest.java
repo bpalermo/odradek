@@ -113,6 +113,7 @@ class DeliveryTlsE2eTest {
             cluster: a
             topics: ["%s", "%s"]
             groups: ["%s"]
+            deadLetterTopics: ["odradek-e2e-delivery-dlq-*"]
           - spiffeIds: ["spiffe://e2e.test/ns/audit/sa/audit"]
             cluster: a
             topics: ["%s"]
@@ -146,6 +147,12 @@ class DeliveryTlsE2eTest {
   DeliveryTlsE2eTest() throws Exception {
     service = new TcpRelay();
   }
+
+  /** Further top-level sections of the sidecars started next, as YAML. */
+  private String sidecarSections = "";
+
+  /** Further lines of every consumer entry of the sidecars started next. */
+  private List<String> entryLines = List.of();
 
   private Path credentials;
   private DispatcherHarness dispatcher;
@@ -408,13 +415,14 @@ class DeliveryTlsE2eTest {
           .append("\n    acceptedSpiffeIds:\n");
       accepted.forEach(spiffeId -> yaml.append("      - \"").append(spiffeId).append("\"\n"));
     }
-    yaml.append("consumers:\n");
+    yaml.append(sidecarSections).append("consumers:\n");
     for (String consumed : names) {
       yaml.append("  ")
           .append(consumed)
           .append(":\n    source: CONSUMER_SOURCE_DISPATCHER\n    cluster: a\n    groupId: ")
           .append(group)
           .append('\n');
+      entryLines.forEach(line -> yaml.append("    ").append(line).append('\n'));
     }
     ServerHarness sidecar = ServerHarness.start(yaml.toString());
     sidecars.add(sidecar);
@@ -613,6 +621,72 @@ class DeliveryTlsE2eTest {
     allowed.credits(4);
     Set<String> produced = produce(topic, "v", 10);
     await("the allowed topic is received", () -> allowed.values().equals(produced));
+  }
+
+  @Test
+  void aDeadLetterTopicIsThePolicysToAllowAndAnAllowedOneIsWrittenTo() throws Exception {
+    String deadLetters = "odradek-e2e-delivery-dlq-" + id;
+    String elsewhere = "odradek-e2e-delivery-elsewhere-" + id;
+    createTopic(topic);
+    createTopic(deadLetters);
+    startDispatcher(dispatcherCertificate);
+    // A codec that fails on every value and lets a tombstone through: Kafka's string
+    // deserializer gives the server a String where it wants bytes.
+    sidecarSections =
+        """
+        codecs:
+          text:
+            value:
+              serializer: org.apache.kafka.common.serialization.StringSerializer
+              deserializer: org.apache.kafka.common.serialization.StringDeserializer
+        """;
+
+    // Billing may read the topic, but its rule does not list this dead-letter topic: the
+    // dispatcher would write there with its own credentials on billing's word.
+    entryLines =
+        List.of(
+            "codec: text",
+            "maxAttempts: 1",
+            "onExhausted: ON_EXHAUSTED_DEAD_LETTER",
+            "deadLetterTopic: " + elsewhere);
+    App denied = new App(sidecar("denied", billing, List.of(DISPATCHER_ID), topic), topic);
+    Status status = denied.status();
+    assertThat(status.getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+    assertThat(status.getDescription())
+        .contains(
+            BILLING
+                + " is not allowed to consume topic "
+                + topic
+                + " in group "
+                + group
+                + " on cluster a with dead-letter topic "
+                + elsewhere);
+
+    // One its rule lists is written to.
+    entryLines =
+        List.of(
+            "codec: text",
+            "maxAttempts: 1",
+            "onExhausted: ON_EXHAUSTED_DEAD_LETTER",
+            "deadLetterTopic: " + deadLetters);
+    App app = new App(sidecar("billing", billing, List.of(DISPATCHER_ID), topic), topic).working();
+    app.credits(4);
+    producer
+        .send(new ProducerRecord<>(topic, 0, "poison", "cannot be decoded"))
+        .get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    producer
+        .send(new ProducerRecord<>(topic, 0, "fine", null))
+        .get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    await("the record behind it arrives", () -> app.received.size() == 1);
+    awaitCommitted(topic);
+    var letters = ServerHarness.read(ServerHarness.KAFKA_A, deadLetters, 1, 1);
+    assertThat(letters).hasSize(1);
+    assertThat(letters.get(0).key()).isEqualTo("poison");
+    assertThat(ServerHarness.header(letters.get(0), "odradek-source-group")).isEqualTo(group);
+    assertThat(ServerHarness.header(letters.get(0), "odradek-failure")).isEqualTo("rejected");
+    // And nothing was written where it was not allowed: the topic was never made.
+    assertThat(admin.listTopics().names().get(30, TimeUnit.SECONDS)).doesNotContain(elsewhere);
+    assertThat(app.closed).isNotDone();
   }
 
   @Test

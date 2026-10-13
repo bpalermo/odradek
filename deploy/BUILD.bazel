@@ -1,0 +1,12 @@
+package(default_visibility = ["//visibility:private"])
+
+# Example Kubernetes manifests: a dispatcher, and an application whose pods
+# consume through it. They are examples to start from, not something a build
+# produces. ExampleManifestsTest in //server:main_test loads every server
+# configuration they embed with the server's own loader and holds the manifests
+# against it, so that they cannot drift from what the server accepts.
+filegroup(
+    name = "manifests",
+    srcs = glob(["kubernetes/**/*.yaml"]),
+    visibility = ["//server:__pkg__"],
+)

@@ -78,18 +78,28 @@ public sealed interface DispatchEvent<R> {
   record Acknowledged<R>(String receiver, int partition, long firstOffset, long lastOffset)
       implements DispatchEvent<R> {}
 
-  /** A receiver gave one record back: a failed attempt. Ignored unless the receiver holds it. */
-  record Rejected<R>(String receiver, int partition, long offset) implements DispatchEvent<R> {}
+  /**
+   * A receiver gave one record back: a failed attempt. Ignored unless the receiver holds it.
+   *
+   * @param reason what the receiver said of it, handed back with {@link DispatchAction.DeadLetter}
+   *     if this was the record's last attempt; null or empty when it said nothing
+   */
+  record Rejected<R>(String receiver, int partition, long offset, String reason)
+      implements DispatchEvent<R> {}
 
   /** The dead letter asked for by {@link DispatchAction.DeadLetter} is written. */
   record DeadLetterWritten<R>(int partition, long offset) implements DispatchEvent<R> {}
 
-  /** The dead letter could not be written. The core asks again at once. */
+  /**
+   * The dead letter could not be written. The core asks again after a wait that doubles with each
+   * failure ({@link DispatchSettings#deadLetterRetry}), for as long as it owns the partition.
+   */
   record DeadLetterFailed<R>(int partition, long offset) implements DispatchEvent<R> {}
 
   /**
-   * Time passed, and nothing else happened. Processing deadlines and the hand-over wait are checked
-   * on this event only; {@link DispatchCore#nextDeadlineNanos()} says when it is next needed.
+   * Time passed, and nothing else happened. Processing deadlines, the waits before a redelivery and
+   * before a dead letter is written again, and the hand-over wait are checked on this event only;
+   * {@link DispatchCore#nextDeadlineNanos()} says when it is next needed.
    */
   record TimePassed<R>() implements DispatchEvent<R> {}
 }

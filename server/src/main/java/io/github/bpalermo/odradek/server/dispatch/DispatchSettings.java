@@ -22,6 +22,14 @@ import java.time.Duration;
  *     at least 1
  * @param revokeGrace longest a revoked partition waits for the acknowledgements of what is in
  *     flight before it is released; zero releases at once
+ * @param redeliveryBackoff how long a record waits before it is sent again after its first failed
+ *     attempt; the wait doubles with each further failed attempt, up to {@code
+ *     redeliveryBackoffMax}. Zero sends again at once
+ * @param redeliveryBackoffMax the longest such wait; not less than {@code redeliveryBackoff}
+ * @param deadLetterRetry how long the core waits before it asks again for a dead letter whose write
+ *     failed; the wait doubles with each further failure, up to {@code deadLetterRetryMax}. Zero
+ *     asks again at once
+ * @param deadLetterRetryMax the longest such wait; not less than {@code deadLetterRetry}
  */
 public record DispatchSettings(
     Ordering ordering,
@@ -31,7 +39,70 @@ public record DispatchSettings(
     long window,
     int maxBufferedRecords,
     long maxBufferedBytes,
-    Duration revokeGrace) {
+    Duration revokeGrace,
+    Duration redeliveryBackoff,
+    Duration redeliveryBackoffMax,
+    Duration deadLetterRetry,
+    Duration deadLetterRetryMax) {
+
+  /** Settings under which nothing waits: a failed record, and a failed dead letter, go at once. */
+  public DispatchSettings(
+      Ordering ordering,
+      Duration maxProcessing,
+      int maxAttempts,
+      OnExhausted onExhausted,
+      long window,
+      int maxBufferedRecords,
+      long maxBufferedBytes,
+      Duration revokeGrace) {
+    this(
+        ordering,
+        maxProcessing,
+        maxAttempts,
+        onExhausted,
+        window,
+        maxBufferedRecords,
+        maxBufferedBytes,
+        revokeGrace,
+        Duration.ZERO,
+        Duration.ZERO,
+        Duration.ZERO,
+        Duration.ZERO);
+  }
+
+  /** These settings with another wait before a redelivery. */
+  public DispatchSettings withRedeliveryBackoff(Duration first, Duration longest) {
+    return new DispatchSettings(
+        ordering,
+        maxProcessing,
+        maxAttempts,
+        onExhausted,
+        window,
+        maxBufferedRecords,
+        maxBufferedBytes,
+        revokeGrace,
+        first,
+        longest,
+        deadLetterRetry,
+        deadLetterRetryMax);
+  }
+
+  /** These settings with another wait before a dead letter is written again. */
+  public DispatchSettings withDeadLetterRetry(Duration first, Duration longest) {
+    return new DispatchSettings(
+        ordering,
+        maxProcessing,
+        maxAttempts,
+        onExhausted,
+        window,
+        maxBufferedRecords,
+        maxBufferedBytes,
+        revokeGrace,
+        redeliveryBackoff,
+        redeliveryBackoffMax,
+        first,
+        longest);
+  }
 
   /** Which records of a partition may be unacknowledged at the same time. */
   public enum Ordering {
@@ -67,6 +138,15 @@ public record DispatchSettings(
     if (window < 1 || maxBufferedRecords < 1 || maxBufferedBytes < 1) {
       throw new IllegalArgumentException(
           "window, maxBufferedRecords and maxBufferedBytes must be at least 1");
+    }
+    checkWait("redeliveryBackoff", redeliveryBackoff, redeliveryBackoffMax);
+    checkWait("deadLetterRetry", deadLetterRetry, deadLetterRetryMax);
+  }
+
+  private static void checkWait(String name, Duration first, Duration longest) {
+    if (first == null || longest == null || first.isNegative() || first.compareTo(longest) > 0) {
+      throw new IllegalArgumentException(
+          name + " must not be negative, nor more than " + name + "Max");
     }
   }
 }

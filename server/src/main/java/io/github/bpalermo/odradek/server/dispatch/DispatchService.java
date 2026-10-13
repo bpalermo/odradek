@@ -120,6 +120,20 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
   static final Duration DEFAULT_COMMIT_INTERVAL = Duration.ofSeconds(5);
 
   /**
+   * How long a dead letter whose write failed waits before it is written again: this the first
+   * time, doubled for each further failure, up to the second. Not configuration: the producer has
+   * already retried what a retry can mend, for its {@code delivery.timeout.ms}, before it reports a
+   * failure, so what is left is a topic that is missing or may not be written, or a record it
+   * refuses, and those are mended by an operator, not by a shorter wait.
+   */
+  static final Duration DEAD_LETTER_RETRY = Duration.ofSeconds(1);
+
+  static final Duration DEAD_LETTER_RETRY_MAX = Duration.ofSeconds(30);
+
+  /** How long {@link #shutdown} lets the dead-letter producers finish, after the groups have. */
+  private static final Duration DEAD_LETTER_CLOSE = Duration.ofSeconds(5);
+
+  /**
    * How much of a partition may be fetched and waiting for a first delivery before fetching it
    * pauses, in records and in bytes; it resumes at half. Not configuration: what bounds memory and
    * redelivery is {@code dispatch.partitionWindow}, and how much one fetch brings is Kafka's own
@@ -143,6 +157,7 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
   private final TlsSources tls;
   private final ServerMetrics metrics;
   private final Factory factory;
+  private final DeadLetters deadLetters;
   private final LongSupplier nanoClock;
   private final long window;
   private final Duration idleGrace;
@@ -182,6 +197,7 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
         (cluster, properties) ->
             new KafkaConsumer<>(
                 properties, new ByteArrayDeserializer(), new ByteArrayDeserializer()),
+        new DeadLetters(config, tls, metrics),
         System::nanoTime);
   }
 
@@ -190,11 +206,13 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
       TlsSources tls,
       ServerMetrics metrics,
       Factory factory,
+      DeadLetters deadLetters,
       LongSupplier nanoClock) {
     this.config = config;
     this.tls = tls;
     this.metrics = metrics;
     this.factory = factory;
+    this.deadLetters = deadLetters;
     this.nanoClock = nanoClock;
     Dispatch dispatch = config.getDispatch();
     if (!dispatch.hasTls() && dispatch.getPolicyCount() > 0) {
@@ -278,8 +296,11 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
 
   /**
    * Stops dispatching: no declaration is accepted any more, every group hands its partitions over
-   * (it waits for what is in flight, for at most the revoke grace, and commits), ends its streams
-   * with UNAVAILABLE and leaves its consumer group. Waits up to {@code timeout} for that.
+   * (it waits for what is in flight and for the dead letters being written, for at most the revoke
+   * grace, and commits), ends its streams with UNAVAILABLE and leaves its consumer group. Waits up
+   * to {@code timeout} for that, and then closes the dead-letter producers: a dead letter that was
+   * not acknowledged by then was not committed past, and its record is delivered again by the next
+   * owner of its partition.
    */
   public void shutdown(Duration timeout) {
     List<DispatchGroup> open;
@@ -294,12 +315,16 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
         group.join(Math.max(1, (deadline - System.nanoTime()) / 1_000_000));
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
-        return;
+        break;
       }
     }
+    deadLetters.close(DEAD_LETTER_CLOSE);
   }
 
-  /** How long {@link #shutdown} needs at most: the hand-over wait and the commits after it. */
+  /**
+   * How long {@link #shutdown} is to be given: the hand-over wait and the commits after it. The
+   * dead-letter producers may take a few seconds more.
+   */
   public Duration shutdownTimeout() {
     return revokeGrace.plusSeconds(15);
   }
@@ -340,6 +365,9 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
             revokeGrace,
             idleGrace,
             commitInterval,
+            DEAD_LETTER_RETRY,
+            DEAD_LETTER_RETRY_MAX,
+            deadLetters,
             () -> accepted,
             nanoClock);
     return new DispatchGroup(
@@ -524,6 +552,7 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
           peer == null || peer.spiffeId() == null ? "an unidentified sidecar" : peer.spiffeId(),
           status.getCode(),
           status.getDescription());
+      metrics.declarationRefused(status.getCode().name());
       call.onError(status.asRuntimeException());
     }
 

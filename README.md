@@ -1,6 +1,8 @@
 # odradek
 
-odradek moves the Kafka client out of the application. Its server is a Java process, deployed today as a sidecar container next to the application in a Kubernetes pod, that owns the Kafka producer and consumer, and exposes a gRPC API to the application over a Unix domain socket. Thin client libraries for applications, in Java, Clojure and Python, live in the same repository.
+odradek moves the Kafka client out of the application. Its server is a Java process, deployed as a sidecar container next to the application in a Kubernetes pod, that owns the Kafka producer and consumer, and exposes a gRPC API to the application over a Unix domain socket. Thin client libraries for applications, in Java, Clojure and Python, live in the same repository.
+
+The same server can also run on its own as a dispatcher ([ADR 6](docs/adr/0006-standalone-dispatcher-for-consumption.md)): a small deployment that is the consumer group and hands records to the sidecars, so that an application's pods scale without rebalancing and beyond the partition count, with per-key ordering, redelivery limits and a dead-letter topic. Its seven planned steps are built; it has not been run in production, and the design says what it still lacks ("Operating a dispatcher" in [docs/design.md](docs/design.md)).
 
 ## Layout
 
@@ -16,6 +18,7 @@ odradek moves the Kafka client out of the application. Its server is a Java proc
 | `client/python/` | Python client library for applications (asyncio): a port of the protocol core, the generated API and the wheel (ADR 3) |
 | `conformance/` | Scenarios every client core must pass |
 | `e2e/` | End-to-end suites against real brokers: the server and the Java client (`src/`), the Python client (`python/`) |
+| `deploy/kubernetes/` | Example manifests, plain YAML with a `kustomization.yaml` each: a dispatcher (`dispatcher/`) and an application pod with the server as its sidecar (`application/`). `kubectl kustomize deploy/kubernetes/dispatcher` renders them; a unit test loads the configurations they embed |
 | `extension/java/` | Interfaces for extension jars: `RecordTransform`, the byte-to-byte codec step (encryption and similar) |
 | `bazel/` | Shared build code: formatter, linters, JUnit 6 macro, gRPC codegen shims |
 | `docs/` | The design (`design.md`) and architecture decision records (`adr/`) |

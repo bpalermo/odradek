@@ -1,0 +1,18 @@
+# An example to start from, not a release artifact: read the comments in each
+# file, and "Operating a dispatcher" in docs/design.md. The files are plain
+# manifests (`kubectl apply -n kafka -f .` works too); this only names them and
+# their namespace, which is not created here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: kafka
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+  - poddisruptionbudget.yaml
+# The image is published as quay.io/odradek/odradek; pin what you run:
+# images:
+#   - name: quay.io/odradek/odradek
+#     digest: sha256:<digest>

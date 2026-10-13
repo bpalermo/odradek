@@ -1,0 +1,15 @@
+# A node drain takes one replica at a time, as a rollout does: each replica
+# that goes hands its partitions over, and the next should not go before they
+# have settled.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: odradek-dispatcher
+  labels:
+    app.kubernetes.io/name: odradek-dispatcher
+    app.kubernetes.io/part-of: odradek
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: odradek-dispatcher
