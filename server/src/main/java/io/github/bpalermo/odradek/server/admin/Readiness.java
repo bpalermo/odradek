@@ -18,19 +18,26 @@ public final class Readiness {
 
   private volatile TlsSources tls = TlsSources.none();
 
+  /** Guarded by this. */
+  private boolean stopped;
+
   /** Names the startup step in progress. */
   public void starting(String step) {
     phase = "starting: " + step;
   }
 
-  /** The server is listening, with these credentials. */
-  public void started(TlsSources credentials) {
+  /** The server is listening, with these credentials. Not after {@link #stopping}. */
+  public synchronized void started(TlsSources credentials) {
+    if (stopped) {
+      return;
+    }
     tls = credentials;
     phase = null;
   }
 
-  /** Shutdown has begun. */
-  public void stopping() {
+  /** Shutdown has begun, for good: a startup that completes after this changes nothing. */
+  public synchronized void stopping() {
+    stopped = true;
     phase = "stopping";
   }
 

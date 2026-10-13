@@ -13,6 +13,7 @@ import io.github.bpalermo.odradek.config.v1.Codec;
 import io.github.bpalermo.odradek.config.v1.Consume;
 import io.github.bpalermo.odradek.config.v1.ConsumerSource;
 import io.github.bpalermo.odradek.config.v1.Contracts;
+import io.github.bpalermo.odradek.config.v1.Coordination;
 import io.github.bpalermo.odradek.config.v1.Dispatch;
 import io.github.bpalermo.odradek.config.v1.Dispatcher;
 import io.github.bpalermo.odradek.config.v1.FileSource;
@@ -562,42 +563,97 @@ class ServerConfigValidationTest {
         .setFiles(FileSource.newBuilder().setDir("/etc/odradek/delivery"));
   }
 
+  /** A dispatch section with what every one needs: the group its replicas find each other in. */
+  private static Dispatch.Builder dispatch() {
+    return Dispatch.newBuilder()
+        .setCoordination(Coordination.newBuilder().setGroupId("odradek-dispatcher"));
+  }
+
+  @Test
+  void dispatchNeedsACoordinationGroup() throws ValidationException {
+    assertViolates(valid().setDispatch(Dispatch.newBuilder().setPort(0)).build(), "required");
+    assertViolates(
+        valid().setDispatch(dispatch().setCoordination(Coordination.getDefaultInstance())).build(),
+        "required");
+    assertViolates(
+        valid()
+            .setDispatch(dispatch().setCoordination(Coordination.newBuilder().setGroupId("")))
+            .build(),
+        "string.min_len");
+  }
+
+  @Test
+  void coordinationClusterMustExistAndIsNeededWithSeveralClusters() throws ValidationException {
+    // One cluster: it is the one.
+    assertThat(ruleIds(valid().setDispatch(dispatch()).build())).isEmpty();
+    assertThat(
+            ruleIds(
+                valid()
+                    .setDispatch(
+                        dispatch()
+                            .setCoordination(
+                                Coordination.newBuilder().setGroupId("g").setCluster("main")))
+                    .build()))
+        .isEmpty();
+    assertViolates(
+        valid()
+            .setDispatch(
+                dispatch()
+                    .setCoordination(
+                        Coordination.newBuilder().setGroupId("g").setCluster("missing")))
+            .build(),
+        "server_config.coordination_cluster_exists");
+    // Several: which one holds the group has to be said, or a new cluster would move it.
+    ServerConfig.Builder two = valid().putClusters("other", cluster().build());
+    assertViolates(
+        two.clone().setDispatch(dispatch()).build(), "server_config.coordination_cluster_exists");
+    assertThat(
+            ruleIds(
+                two.clone()
+                    .setDispatch(
+                        dispatch()
+                            .setCoordination(
+                                Coordination.newBuilder().setGroupId("g").setCluster("other")))
+                    .build()))
+        .isEmpty();
+    // A server that is no dispatcher is not asked.
+    assertThat(ruleIds(two.build())).isEmpty();
+  }
+
   /** A valid config whose dispatch section has this one rule, and the TLS a rule needs. */
   private static ServerConfig withRule(PolicyRule.Builder rule) {
-    return valid().setDispatch(Dispatch.newBuilder().setTls(listenerTls()).addPolicy(rule)).build();
+    return valid().setDispatch(dispatch().setTls(listenerTls()).addPolicy(rule)).build();
   }
 
   @Test
   void policyNeedsTlsOnTheDeliveryPort() throws ValidationException {
     // Without TLS nobody has an identity: a rule could match no one, or would be ignored.
     assertViolates(
-        valid().setDispatch(Dispatch.newBuilder().addPolicy(rule())).build(),
-        "dispatch.policy_requires_tls");
+        valid().setDispatch(dispatch().addPolicy(rule())).build(), "dispatch.policy_requires_tls");
     assertThat(ruleIds(withRule(rule()))).isEmpty();
   }
 
   @Test
   void dispatchWithNeitherTlsNorPolicyIsThePlaintextOfTests() throws ValidationException {
-    assertThat(ruleIds(valid().setDispatch(Dispatch.newBuilder().setPort(0)).build())).isEmpty();
+    assertThat(ruleIds(valid().setDispatch(dispatch().setPort(0)).build())).isEmpty();
   }
 
   @Test
   void dispatchWithTlsAndNoPolicyIsValid() throws ValidationException {
     // It refuses every declaration, which is a state a rollout passes through, not an error.
-    assertThat(ruleIds(valid().setDispatch(Dispatch.newBuilder().setTls(listenerTls())).build()))
-        .isEmpty();
+    assertThat(ruleIds(valid().setDispatch(dispatch().setTls(listenerTls())).build())).isEmpty();
   }
 
   @Test
   void listenerTlsNeedsASource() throws ValidationException {
     assertViolates(
-        valid().setDispatch(Dispatch.newBuilder().setTls(ListenerTls.getDefaultInstance())).build(),
+        valid().setDispatch(dispatch().setTls(ListenerTls.getDefaultInstance())).build(),
         "required");
     assertThat(
             ruleIds(
                 valid()
                     .setDispatch(
-                        Dispatch.newBuilder()
+                        dispatch()
                             .setTls(
                                 ListenerTls.newBuilder()
                                     .setSpiffe(SpiffeSource.getDefaultInstance())))
@@ -610,7 +666,7 @@ class ServerConfigValidationTest {
     assertViolates(
         valid()
             .setDispatch(
-                Dispatch.newBuilder()
+                dispatch()
                     .setTls(
                         ListenerTls.newBuilder().setFiles(FileSource.newBuilder().setDir("tls"))))
             .build(),
@@ -671,7 +727,7 @@ class ServerConfigValidationTest {
     ServerConfig config =
         valid()
             .setDispatch(
-                Dispatch.newBuilder()
+                dispatch()
                     .setPort(9465)
                     .setTls(listenerTls())
                     .setAdvertisedAddress("10.0.0.7:9465")
@@ -695,9 +751,12 @@ class ServerConfigValidationTest {
   }
 
   @Test
-  void emptyDispatchSectionPasses() throws ValidationException {
-    // Every field has a default, and no rule means that every declaration is refused.
-    assertThat(ruleIds(valid().setDispatch(Dispatch.getDefaultInstance()).build())).isEmpty();
+  void aDispatchSectionWithItsCoordinationGroupAloneIsValid() throws ValidationException {
+    // Every other field has a default, and no rule means that every declaration is refused.
+    assertThat(ruleIds(valid().setDispatch(dispatch()).build())).isEmpty();
+    // The group is what cannot be defaulted: two dispatchers that shared one would be each
+    // other's replicas.
+    assertViolates(valid().setDispatch(Dispatch.getDefaultInstance()).build(), "required");
   }
 
   @Test
@@ -897,29 +956,26 @@ class ServerConfigValidationTest {
 
   @Test
   void dispatchPortMustBeAPort() throws ValidationException {
-    assertViolates(valid().setDispatch(Dispatch.newBuilder().setPort(70000)).build(), "uint32.lte");
+    assertViolates(valid().setDispatch(dispatch().setPort(70000)).build(), "uint32.lte");
   }
 
   @Test
   void advertisedAddressMustBeHostAndPort() throws ValidationException {
     assertViolates(
-        valid().setDispatch(Dispatch.newBuilder().setAdvertisedAddress("10.0.0.7")).build(),
+        valid().setDispatch(dispatch().setAdvertisedAddress("10.0.0.7")).build(),
         "string.host_and_port");
   }
 
   @Test
   void idleGraceMustNotBeNegative() throws ValidationException {
     assertViolates(
-        valid().setDispatch(Dispatch.newBuilder().setIdleGrace(seconds(-1))).build(),
-        "duration.gte");
-    assertThat(ruleIds(valid().setDispatch(Dispatch.newBuilder().setIdleGrace(seconds(0))).build()))
-        .isEmpty();
+        valid().setDispatch(dispatch().setIdleGrace(seconds(-1))).build(), "duration.gte");
+    assertThat(ruleIds(valid().setDispatch(dispatch().setIdleGrace(seconds(0))).build())).isEmpty();
   }
 
   @Test
   void partitionWindowMustBeAtLeastOne() throws ValidationException {
-    assertViolates(
-        valid().setDispatch(Dispatch.newBuilder().setPartitionWindow(0)).build(), "uint32.gte");
+    assertViolates(valid().setDispatch(dispatch().setPartitionWindow(0)).build(), "uint32.gte");
   }
 
   @Test

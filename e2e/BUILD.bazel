@@ -73,6 +73,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2e.MtlsE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
         "io.github.bpalermo.odradek.e2e.ReceiveE2eTest",
+        "io.github.bpalermo.odradek.e2e.ReplicasE2eTest",
         "io.github.bpalermo.odradek.e2e.StartupE2eTest",
         "io.github.bpalermo.odradek.e2e.TelemetryE2eTest",
     ],
@@ -112,6 +113,26 @@ java_junit_test(
     deps = _DEPS,
 )
 
+# The dispatcher's replicas against the packaged server, in a target of its own.
+# A JVM takes seconds to start, the suite above starts a server or two for each
+# case, and this class starts two dozen: beside that suite, it adds nothing to
+# the time a run takes.
+java_junit_test(
+    name = "e2e_replicas_jvm_binary_test",
+    size = "large",
+    srcs = glob(["src/test/java/**/*.java"]),
+    data = ["//server"],
+    env = {"ODRADEK_E2E_SERVER": "$(rootpath //server)"},
+    javacopts = JAVACOPTS,
+    tags = _TAGS,
+    test_classes = ["io.github.bpalermo.odradek.e2e.ReplicasE2eTest"],
+    runtime_deps = [
+        "//server:netty_epoll_native",
+        "@maven//:ch_qos_logback_logback_classic",
+    ],
+    deps = _DEPS,
+)
+
 # The same again against the native image of the server (ADR 5), compiled
 # ahead of time by GraalVM. A test that passes on the JVM and fails here is a
 # failure of the native image.
@@ -134,6 +155,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2e.MtlsE2eTest",
         "io.github.bpalermo.odradek.e2e.ProduceE2eTest",
         "io.github.bpalermo.odradek.e2e.ReceiveE2eTest",
+        "io.github.bpalermo.odradek.e2e.ReplicasE2eTest",
         "io.github.bpalermo.odradek.e2e.StartupE2eTest",
         "io.github.bpalermo.odradek.e2e.TelemetryE2eTest",
     ],

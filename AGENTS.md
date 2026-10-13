@@ -48,6 +48,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 - **Metrics.** Every metric is declared in `ServerMetrics`, or in `KafkaClientMetrics` when it is one of the Kafka clients' own, and listed in `docs/design.md`. Names and attributes are a contract with dashboards: add, do not rename.
 - **Version.** One version for everything, in `bazel/version.bzl`. Do not edit it by hand; the release workflow sets it from the tag with `scripts/set-version.sh`.
 - **Tests that create topics** must wait for partition leaders before producing (see `ServerHarness.createTopic`); producing sooner can wedge Kafka's idempotent producer for minutes.
+- **Tests that start a dispatcher** go through `DispatcherHarness`, which gives each one a coordination group of its own: every suite uses the same brokers, and dispatchers that shared a group would be each other's replicas. Further replicas of one dispatcher come from `replica()`.
 - **Design changes.** Update `docs/design.md` in the same change. A decision that constrains future work gets a new ADR in `docs/adr/`, in the format of the existing ones.
 
 ## Workflow

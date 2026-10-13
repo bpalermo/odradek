@@ -23,7 +23,9 @@ service DeliveryService {
   // One stream carries one topic of one consumer group. A sidecar opens a
   // stream to every dispatcher replica for each topic its application
   // consumes, because each replica owns some of the topic's partitions, and
-  // closes them when the application stops consuming.
+  // closes them when the application stops consuming. A replica joins the
+  // consumer group when the first sidecar declares it to that replica, which
+  // is why the list of replicas a sidecar is sent is all of them.
   //
   // The first message from the sidecar must be Declare; the dispatcher
   // answers with Accepted before anything else. Records are then delivered
@@ -279,8 +281,9 @@ message Accepted {
   // filled in: those of the first declaration, which this one matched or
   // was, with the max_processing_ms of this one.
   Settings settings = 1;
-  // The dispatcher's replicas at the time of the handshake. The sidecar
-  // opens a stream to each one it is not connected to.
+  // The dispatcher's replicas as this one knew them at the handshake: the
+  // newest list it has. The sidecar opens a stream to each one it is not
+  // connected to, unless it already acts on a list with a higher generation.
   ReplicaList replicas = 2;
   // The dispatcher replica answering this stream.
   PeerInfo dispatcher = 3;
@@ -293,19 +296,28 @@ message Accepted {
   string address = 4;
 }
 
-// ReplicaList is every dispatcher replica that consumes for the stream's
-// consumer group. A list is complete: it replaces the one before it. Every
-// replica pushes the new list on every stream it holds whenever the group's
-// membership changes, and a sidecar opens and closes streams to match.
+// ReplicaList is every replica of the dispatcher, whatever each of them
+// consumes: a replica starts consuming a group's topics when a sidecar
+// declares them to it, so a sidecar declares to every replica there is. A
+// list is complete: it replaces the one before it. Every replica pushes the
+// new list on every stream it holds whenever a replica starts or stops, and a
+// sidecar opens and closes streams to match.
+//
+// The replicas agree on the list through a consumer group of their own in
+// Kafka, where the same message also serves as what they tell each other: a
+// replica joins with a list of itself alone under the highest generation it
+// has seen, and is answered with the list of all under a new one.
 message ReplicaList {
-  // Orders the lists of one consumer group: it grows every time the group's
-  // membership changes, and every replica sends the same list under the same
-  // generation. A sidecar ignores a list whose generation is not higher than
-  // that of the list it is acting on. A sidecar that has lost every stream
-  // forgets the generation it knew and starts again from the bootstrap
-  // address.
+  // Orders the lists of one dispatcher: every change of its replicas makes a
+  // list with a higher generation than any replica had seen, and every
+  // replica sends the same list under the same generation. A sidecar ignores
+  // a list whose generation is not higher than that of the list it is acting
+  // on. A sidecar that has lost every stream forgets the generation it knew
+  // and starts again from the bootstrap address. Generations are not
+  // consecutive, and the same replicas may be listed again under a higher
+  // one.
   uint64 generation = 1;
-  // The replicas, in no particular order.
+  // The replicas, ordered by address. The order means nothing.
   repeated Replica replicas = 2;
 }
 

@@ -40,6 +40,14 @@ import org.slf4j.LoggerFactory;
 public final class DeliveryServer implements Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(DeliveryServer.class);
 
+  /**
+   * The environment variable that names the host this replica advertises, when the address of its
+   * network interface is not the one sidecars reach it at. It is per replica, which a configuration
+   * file shared by all of them cannot be: in Kubernetes, set it from the pod's {@code
+   * status.podIP}. The port being served is added to it.
+   */
+  public static final String HOST_VARIABLE = "ODRADEK_ADVERTISED_HOST";
+
   private final Server server;
   private final EventLoopGroup acceptors;
   private final EventLoopGroup workers;
@@ -64,13 +72,31 @@ public final class DeliveryServer implements Closeable {
    */
   public static DeliveryServer start(Dispatch dispatch, DispatchService service, TlsSources tls)
       throws IOException, CredentialException {
-    return start(dispatch, service, tls.listener());
+    return start(dispatch, service, tls.listener(), System.getenv(HOST_VARIABLE));
   }
 
   /** As above, with the listener's credentials themselves; null for a plaintext port. */
   static DeliveryServer start(
       Dispatch dispatch, DispatchService service, CredentialSource credentials)
       throws IOException, CredentialException {
+    return start(dispatch, service, credentials, null);
+  }
+
+  /**
+   * As above, with the host this replica was given in its environment to advertise; null when it
+   * was given none.
+   */
+  static DeliveryServer start(
+      Dispatch dispatch, DispatchService service, CredentialSource credentials, String host)
+      throws IOException, CredentialException {
+    if (dispatch.hasAdvertisedAddress() && host != null && !host.isBlank()) {
+      // Before anything is bound. The variable is this replica's own and the configuration is
+      // shared by all of them: nothing says which was meant.
+      throw new IOException(
+          "dispatch.advertisedAddress and "
+              + HOST_VARIABLE
+              + " are both set; a replica advertises one address");
+    }
     if (dispatch.hasTls() != (credentials != null)
         || dispatch.hasTls() != service.enforcesPolicy()) {
       // One configuration made all three; a listener must never be less safe than its service.
@@ -105,10 +131,7 @@ public final class DeliveryServer implements Closeable {
       workers.shutdownGracefully(0, 1, TimeUnit.SECONDS);
       throw e;
     }
-    String advertised =
-        dispatch.hasAdvertisedAddress()
-            ? dispatch.getAdvertisedAddress()
-            : hostAndPort(interfaceAddress(), server.getPort());
+    String advertised = advertised(dispatch, host, server.getPort());
     service.advertise(advertised);
     LOG.info(
         "delivery service on port {}, advertised as {}, {}",
@@ -165,6 +188,22 @@ public final class DeliveryServer implements Closeable {
     acceptors.shutdownGracefully(0, 1, TimeUnit.SECONDS);
     workers.shutdownGracefully(0, 1, TimeUnit.SECONDS);
     LOG.info("delivery service stopped");
+  }
+
+  /**
+   * The address this replica advertises: the one in its configuration; or the host its environment
+   * names, with the port being served; or the address of its network interface with that port.
+   */
+  static String advertised(Dispatch dispatch, String host, int port) {
+    if (dispatch.hasAdvertisedAddress()) {
+      return dispatch.getAdvertisedAddress();
+    }
+    if (host == null || host.isBlank()) {
+      return hostAndPort(interfaceAddress(), port);
+    }
+    String name = host.strip();
+    // An IPv6 address as status.podIP gives it, without brackets.
+    return (name.indexOf(':') >= 0 && !name.startsWith("[") ? "[" + name + "]" : name) + ":" + port;
   }
 
   static String hostAndPort(InetAddress address, int port) {

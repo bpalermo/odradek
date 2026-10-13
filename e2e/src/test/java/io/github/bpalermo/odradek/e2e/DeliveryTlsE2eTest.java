@@ -49,11 +49,13 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.GroupState;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
@@ -94,12 +96,15 @@ class DeliveryTlsE2eTest {
             bootstrap.servers: %s
           consumerProperties:
             session.timeout.ms: 10000
+            heartbeat.interval.ms: 500
       consume:
         commitInterval: 0.2s
         revokeDeadline: 2s
       dispatch:
         port: 0
         idleGrace: 60s
+        coordination:
+          groupId: odradek-e2e-delivery-replicas-%s
         tls:
           files:
             dir: %s
@@ -135,6 +140,12 @@ class DeliveryTlsE2eTest {
   private final List<String> topics = new ArrayList<>();
   private final List<ServerHarness> sidecars = new ArrayList<>();
   private final List<ManagedChannel> channels = new ArrayList<>();
+  private final List<DispatcherHarness> dispatchers = new ArrayList<>();
+  private final TcpRelay service;
+
+  DeliveryTlsE2eTest() throws Exception {
+    service = new TcpRelay();
+  }
 
   private Path credentials;
   private DispatcherHarness dispatcher;
@@ -259,6 +270,12 @@ class DeliveryTlsE2eTest {
       return this;
     }
 
+    /** The app is done: the stream is closed in good order. */
+    void close() {
+      onRecord = record -> {};
+      requests.onCompleted();
+    }
+
     Status status() throws Exception {
       return closed.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
     }
@@ -296,9 +313,10 @@ class DeliveryTlsE2eTest {
     for (ServerHarness sidecar : sidecars) {
       sidecar.stop();
     }
-    if (dispatcher != null) {
-      dispatcher.stop();
+    for (DispatcherHarness started : dispatchers) {
+      started.stop();
     }
+    service.close();
     if (producer != null) {
       producer.close(Duration.ofSeconds(5));
     }
@@ -316,7 +334,11 @@ class DeliveryTlsE2eTest {
   // -------------------------------------------------------------------------------------------
 
   private void createTopic(String name) throws Exception {
-    ServerHarness.createTopic(ServerHarness.KAFKA_A, name, 1);
+    createTopic(name, 1);
+  }
+
+  private void createTopic(String name, int partitions) throws Exception {
+    ServerHarness.createTopic(ServerHarness.KAFKA_A, name, partitions);
     topics.add(name);
   }
 
@@ -330,17 +352,32 @@ class DeliveryTlsE2eTest {
 
   /** Starts the dispatcher with this certificate; it trusts the sidecars' authority. */
   private int startDispatcher(TestPki.Issued certificate) throws Exception {
-    dispatcher =
+    dispatcher = replica("dispatcher", certificate, topic);
+    return dispatcher.port();
+  }
+
+  /**
+   * Starts a server that joins the coordination group of this test's dispatcher: a replica of it,
+   * or something that only says it is.
+   *
+   * @param name of its credentials directory
+   * @param allowed the topic its policy allows billing, besides {@code third}
+   */
+  private DispatcherHarness replica(String name, TestPki.Issued certificate, String allowed)
+      throws Exception {
+    DispatcherHarness started =
         DispatcherHarness.start(
             DISPATCHER,
             ServerHarness.KAFKA_A,
-            install("dispatcher", certificate, ca),
-            topic,
+            id,
+            install(name, certificate, ca),
+            allowed,
             third,
             group,
             second,
             group);
-    return dispatcher.port();
+    dispatchers.add(started);
+    return started;
   }
 
   /**
@@ -352,11 +389,18 @@ class DeliveryTlsE2eTest {
   private ServerHarness sidecar(
       String name, TestPki.Issued certificate, List<String> accepted, String... names)
       throws Exception {
+    return sidecarAt(dispatcher.port(), name, certificate, accepted, names);
+  }
+
+  /** As above, for a sidecar that knows the dispatcher by the address at this local port. */
+  private ServerHarness sidecarAt(
+      int port, String name, TestPki.Issued certificate, List<String> accepted, String... names)
+      throws Exception {
     StringBuilder yaml =
         new StringBuilder()
             .append("listener:\n  socketPath: %s/kafka.sock\n")
             .append("dispatcher:\n  address: localhost:")
-            .append(dispatcher.port())
+            .append(port)
             .append('\n');
     if (name != null) {
       yaml.append("  tls:\n    files:\n      dir: ")
@@ -397,6 +441,58 @@ class DeliveryTlsE2eTest {
       assertThat(System.nanoTime()).as("%s within %s", what, TIMEOUT).isLessThan(deadline);
       Thread.sleep(20);
     }
+  }
+
+  /** Writes {@code count} records with keys of their own, spread over a topic's partitions. */
+  private Set<String> produce(String name, String prefix, int count, int partitions)
+      throws Exception {
+    List<Future<RecordMetadata>> sends = new ArrayList<>();
+    Set<String> values = new TreeSet<>();
+    for (int i = 0; i < count; i++) {
+      String value = prefix + "-" + i;
+      values.add(value);
+      sends.add(producer.send(new ProducerRecord<>(name, i % partitions, "key-" + value, value)));
+    }
+    for (Future<RecordMetadata> send : sends) {
+      send.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    }
+    return values;
+  }
+
+  /**
+   * How many partitions each member of the consumed group has, as the brokers know it; empty while
+   * the group is not stable. A member is the consumer of one replica, which joins the group only
+   * when a sidecar it accepted declares the group to it.
+   */
+  private List<Integer> members() {
+    try {
+      ConsumerGroupDescription description =
+          admin
+              .describeConsumerGroups(List.of(group))
+              .describedGroups()
+              .get(group)
+              .get(30, TimeUnit.SECONDS);
+      if (description.groupState() != GroupState.STABLE) {
+        return List.of();
+      }
+      return description.members().stream()
+          .map(member -> member.assignment().topicPartitions().size())
+          .toList();
+    } catch (Exception e) {
+      return List.of();
+    }
+  }
+
+  /** Waits until this many replicas consume the group and have these partitions between them. */
+  private void awaitMembers(int count, int partitions) throws InterruptedException {
+    await(
+        count + " replicas consume the group",
+        () -> {
+          List<Integer> members = members();
+          return members.size() == count
+              && members.stream().noneMatch(owned -> owned == 0)
+              && members.stream().mapToInt(Integer::intValue).sum() == partitions;
+        });
   }
 
   /** What the group has committed for the one partition of a topic; -1 for nothing. */
@@ -672,6 +768,14 @@ class DeliveryTlsE2eTest {
     assertThat(app.received).as("nothing was delivered twice").hasSize(21);
     assertThat(app.lost).isEmpty();
 
+    // The streams of one sidecar share its connection to the dispatcher, and a connection is
+    // who it was when it was made: while the first stream holds it, the sidecar is still billing.
+    assertThat(new App(sidecar, second).status().getCode())
+        .isEqualTo(Status.Code.PERMISSION_DENIED);
+    assertThat(app.closed).isNotDone();
+    app.close();
+    assertThat(app.status()).isEqualTo(Status.OK);
+
     // A new connection of the same sidecar presents the new certificate: it is audit now.
     App asAudit = new App(sidecar, second).working();
     asAudit.credits(10);
@@ -680,12 +784,101 @@ class DeliveryTlsE2eTest {
 
     // And the dispatcher presents its new one: the sidecar that waited for it is served.
     await("the waiting sidecar is served", () -> late.values().equals(forLate));
-    assertThat(app.closed).isNotDone();
   }
 
   // -------------------------------------------------------------------------------------------
   // The process
   // -------------------------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------------------------
+  // Several replicas
+  // -------------------------------------------------------------------------------------------
+
+  @Test
+  void replicasAreFoundAndVerifiedOverMutualTlsAndSoIsOneThatReplacesAnother() throws Exception {
+    createTopic(topic, 4);
+    startDispatcher(dispatcherCertificate);
+    DispatcherHarness other = dispatcher.replica();
+    dispatchers.add(other);
+    service.target(dispatcher.port(), other.port());
+    await(
+        "both replicas know of each other",
+        () -> dispatcher.replicaCount() == 2 && other.replicaCount() == 2);
+
+    // One address, that of the Service. The replica that answers there is verified, and so is
+    // the other, which the sidecar connects to at the address the first one gave it: each
+    // authorizes the declaration by the sidecar's certificate, and joins the group for it.
+    App app =
+        new App(sidecarAt(service.port(), "billing", billing, List.of(DISPATCHER_ID), topic), topic)
+            .working();
+    app.credits(8);
+    awaitMembers(2, 4);
+    Set<String> produced = produce(topic, "a", 40, 4);
+    await("everything is received", () -> app.values().equals(produced));
+
+    // One replica goes and another comes, somewhere else. The sidecar hears of it from the
+    // replica it still has, and does not go back to the Service's address.
+    int connections = service.accepted();
+    other.stopDispatcher();
+    awaitMembers(1, 4);
+    DispatcherHarness next = dispatcher.replica();
+    dispatchers.add(next);
+    awaitMembers(2, 4);
+    produced.addAll(produce(topic, "b", 40, 4));
+    await("everything is received after the change", () -> app.values().equals(produced));
+    assertThat(service.accepted())
+        .as("connections to the Service's address")
+        .isEqualTo(connections);
+    assertThat(app.closed).isNotDone();
+  }
+
+  @Test
+  void anAddressOnTheListThatIsNotTheDispatchersIsConnectedToAndNeverDeclaredTo() throws Exception {
+    createTopic(topic);
+    startDispatcher(dispatcherCertificate);
+    // Whoever can join the coordination group puts an address on the list every sidecar is
+    // sent. This one chains to the same authority and is not the dispatcher: another workload
+    // of the trust domain.
+    DispatcherHarness other = replica("other", nextDispatcherCertificate, topic);
+    await("the dispatcher lists the other", () -> dispatcher.replicaCount() == 2);
+
+    // The sidecar accepts the dispatcher's SPIFFE ID and no other. It is sent both addresses,
+    // and the handshake with the second fails before a word is said on it.
+    App app = new App(sidecar("billing", billing, List.of(DISPATCHER_ID), topic), topic).working();
+    app.credits(4);
+    Set<String> produced = produce(topic, "v", 20);
+    await("everything is received from the dispatcher", () -> app.values().equals(produced));
+    awaitCommitted(topic);
+    pause();
+
+    // Nothing was declared to the other, so it never joined the group and never read a record.
+    assertThat(members()).as("the members of the consumed group").containsExactly(1);
+    assertThat(app.closed).as("the app's stream").isNotDone();
+    if (DispatcherHarness.packaged()) {
+      assertThat(other.log).noneMatch(line -> line.contains("deliver stream"));
+      assertThat(dispatcher.log).anyMatch(line -> line.contains("deliver stream"));
+    }
+  }
+
+  @Test
+  void aReplicaWhosePolicyRefusesEndsTheAppsStreamAndTheStatusSaysWhichReplica() throws Exception {
+    createTopic(topic);
+    startDispatcher(dispatcherCertificate);
+    // A replica whose policy does not allow billing the topic, as an old one during a rolling
+    // update of the dispatcher that adds the rule.
+    DispatcherHarness behind = replica("behind", dispatcherCertificate, second);
+    await("the dispatcher lists both", () -> dispatcher.replicaCount() == 2);
+
+    // The replica the sidecar reaches first accepts. The other refuses, and one refusal ends the
+    // app's stream: a topic that only some replicas hand over would be consumed in part.
+    App app = new App(sidecar("billing", billing, List.of(DISPATCHER_ID), topic), topic);
+    app.credits(4);
+    Status status = app.status();
+    assertThat(status.getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+    assertThat(status.getDescription())
+        .contains(":" + behind.port() + " refused topic " + topic)
+        .contains(BILLING + " is not allowed to consume topic " + topic);
+  }
 
   /** Needs the packaged server: the in-process harness runs neither Main nor the health service. */
   @Test
