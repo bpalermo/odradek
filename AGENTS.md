@@ -22,6 +22,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 - `--config=llm` gives plain output with verbose failures.
 - Java tests run on the JUnit console launcher (`java_junit_test`, `//bazel/java:junit.bzl`). A new test class runs only once it is listed in the target's `test_classes`, and `--test_filter` has no effect.
 - First-party Java compiles with `-Xlint:all -Werror` and Error Prone, so a warning is a build failure.
+- PMD lints `java_library` and `java_binary` sources under `--config=lint` (ruleset: `pmd.xml`; tests are not visited). An unused pattern binding is written `_`. Exclude a rule in `pmd.xml` with its reason, do not scatter suppressions.
 
 ## Layout
 

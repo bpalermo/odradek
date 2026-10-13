@@ -522,7 +522,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         }
       }
       case DeadLettered answer -> deadLettered(answer);
-      case Shutdown shutdown -> stopping = true;
+      case Shutdown _ -> stopping = true;
     }
   }
 

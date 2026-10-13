@@ -180,6 +180,27 @@ http_jar(
     url = "https://github.com/google/google-java-format/releases/download/v1.37.0/google-java-format-1.37.0-all-deps.jar",
 )
 
+# PMD: Java lint (rules_lint aspect, //bazel/lint). aspect_rules_lint bundles only
+# 7.7.0, which cannot parse Java 25, so the distribution is pinned here instead.
+# Bump = new version in the URL and prefix + new sha256.
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "net_sourceforge_pmd",
+    build_file_content = """\
+load("@rules_java//java:defs.bzl", "java_import")
+
+java_import(
+    name = "net_sourceforge_pmd",
+    jars = glob(["*.jar"]),
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "f974ba571f7bc01c73fffe11bade25fbc1f438698f9e9c00e416e8d65e9fbac2",
+    strip_prefix = "pmd-bin-7.28.0/lib",
+    url = "https://github.com/pmd/pmd/releases/download/pmd_releases/7.28.0/pmd-dist-7.28.0-bin.zip",
+)
+
 # buf: proto lint (rules_lint aspect, `bazel run //:format` for formatting) and
 # breaking-change detection. Pinned here so every machine runs the same binary.
 buf = use_extension("@rules_buf//buf:extensions.bzl", "buf")

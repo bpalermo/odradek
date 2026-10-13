@@ -10,4 +10,8 @@ public final class BufferFullException extends RuntimeException {
   BufferFullException(String message) {
     super(message);
   }
+
+  BufferFullException(String message, Throwable cause) {
+    super(message, cause);
+  }
 }

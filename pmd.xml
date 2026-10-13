@@ -1,0 +1,78 @@
+<?xml version="1.0"?>
+<ruleset name="odradek"
+    xmlns="http://pmd.sourceforge.net/ruleset/2.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://pmd.sourceforge.net/ruleset/2.0.0 https://pmd.sourceforge.io/ruleset_2_0_0.xsd">
+  <description>
+    PMD rules for first-party Java, run by the `pmd` aspect (//bazel/lint:linters.bzl).
+
+    Whole categories are taken and rules are excluded with a reason, so a rule PMD adds later is
+    on until someone decides otherwise. The compiler already runs -Xlint:all and Error Prone as
+    errors; style is google-java-format's business, so the codestyle, design and documentation
+    categories are left out.
+  </description>
+
+  <rule ref="category/java/bestpractices.xml">
+    <!-- Kafka's and gRPC's APIs take and return concrete types and arrays. -->
+    <exclude name="LooseCoupling"/>
+    <exclude name="UseVarargs"/>
+    <exclude name="ArrayIsStoredDirectly"/>
+    <!-- Logging arguments here are cheap; guards would only add noise. -->
+    <exclude name="GuardLogStatement"/>
+    <!-- Reads as it is written; a matter of taste. -->
+    <exclude name="LiteralsFirstInComparisons"/>
+    <exclude name="AvoidReassigningParameters"/>
+    <exclude name="AvoidReassigningLoopVariables"/>
+    <exclude name="ImplicitFunctionalInterface"/>
+    <!-- Command-line tools print. -->
+    <exclude name="SystemPrintln"/>
+    <!-- A switch over a oneof handles the cases a caller can send and ignores the rest. -->
+    <exclude name="NonExhaustiveSwitch"/>
+    <!-- Does not see a use through a method reference; Error Prone's UnusedMethod does. -->
+    <exclude name="UnusedPrivateMethod"/>
+  </rule>
+
+  <rule ref="category/java/errorprone.xml">
+    <!-- Record components and builders name a field and its accessor alike. -->
+    <exclude name="AvoidFieldNameMatchingMethodName"/>
+    <exclude name="AvoidFieldNameMatchingTypeName"/>
+    <!-- Threads and callbacks from other libraries must not be allowed to throw past us. -->
+    <exclude name="AvoidCatchingGenericException"/>
+    <exclude name="AvoidInstanceofChecksInCatchClause"/>
+    <!-- null means absent in several places, for a tombstone's value among others. -->
+    <exclude name="NullAssignment"/>
+    <exclude name="ReturnEmptyCollectionRatherThanNull"/>
+    <!-- Identity is meant: the same stream, the same thread, the same record. -->
+    <exclude name="CompareObjectsWithEquals"/>
+    <!-- Taste. -->
+    <exclude name="AssignmentInOperand"/>
+    <exclude name="AvoidDuplicateLiterals"/>
+    <exclude name="AvoidLiteralsInIfCondition"/>
+    <!-- Misreads a trailing Throwable as a missing placeholder. -->
+    <exclude name="InvalidLogMessageFormat"/>
+    <!-- Java EE advice. -->
+    <exclude name="UseProperClassLoader"/>
+    <exclude name="TestClassWithoutTestCases"/>
+  </rule>
+  <rule ref="category/java/errorprone.xml/EmptyCatchBlock">
+    <properties>
+      <!-- An empty catch must say why. -->
+      <property name="allowCommentedBlocks" value="true"/>
+    </properties>
+  </rule>
+
+  <rule ref="category/java/multithreading.xml">
+    <!-- Java EE advice: this server owns its threads, locks and volatile fields on purpose. -->
+    <exclude name="DoNotUseThreads"/>
+    <exclude name="UseConcurrentHashMap"/>
+    <exclude name="AvoidSynchronizedStatement"/>
+    <exclude name="AvoidSynchronizedAtMethodLevel"/>
+    <exclude name="AvoidUsingVolatile"/>
+  </rule>
+
+  <rule ref="category/java/performance.xml">
+    <!-- Allocation per record is what a record pipeline does. -->
+    <exclude name="AvoidInstantiatingObjectsInLoops"/>
+    <exclude name="InsufficientStringBufferDeclaration"/>
+  </rule>
+</ruleset>

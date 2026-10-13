@@ -427,7 +427,7 @@ public final class DispatchCore<R> {
       case PartitionAssigned<R> e -> assigned(e, out);
       case PartitionsRevoked<R> e -> revoked(e, out);
       case PartitionsLost<R> e -> lost(e, out);
-      case RecordsFetched<R> e -> fetched(e, out);
+      case RecordsFetched<R> e -> fetched(e);
       case ReceiverJoined<R> e -> joined(e);
       case ReceiverLeft<R> e -> left(e);
       case CreditsGranted<R> e -> credits(e);
@@ -742,7 +742,7 @@ public final class DispatchCore<R> {
   // Records
   // ---------------------------------------------------------------------------------------------
 
-  private void fetched(RecordsFetched<R> e, List<DispatchAction<R>> out) {
+  private void fetched(RecordsFetched<R> e) {
     Part<R> p = partitions.get(e.partition());
     if (p == null || p.draining) {
       return;
