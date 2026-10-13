@@ -1137,6 +1137,14 @@
     {
       "fields": [
         {
+          "name": "TCP_USER_TIMEOUT"
+        }
+      ],
+      "type": "io.netty.channel.epoll.EpollChannelOption"
+    },
+    {
+      "fields": [
+        {
           "name": "fd"
         }
       ],

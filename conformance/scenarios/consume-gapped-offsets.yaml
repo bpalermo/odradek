@@ -1,0 +1,48 @@
+name: consume-gapped-offsets
+description: >-
+  The offsets of the records of a partition need not be consecutive, within a
+  batch or from one batch to the next: when a dispatcher delivers the topic,
+  the records in between went to other pods. Records are counted, not offsets,
+  and an ack frees only the records of its range that were delivered here.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 4}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 4}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}
+    # Gaps within a batch, and between this batch and the next.
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 3}, {offset: 7}, {offset: 8}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 3}, {offset: 7}, {offset: 8}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 12}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 12}]}
+    # The app holds four records, not the ten offsets from 3 to 12. One acked:
+    # one of four free, less than half, so no grant.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 7, lastOffset: 7}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 7, lastOffset: 7}}
+    # A range over a gap is forwarded as the app gave it: the server applies it
+    # to what it delivered on this stream. It frees one record, offset 3, not
+    # four: two of four are free now, and granted.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 3, lastOffset: 6}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 3, lastOffset: 6}}
+        - transmit: {credits: {records: 2}}
+    # A range that lies in a gap acks nothing delivered here.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 9, lastOffset: 11}}
+    # The two records left, 8 and 12, in one range across the gap between them.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 8, lastOffset: 12}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 8, lastOffset: 12}}
+        - transmit: {credits: {records: 2}}

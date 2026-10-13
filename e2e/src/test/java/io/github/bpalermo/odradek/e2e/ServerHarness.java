@@ -12,6 +12,7 @@ import io.github.bpalermo.odradek.server.consume.ConsumeService;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
+import io.github.bpalermo.odradek.server.receive.ReceiveService;
 import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.ManagedChannel;
@@ -62,11 +63,14 @@ final class ServerHarness {
   private CodecRegistry codecs;
   private TlsSources tls;
   private ClusterProducers producers;
+  private ReceiveService receive;
   private ConsumeService consume;
   private OdradekServer server;
 
   // External server.
   private Process process;
+
+  private boolean stopped;
 
   private ServerHarness(String yamlTemplate, Object... arguments) throws Exception {
     dir = Files.createTempDirectory(Path.of("/tmp"), "odradek-e2e");
@@ -104,8 +108,10 @@ final class ServerHarness {
       ProduceService produce =
           new ProduceService(
               config, ProduceRoutes.create(config, producers, codecs), ServerMetrics.noop());
+      receive = ReceiveService.create(config, ServerMetrics.noop());
       consume =
-          new ConsumeService(config, codecs, tls, produce.serverEpoch(), ServerMetrics.noop());
+          new ConsumeService(
+              config, codecs, tls, produce.serverEpoch(), ServerMetrics.noop(), receive);
       server = OdradekServer.start(config, new OdradekService(produce, consume));
       return;
     }
@@ -142,10 +148,28 @@ final class ServerHarness {
       server.stopAccepting();
       producers.flush();
       consume.shutdown(Duration.ofSeconds(15));
+      receive.close();
       server.close();
       producers.close(Duration.ofSeconds(5));
       tls.close();
       codecs.close();
+    }
+  }
+
+  /**
+   * The pod is gone: the process is killed where it stands, with whatever it held. A server
+   * assembled in this JVM cannot be killed, and is stopped in good order instead: seen from a
+   * dispatcher both are a sidecar whose streams ended.
+   */
+  void kill() throws Exception {
+    if (process != null) {
+      process.destroyForcibly();
+      process.waitFor(60, TimeUnit.SECONDS);
+      process = null;
+      stopped = true;
+    } else {
+      stopServer();
+      stopped = true;
     }
   }
 
@@ -159,7 +183,9 @@ final class ServerHarness {
   }
 
   void stop() throws Exception {
-    stopServer();
+    if (!stopped) {
+      stopServer();
+    }
     channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
     group.shutdownGracefully();
     try (var files = Files.walk(dir)) {

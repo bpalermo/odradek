@@ -439,7 +439,7 @@ message Consumer {
     (buf.validate.field).string.min_len = 1
   ];
   // Consumer group used to read this topic. Topics that an app subscribes to
-  // on one stream must share the same cluster and group. Required.
+  // on one stream must share the same cluster, group and `source`. Required.
   string group_id = 2 [
     (buf.validate.field).required = true,
     (buf.validate.field).string.min_len = 1
@@ -559,6 +559,10 @@ enum OnDecodeError {
   // End the Consume stream with DATA_LOSS. The offset is not committed, so
   // the record is met again after resubscribing, until the codec or the
   // record's source is fixed. Nothing is skipped.
+  //
+  // For a topic received from a dispatcher the stream stays open: the record
+  // is rejected back to the dispatcher, which counts a failed delivery and
+  // delivers it again (see Consumer.max_attempts). The app never sees it.
   ON_DECODE_ERROR_FAIL = 1;
   // Deliver the record as stored, with ConsumedRecord.decode_error set. The
   // app acks it like any other record and decides what to do with it.

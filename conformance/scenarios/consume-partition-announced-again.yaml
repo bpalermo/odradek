@@ -1,0 +1,54 @@
+name: consume-partition-announced-again
+description: >-
+  When a dispatcher delivers the topic, a partition is announced with the
+  first record of it, never revoked, lost when the dispatcher takes its
+  records back, and announced again under a new epoch with the next record,
+  which may be one the app has seen. Acks under the earlier epoch are
+  swallowed; those under the new one are forwarded.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 4}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 4}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 2, assignmentEpoch: 1}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 2, assignmentEpoch: 1}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 2, assignmentEpoch: 1, records: [{offset: 4}, {offset: 6}]}
+      expect:
+        - deliver: {topic: orders, partition: 2, assignmentEpoch: 1, records: [{offset: 4}, {offset: 6}]}
+    # The dispatcher takes the partition's records back. The two the app held
+    # are released, and their credits granted again.
+    - event: {received: {lost: {partitions: [{topic: orders, partition: 2}]}}}
+      expect:
+        - lost: {partitions: [{topic: orders, partition: 2}]}
+        - transmit: {credits: {records: 2}}
+    - event: {ack: {topic: orders, partition: 2, assignmentEpoch: 1, firstOffset: 4, lastOffset: 4}}
+    # The same partition again, under a new epoch, with a record seen before.
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 2, assignmentEpoch: 2}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 2, assignmentEpoch: 2}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 2, assignmentEpoch: 2, records: [{offset: 4}]}
+      expect:
+        - deliver: {topic: orders, partition: 2, assignmentEpoch: 2, records: [{offset: 4}]}
+    # The app finishes the copy it got first: that ownership is over.
+    - event: {ack: {topic: orders, partition: 2, assignmentEpoch: 1, firstOffset: 4, lastOffset: 6}}
+    - event: {ack: {topic: orders, partition: 2, assignmentEpoch: 2, firstOffset: 4, lastOffset: 4}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 2, assignmentEpoch: 2, firstOffset: 4, lastOffset: 4}}
+    # Another partition is announced in the middle of the stream, not at its start.
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 3}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 3}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 3, records: [{offset: 0}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 3, records: [{offset: 0}]}

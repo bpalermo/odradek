@@ -47,7 +47,7 @@ import org.slf4j.LoggerFactory;
  * <p>Everything that touches the consumer, the partition states or the response stream runs on that
  * thread. The gRPC side only puts commands on a queue.
  */
-final class ConsumeSession implements ConsumerRebalanceListener {
+final class ConsumeSession implements ConsumerRebalanceListener, AppStream {
   private static final Logger LOG = LoggerFactory.getLogger(ConsumeSession.class);
   private static final Duration POLL = Duration.ofMillis(50);
 
@@ -72,6 +72,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
   /** The server is stopping. */
   record Shutdown() implements Command {}
 
+  private final String name;
   private final ServerCallStreamObserver<ConsumeResponse> call;
   private final org.apache.kafka.clients.consumer.Consumer<byte[], byte[]> consumer;
   private final List<String> topics;
@@ -127,6 +128,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
   }
 
   ConsumeSession(
+      String name,
       ServerCallStreamObserver<ConsumeResponse> call,
       org.apache.kafka.clients.consumer.Consumer<byte[], byte[]> consumer,
       List<String> topics,
@@ -137,6 +139,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
       Duration commitInterval,
       LongSupplier nanoClock,
       java.util.function.Consumer<ConsumeSession> onEnd) {
+    this.name = name;
     this.call = call;
     this.consumer = consumer;
     this.topics = topics;
@@ -149,7 +152,8 @@ final class ConsumeSession implements ConsumerRebalanceListener {
     this.onEnd = onEnd;
   }
 
-  void start(String name) {
+  @Override
+  public void start() {
     thread.setName(name);
     thread.setDaemon(true);
     thread.start();
@@ -159,12 +163,44 @@ final class ConsumeSession implements ConsumerRebalanceListener {
     commands.add(command);
   }
 
-  void cancelled() {
+  @Override
+  public void credits(long records) {
+    submit(new Credit(records));
+  }
+
+  @Override
+  public void ack(Ack ack) {
+    submit(new Acked(ack));
+  }
+
+  @Override
+  public void revokeDone(long revokeId) {
+    submit(new RevokeDone(revokeId));
+  }
+
+  @Override
+  public void halfClose() {
+    submit(new HalfClose());
+  }
+
+  @Override
+  public void cancelled() {
     cancelled = true;
     commands.add(new Cancel());
   }
 
-  void join(long millis) throws InterruptedException {
+  @Override
+  public void fail(Status status) {
+    submit(new Fail(status));
+  }
+
+  @Override
+  public void shutdown() {
+    submit(new Shutdown());
+  }
+
+  @Override
+  public void join(long millis) throws InterruptedException {
     thread.join(millis);
   }
 
@@ -247,7 +283,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
   private void handle(Command command) {
     switch (command) {
       case Credit credit -> credits += credit.records();
-      case Acked acked -> ack(acked.ack());
+      case Acked acked -> applyAck(acked.ack());
       // Outside a revocation there is nothing to answer; a late RevokeDone is harmless.
       case RevokeDone done -> {}
       case HalfClose close -> exit = Status.OK;
@@ -258,7 +294,7 @@ final class ConsumeSession implements ConsumerRebalanceListener {
     }
   }
 
-  private void ack(Ack ack) {
+  private void applyAck(Ack ack) {
     PartitionState state = states.get(new TopicPartition(ack.getTopic(), ack.getPartition()));
     // An ack for a partition no longer owned, or for an earlier ownership of it, says nothing
     // about the records delivered under the current one.

@@ -224,9 +224,9 @@ runs dispatch "delivery service on port [0-9]*, advertised as " "delivery servic
 grep -q "POLICY IS NOT ENFORCED" dispatch.log || fail "dispatch: no warning about the policy"
 [ ! -e dispatch.sock ] || fail "dispatch: opened the app's socket"
 
-# Receiving from a dispatcher has a schema and no behaviour yet: the settings load and are
-# validated, and the server then refuses to start instead of ignoring them. A server that only
-# receives has no cluster of its own.
+# A server that receives what it consumes from a dispatcher (ADR 6) has no cluster of its own,
+# and starts, and is ready, with no dispatcher to be found: it connects when an app subscribes.
+# It says that the connection is not secured yet.
 config dispatched-consumer <<'EOF'
 dispatcher:
   address: odradek-dispatcher.kafka.svc:9465
@@ -237,8 +237,9 @@ consumers:
     groupId: billing
     ordering: ORDERING_PARTITION
 EOF
-rejected dispatched-consumer \
-  "consumers.orders.source is CONSUMER_SOURCE_DISPATCHER, and receiving from a dispatcher is not implemented yet"
+serves dispatched-consumer
+grep -q "CONNECTION TO THE DISPATCHER AT odradek-dispatcher.kafka.svc:9465 IS NOT AUTHENTICATED" \
+  dispatched-consumer.log || fail "dispatched-consumer: no warning about the connection"
 
 # Its rules run in the image like the others.
 config dispatch-violations <<'EOF'

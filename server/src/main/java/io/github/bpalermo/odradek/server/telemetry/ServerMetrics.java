@@ -46,6 +46,10 @@ public final class ServerMetrics {
   private final LongCounter dispatchRedeliveries;
   private final LongUpDownCounter dispatchInFlight;
   private final LongUpDownCounter dispatchBlocked;
+  private final LongUpDownCounter receiveStreams;
+  private final LongCounter receiveRecords;
+  private final LongCounter receiveRejects;
+  private final LongCounter receiveReconnects;
   private final KafkaClientMetrics kafkaClients;
 
   public ServerMetrics(Meter meter) {
@@ -142,6 +146,35 @@ public final class ServerMetrics {
             .setDescription(
                 "Partitions stopped at a record that used all its attempts (ON_EXHAUSTED_BLOCK).")
             .setUnit("{partition}")
+            .build();
+    receiveStreams =
+        meter
+            .upDownCounterBuilder("odradek.receive.streams")
+            .setDescription(
+                "Deliver streams this server holds to dispatcher replicas, declaration accepted.")
+            .setUnit("{stream}")
+            .build();
+    receiveRecords =
+        meter
+            .counterBuilder("odradek.receive.records")
+            .setDescription(
+                "Records received from a dispatcher; one received again is counted again.")
+            .setUnit("{record}")
+            .build();
+    receiveRejects =
+        meter
+            .counterBuilder("odradek.receive.rejects")
+            .setDescription(
+                "Records returned to the dispatcher because the topic's codec could not decode"
+                    + " them.")
+            .setUnit("{record}")
+            .build();
+    receiveReconnects =
+        meter
+            .counterBuilder("odradek.receive.reconnects")
+            .setDescription(
+                "Deliver streams opened again after one was lost or refused for the time being.")
+            .setUnit("{stream}")
             .build();
   }
 
@@ -244,6 +277,43 @@ public final class ServerMetrics {
   /** The dispatcher metrics of one topic of one group on one cluster. */
   public DispatchTopic dispatchTopic(String cluster, String group, String topic) {
     return new DispatchTopic(cluster, group, topic);
+  }
+
+  /**
+   * What a server that receives a topic from a dispatcher reports about it. The cluster is the
+   * dispatcher's name for it.
+   */
+  public final class ReceiveTopic {
+    private final Attributes attributes;
+
+    private ReceiveTopic(String cluster, String group, String topic) {
+      attributes = Attributes.of(CLUSTER, cluster, GROUP, group, TOPIC, topic);
+    }
+
+    /** Deliver streams accepted by a replica (positive) or ended after that (negative). */
+    public void streams(long delta) {
+      receiveStreams.add(delta, attributes);
+    }
+
+    /** Records arrived from a dispatcher. */
+    public void received(long records) {
+      receiveRecords.add(records, attributes);
+    }
+
+    /** A record could not be decoded and goes back to the dispatcher. */
+    public void rejected() {
+      receiveRejects.add(1, attributes);
+    }
+
+    /** A stream is opened again after one was lost or refused for the time being. */
+    public void reconnected() {
+      receiveReconnects.add(1, attributes);
+    }
+  }
+
+  /** The receiving-side metrics of one topic of one group on one cluster. */
+  public ReceiveTopic receiveTopic(String cluster, String group, String topic) {
+    return new ReceiveTopic(cluster, group, topic);
   }
 
   /**

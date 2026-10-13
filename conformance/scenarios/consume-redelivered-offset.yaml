@@ -1,0 +1,53 @@
+name: consume-redelivered-offset
+description: >-
+  A later batch may carry a lower offset than an earlier one: a dispatcher
+  delivers a record again, behind newer ones, when its deadline passed. That
+  is not a protocol violation. A record the app still holds is handed to it
+  again and counted once; a record it had already acked is counted anew.
+consume:
+  setup: {topics: [orders], maxUnackedRecords: 4}
+  steps:
+    - event: {streamOpened: {}}
+      expect:
+        - transmit: {subscribe: {topics: [orders]}}
+    - event: {received: {subscribed: {serverEpoch: e1}}}
+      expect:
+        - transmit: {credits: {records: 4}}
+    - event: {received: {assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}}}
+      expect:
+        - assigned: {partitions: [{topic: orders, partition: 0, assignmentEpoch: 1}]}
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 5}, {offset: 9}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 5}, {offset: 9}]}
+    # Offset 5 again, behind 9, while the app still holds it. The app gets it
+    # a second time; it holds two records, not three.
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 5}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 5}]}
+    # One ack settles both copies: the app holds one record, and one credit is
+    # still out, so two of four are free and granted.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 5, lastOffset: 5}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 5, lastOffset: 5}}
+        - transmit: {credits: {records: 2}}
+    # The ack for the second copy acks nothing that is still held.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 5, lastOffset: 5}}
+    # Offset 5 a third time, after it was acked: the ack and the redelivery
+    # crossed. It is a record the app holds again.
+    - event:
+        received:
+          records: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 5}]}
+      expect:
+        - deliver: {topic: orders, partition: 0, assignmentEpoch: 1, records: [{offset: 5}]}
+    # The app holds 5 and 9; two credits are out. Acking 9 frees one of four.
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 9, lastOffset: 9}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 9, lastOffset: 9}}
+    - event: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 5, lastOffset: 5}}
+      expect:
+        - transmit: {ack: {topic: orders, partition: 0, assignmentEpoch: 1, firstOffset: 5, lastOffset: 5}}
+        - transmit: {credits: {records: 2}}

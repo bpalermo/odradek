@@ -370,6 +370,7 @@ class DispatchServiceTest {
     assertThat(accepted.getReplicas().getGeneration()).isEqualTo(1);
     assertThat(accepted.getReplicas().getReplicasList().stream().map(Replica::getAddress).toList())
         .containsExactly("10.1.2.3:9465");
+    assertThat(accepted.getAddress()).isEqualTo("10.1.2.3:9465");
     assertThat(accepted.getDispatcher().getVersion()).isEqualTo(Version.VERSION).isNotEmpty();
     eventually("subscribed", () -> consumers.get(0).subscriptions.contains(Set.of("orders")));
   }

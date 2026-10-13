@@ -17,6 +17,9 @@ What is in it, and why:
 - **Compression libraries**: the JNI classes of zstd-jni and lz4-java, and their native
   libraries as resources (`linux/*/libzstd-jni-*.so`, `net/jpountz/util/linux/*/liblz4-java.so`,
   for both architectures). snappy-java and netty ship their own metadata.
+- **`EpollChannelOption.TCP_USER_TIMEOUT`**: grpc-netty reads the field by name when a client
+  channel over TCP has keepalive, which the connection to a dispatcher does
+  (`ReceiveE2eTest` is what takes that path).
 - **JDK and Guava internals** that Netty, Guava and the Kafka clients reach reflectively.
 
 Not in it: anything a library already ships under `META-INF/native-image` (Netty, snappy-java),

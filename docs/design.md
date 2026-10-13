@@ -72,6 +72,7 @@ flowchart LR
   - One shared `KafkaProducer` (thread-safe) per cluster. Each Produce stream calls `send()` from its own serialized gRPC callback, with manual inbound flow control (`request(1)`), so arrival order equals `send()` order.
   - One `KafkaConsumer` per Consume stream, owned by a dedicated poll thread. gRPC control messages (`Credits`, `Ack`, `RevokeDone`) are queued to that thread; nothing else touches the consumer.
   - In a dispatcher, one `KafkaConsumer` per cluster and consumer group that sidecars have declared, owned by a thread of its own together with the group's dispatch cores and `Deliver` streams (see Dispatcher).
+  - A Consume stream whose topics are received from a dispatcher has no `KafkaConsumer`. It has a thread of its own all the same, which owns the stream's `Deliver` streams to the dispatcher and everything it knows about them (see What a receiving sidecar does).
 
 ### Lifecycle
 
@@ -83,10 +84,12 @@ flowchart LR
   4. answers `SERVING`. The app container starts after that.
 - **A server that only dispatches** (a `dispatch` section, no `producers` and no `consumers`) does not open the Unix socket: no app runs next to it, and the socket's directory, a volume shared with the app, normally does not exist in its pod. `listener` is then ignored. It is ready when its delivery port is up, whether or not a sidecar is connected.
 - **Waiting for a required cluster**: the socket does not exist until every required cluster has answered, so an app never talks to a server that has not reached the clusters it must have. While waiting, the reason for `NOT_SERVING` names the cluster (`starting: waiting for cluster orders`). An attempt times out after 10 seconds and the next follows a second later. The reason for a failure is logged when it differs from the previous one, and the wait itself every 30 seconds. The server neither gives up nor exits: the `startupProbe`'s `failureThreshold` is what bounds the wait, and kubelet restarts the container when it is exceeded. Clusters that are not required are not contacted at startup.
+- **The dispatcher is not waited for.** A server that receives topics from a dispatcher connects to it when an app subscribes, not before, and is ready whether or not it can be reached: an app that only produces must be able to start. While the dispatcher is away the app's Consume stream is open and receives nothing.
 - **Startup only**: a required cluster that becomes unreachable later does not change readiness. Producing and consuming report their own errors, and taking the pod out of service for a broker blip would turn a partial failure into a full one.
 - **Readiness afterwards**: `""` goes back to `NOT_SERVING` when a cluster's client certificate has expired, which means whatever renews it has stopped (files not replaced, or the Workload API unreachable for an SVID's lifetime), and when shutdown begins.
 - **App readiness**: the client library reports ready only while it holds a session whose handshake has completed.
 - **Shutdown**: the server receives SIGTERM after the app container exits. It stops accepting streams, completes in-flight produce results, `flush()`es, commits acked offsets, leaves its groups and exits. `terminationGracePeriodSeconds` must cover app drain plus `delivery.timeout.ms`.
+- **Shutdown of a server that receives from a dispatcher**: for each Consume stream it grants the dispatcher nothing more, passes on the acknowledgements the app has sent, half-closes its `Deliver` streams and ends the app's stream with `UNAVAILABLE`. The half-close is a clean leave: the dispatcher delivers again, under the same attempt numbers, what the app held. It waits up to 5 seconds for the dispatcher to close the streams.
 - **Shutdown of a dispatcher**: it stops accepting `Deliver` streams, stops sending, waits up to `consume.revokeDeadline` for the acknowledgements of what its sidecars hold, commits, ends the streams with `UNAVAILABLE` and leaves its groups. `terminationGracePeriodSeconds` must cover `consume.revokeDeadline` plus the commits (the server allows itself 15 seconds more).
 - **Server restart with the app alive**: the app reconnects, sees a new `server_epoch`, and fails every unacknowledged send with *outcome unknown*. Consumers get a fresh assignment; unacked records are redelivered.
 - **App restart with the server alive**: produce sessions idle out; consume streams close, which triggers a commit of acked offsets and a group leave.
@@ -102,14 +105,18 @@ Metrics are pushed over OTLP/gRPC to the collector named by `telemetry.endpoint`
 | `odradek.produce.streams` | up-down counter | | Open Produce streams |
 | `odradek.consume.records` | counter | `topic` | Records delivered to the app |
 | `odradek.consume.decode.errors` | counter | `topic` | Records the topic's codec could not decode |
-| `odradek.consume.streams` | up-down counter | `cluster`, `group` | Open Consume streams, each a Kafka consumer in its group |
-| `odradek.consume.stream.ends` | counter | `cluster`, `group`, `reason` | Consume streams ended, by gRPC status. `ABORTED` is an app that stopped acknowledging |
+| `odradek.consume.streams` | up-down counter | `cluster`, `group` | Open Consume streams. Each is a Kafka consumer in its group, unless its topics are received from a dispatcher |
+| `odradek.consume.stream.ends` | counter | `cluster`, `group`, `reason` | Consume streams ended, by gRPC status. `ABORTED` is an app that stopped acknowledging; `FAILED_PRECONDITION`, `PERMISSION_DENIED` and `UNIMPLEMENTED` include a declaration the dispatcher refused |
 | `odradek.consume.rebalances` | counter | `cluster`, `group`, `event` | Rebalance callbacks: `assigned`, `revoked`, `lost` |
 | `odradek.dispatch.receivers` | up-down counter | `cluster`, `group`, `topic` | Open `Deliver` streams: the sidecars a dispatcher hands the topic's records to |
 | `odradek.dispatch.records` | counter | `cluster`, `group`, `topic` | Records a dispatcher sent to sidecars. A record sent again is counted again |
 | `odradek.dispatch.redeliveries` | counter | `cluster`, `group`, `topic` | Of those, the records that had been sent before: after a missed deadline, a rejection, or a sidecar that went away |
 | `odradek.dispatch.in_flight` | up-down counter | `cluster`, `group`, `topic` | Records sent to a sidecar and not yet acknowledged, rejected or expired |
 | `odradek.dispatch.partitions.blocked` | up-down counter | `cluster`, `group`, `topic` | Partitions stopped at a record that used all its attempts |
+| `odradek.receive.streams` | up-down counter | `cluster`, `group`, `topic` | `Deliver` streams this server holds to dispatcher replicas, declaration accepted. Zero with an open Consume stream means the dispatcher cannot be reached |
+| `odradek.receive.records` | counter | `cluster`, `group`, `topic` | Records received from a dispatcher. A record received again is counted again |
+| `odradek.receive.rejects` | counter | `cluster`, `group`, `topic` | Records returned to the dispatcher because the topic's codec could not decode them |
+| `odradek.receive.reconnects` | counter | `cluster`, `group`, `topic` | `Deliver` streams opened again after one was lost, or refused for the time being |
 | `odradek.tls.certificate.not_after` | gauge, seconds since the epoch | `cluster` | When the client certificate in use expires |
 | `odradek.tls.credential.reloads` | counter | `cluster` | Times new credentials replaced the ones in use, the first load included |
 | `odradek.tls.credential.reload.failures` | counter | `cluster` | Times new credentials were rejected or could not be fetched |
@@ -146,7 +153,9 @@ The Kafka clients' own metrics are exported too, from an allow-list: Kafka has h
 - Lag is what the consumer saw at its last fetch. A group with no open stream reports none: lag of a group nobody consumes is the broker's to report.
 - The metrics reach the SDK through a Kafka `MetricsReporter` that the server adds to `metric.reporters`, after any reporter the cluster's properties name (Kafka's JMX reporter when they name none). Without `telemetry.endpoint` the reporter is not installed.
 
-Not built yet: latency histograms, configuration reload metrics, and the rest of the dispatcher's (window pauses, attempts, dead letters, declarations refused).
+- A server that receives a topic from a dispatcher reports `odradek.consume.records`, `odradek.consume.decode.errors` (records delivered undecoded), `odradek.consume.streams` and `odradek.consume.stream.ends` for it as for any other, and the `odradek.receive.*` metrics besides. It has no Kafka consumer, so no `odradek.kafka.consumer.*` and no `odradek.consume.rebalances`: lag is the dispatcher's to report. In `odradek.receive.*`, `cluster` is the dispatcher's name for the cluster.
+
+Not built yet: latency histograms, configuration reload metrics, and the rest of the dispatcher's and of the receiving side's (window pauses, attempts, dead letters, declarations refused, records waiting for the app's credit).
 
 ## 3. API
 
@@ -252,15 +261,16 @@ The server owns the settings the guarantees rest on. They may be omitted from `p
 - The cluster reference is mandatory. A topic is consumed from exactly one cluster, even when it is produced to several.
 - A `Subscribe` for a topic without an entry fails the stream with `NOT_FOUND`.
 - One stream is one Kafka consumer, so all topics of a `Subscribe` must resolve to the same cluster and group; otherwise the stream fails with `FAILED_PRECONDITION`. The resolved cluster and group are returned in `Subscribed`.
+- One stream has one `source`: its topics are all read from Kafka by the server or all received from a dispatcher (see Dispatcher). A `Subscribe` that mixes the two fails with `FAILED_PRECONDITION`. An app that consumes both ways opens a stream for each.
 - **Start position**: for a partition where the group has no committed offset, the server positions the consumer itself:
   - `startTimestamp`, if set: the first record at or after that instant.
   - otherwise `offsetReset`: `EARLIEST` (default, never skips) or `LATEST`.
 
 ### Dispatcher
 
-[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. Steps 1 to 3 of its plan exist: the schema, the `odradek.delivery.v1` protocol, the dispatch core and the dispatcher itself. The sidecar's side does not: a configuration with a consumer whose `source` is the dispatcher loads, is validated, and is then refused at startup (exit status 2).
+[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. Steps 1 to 4 of its plan exist: the schema, the `odradek.delivery.v1` protocol, the dispatch core, the dispatcher itself, and the sidecar's side. An app whose topics have the dispatcher as their `source` consumes them on the same `Consume` stream as before, and its sidecar has no Kafka consumer for them.
 
-> **A dispatcher is not for use outside tests yet.** Its delivery port is plaintext and its policy is not enforced: every well-formed declaration that names one of its clusters is accepted, so whoever can reach the port can read every topic the dispatcher's Kafka credentials can. The dispatcher logs a warning saying so every time it starts. Mutual TLS and the policy are step 5. It also runs as **one replica only**: a replica tells sidecars about itself alone, so with two of them a sidecar would see the partitions of one. Membership is step 6. Dead-lettering is step 7.
+> **A dispatcher is not for use outside tests yet.** Its delivery port is plaintext and its policy is not enforced: every well-formed declaration that names one of its clusters is accepted, so whoever can reach the port can read every topic the dispatcher's Kafka credentials can. Seen from the sidecar, records and acknowledgements travel unencrypted and nothing proves that what answers at `dispatcher.address` is the dispatcher. Both log a warning saying so every time they start. Mutual TLS and the policy are step 5. It also runs as **one replica only**: a replica tells sidecars about itself alone, so with two of them a sidecar would see the partitions of one. Membership is step 6. Dead-lettering is step 7.
 
 A server that acts as a dispatcher has a `dispatch` section:
 
@@ -344,15 +354,58 @@ A server with a `dispatch` section serves `DeliveryService` on `dispatch.port` (
 - **Rebalance.** In `onPartitionsRevoked` the cores stop sending for the revoked partitions and wait, up to `consume.revokeDeadline`, for the acknowledgements of what is in flight, which are still handled; then the positions are committed and the sidecars still holding records of those partitions get `Released`. Lost partitions are dropped without a commit. `max.poll.interval.ms` is kept above the revoke deadline plus 30 seconds.
 - **Backpressure.** A partition whose fetched and never delivered records reach 1000 records or 4 MiB is paused on the consumer, and resumed at half. These two bounds are constants: what bounds memory and redelivery is `dispatch.partitionWindow`, and how much a fetch brings is Kafka's own `max.partition.fetch.bytes` and `max.poll.records` in the cluster's properties. The poll thread never waits for a sidecar, so the consumer is polled, and stays in the group, whatever the sidecars do.
 - **A blocked partition** is logged and counted (`odradek.dispatch.partitions.blocked`). Nothing resumes it but a change of owner, which today means restarting the dispatcher.
-- **Replicas.** `Accepted` lists this replica alone, at `dispatch.advertisedAddress`, under generation 1. The default address is that of the pod's network interface: the first address of an interface that is up which is neither loopback nor link-local, IPv4 before IPv6.
+- **Replicas.** `Accepted` lists this replica alone, at `dispatch.advertisedAddress`, under generation 1, and gives the same address as the replica that answered (`Accepted.address`), which is how a sidecar that came through the Service's address knows which of the listed replicas it already has a stream to. The default address is that of the pod's network interface: the first address of an interface that is up which is neither loopback nor link-local, IPv4 before IPv6.
 
 **Threads.** One thread per cluster and group owns the Kafka consumer, the cores of the group's topics and its streams. It is the only one to touch the consumer and the cores, and the only one to write to a stream once its declaration has been checked. gRPC threads check a declaration and queue commands for it. The thread waits on that queue, for at most 10 ms when nothing happens, and polls the consumer without blocking: an acknowledgement is acted on when it arrives, not at the end of a poll, which matters under `ORDERING_KEY`, where the next record of a key waits for it.
 
 **Known limits**, beyond those in the box above:
 
-- A rejected record is delivered again at once. Without `maxAttempts`, a record that no sidecar can decode goes round as fast as the network allows. Rejections are logged at most once per topic every 10 seconds.
+- A rejected record is delivered again at once. A sidecar therefore keeps a record it cannot decode for a second before rejecting it (see What a receiving sidecar does); a client of `DeliveryService` that does not would, without `maxAttempts`, send such a record round as fast as the network allows. Rejections are logged at most once per topic every 10 seconds.
 - An error that Kafka reports for one topic of a group (a topic the dispatcher may not read, for example) ends every stream of the group with `UNAVAILABLE`. The sidecars reconnect, and the group fails again while the topic is declared.
 - A sidecar's credit bounds what is written to its stream, not what it reads: a sidecar that grants credit and stops reading holds that many records in the dispatcher's memory until its connection is closed.
+
+#### What a receiving sidecar does
+
+A `Subscribe` whose topics have the dispatcher as their `source` is served by `server/receive` (`ReceiveService`, `ReceiveSession`) instead of a Kafka consumer. `Subscribed` is sent at once, with the cluster and group of the consumer entry and the processing deadline resolved as for any stream. The app cannot tell the difference, except by what follows.
+
+- **Streams.** One `Deliver` stream per topic and dispatcher replica, opened when the app subscribes and closed when its stream ends. Each declares the entry's `cluster`, `groupId` and topic, its `ordering`, `offsetReset`, `startTimestamp`, `maxAttempts`, `onExhausted` and `deadLetterTopic` (what the entry leaves unset is left to the dispatcher's defaults), the app's processing deadline, and the server's version.
+- **Finding the replicas.** The first stream of each topic goes to `dispatcher.address`. `Accepted` carries the list of replicas and the address of the one that answered (`Accepted.address`): if that address is on the list, the stream is the stream to that replica, and one is opened to each of the others; if it is not, or is missing, every listed replica gets a stream of its own and the first one is closed. A `ReplicaList` that arrives later, on any stream, replaces the list when its generation is higher: streams are opened to replicas that are new and closed to those no longer listed. A list whose generation is not higher is ignored. Replica addresses are connected to as given.
+- **Lost streams.** A stream that ends with `UNAVAILABLE`, or with anything else that is not a refusal for good, is opened again at the same replica while that replica is listed, after a delay that doubles from 100 ms to 5 s, each delay drawn at random from the upper half of its step (the backoff of the client libraries). When no stream is left, open or being opened, the list and its generation are forgotten and the server starts again from `dispatcher.address`. Meanwhile the app's stream stays open and receives nothing.
+- **Refusals for good.** `FAILED_PRECONDITION` (the group consumes the topic with other settings), `PERMISSION_DENIED`, `UNAUTHENTICATED`, `INVALID_ARGUMENT` and `UNIMPLEMENTED` would be met again by a new stream. The app's stream ends with the same status and a message that names the dispatcher's address, the topic, the group and the cluster, followed by what the dispatcher said. The client libraries treat all five as fatal.
+- **Decoding.** Records arrive as stored in Kafka and are decoded with the topic's codec, as on the consume path. A record that cannot be decoded follows the entry's `onDecodeError`: with `DELIVER_UNDECODED` it is delivered as stored with `decode_error` set, and acknowledged by the app like any other; with `FAIL`, where a consumer that reads Kafka ends the stream with `DATA_LOSS`, it is rejected to the dispatcher, which counts a failed attempt, and the stream stays. The rejection is sent one second after the record arrived, so that a record nobody can decode, on a topic with no `maxAttempts`, goes round once a second per sidecar and not as fast as the network allows. Rejections are logged at most once per topic every 10 seconds.
+- **No Kafka client.** The server commits nothing and holds no consumer for these topics. A server whose consumers are all received, and which produces nothing, needs no entry under `clusters`.
+
+**Partitions, epochs and acknowledgements.** The app's protocol speaks of assigned partitions; a pod that receives from a dispatcher owns none. What stands in for ownership is the stream that last delivered a partition's records (`Holdings`):
+
+| Event | What the app is sent |
+|---|---|
+| The first record of a partition is about to be delivered | `Assigned` for that partition, with a new epoch, then the records |
+| The dispatcher sends `Released` for a partition the app holds records of | `Lost` for it. What the app held is delivered again by the dispatcher |
+| A `Deliver` stream ends, or is closed because its replica left the list | `Lost` for every partition whose records came from it |
+| A record of a partition arrives on another stream than the one that delivered it so far | `Lost`, then `Assigned` with a new epoch, then the record: another replica owns the partition now, whether or not the first has said so yet |
+| Never | `Revoked` |
+
+- An epoch therefore names one stream, and every record held under it came from that stream. Epochs count up from 1 over the Consume stream; a partition that comes back after `Lost` gets a new one, so an acknowledgement under the old one is recognizable and dropped, by the client core and by the server.
+- **An acknowledgement** is a range of one partition under an epoch. The server passes on the records of the range that it delivered under that epoch and that are not acknowledged yet, to the stream they came from, as the fewest ranges of consecutive offsets. It never passes on the app's range as such: the offsets between two of this app's records went to other pods, and one of them, rejected here, may be on its way back, where a range spanning it would acknowledge it unprocessed.
+- An acknowledgement for anything no longer held (released, its stream gone, an earlier epoch, never delivered here) is dropped. The dispatcher delivers the record again, or it is not this pod's to speak for.
+- A record that the dispatcher delivers a second time to the same pod, because its deadline passed, is handed to the app again and held once. A late acknowledgement is passed on like any other; the dispatcher counts it if the record is still unacknowledged.
+
+**Credit** (`CreditSplit`). The app grants credit for its whole stream, and a credit granted to a replica cannot be taken back. So no `Deliver` stream is given the app's credit to keep:
+
+- **One stream wanted** (one topic, one replica): everything the app grants is passed on. There is nothing else that could need it.
+- **Several**: each has a window, the most it may have outstanding. A window starts at 1 and doubles each time its stream uses all it had outstanding, up to the app's budget divided by twice the number of streams, the budget being what the app can still take. What the app granted beyond the windows stays in the server until a record arrives, and is granted where it arrived. A stream with nothing to send thus holds one credit, a stream that was busy at most its share of half the budget, and the other half always follows the records.
+- **A stream with nothing outstanding gets one credit even when the budget is all promised**, as long as the app can take a record at all: otherwise an app that asks for one record at a time would give its only credit to one stream and never hear of the others. Records that arrive for credit the app did not grant wait in the server; such a credit is granted only while the credits outstanding exceed the budget by less than the number of streams less one, which is therefore the most records the server holds beyond what the app asked for. They are on the dispatcher's clock while they wait.
+- The number of streams is the number wanted, topics times listed replicas, not the number open: while one of two is being opened again, the other keeps to its window.
+
+**An app that stops acknowledging.** A consumer that reads Kafka ends the stream with `ABORTED` when a record is held past the processing deadline (section 6). Here the dispatcher is the authority: it delivers the record again, to this pod or another, on its own clock, and the app's stream is not ended. What the server does is stop asking: while the app has held any record for longer than the deadline, the dispatcher is granted no more credit on that Consume stream, since every record sent to such an app would wait out its deadline before another pod got it. Credit flows again when the app has acknowledged every overdue record; the change is logged both ways. An app that loses a record and never acknowledges it is therefore not told, as it is by `ABORTED`: its pod receives nothing more until its stream is opened again.
+
+**Threads.** One thread per Consume stream owns the stream's state, the writes to the app and the writes to its `Deliver` streams. gRPC threads, the app's and the dispatcher's, only queue events for it. It waits on that queue, and on the timers of the streams to open again and the rejections to send.
+
+**Known limits** of the receiving side:
+
+- With several streams, a stream that was busy and went quiet keeps what its window had outstanding, up to its share of half the app's budget, until it is opened again.
+- A record waiting in the server for the app's credit is not visible in a metric yet.
+- The connection is plaintext, and one connection per address and Consume stream: streams of different Consume streams do not share one.
 
 #### Dispatch core
 
@@ -445,6 +498,8 @@ What it does not give:
 - Per partition the server tracks delivered and acked offsets and commits `highest contiguous acked offset + 1`: asynchronously on an interval, synchronously on revoke and on close.
 - Acks carrying a stale `assignment_epoch` are ignored.
 - Result: at-least-once, with redelivery limited to records that were delivered but not acked.
+
+This section describes a stream whose topics the server reads from Kafka itself. For topics received from a dispatcher, the same stream carries the same messages with another meaning behind them: see What a receiving sidecar does (section 4).
 
 ### Liveness
 
@@ -731,7 +786,7 @@ A migration is a sequence of configuration changes on top of multi-cluster produ
 | Per-partition ordering | Preserved per Produce stream, on every cluster the topic is produced to. |
 | No duplicates from client retries | Preserved while the server stays up. A server restart, or a partial multi-cluster write, yields *outcome unknown*; resending may duplicate. |
 | Bounded producer memory | Preserved via the in-flight window, shared by all topics of a stream. |
-| Hung consumer is evicted | Preserved via `max_processing_ms`. |
+| Hung consumer is evicted | Preserved via `max_processing_ms`. Through a dispatcher the consumer is not evicted: its records are given to other pods, and it is sent no more until it acknowledges. |
 | Commit only processed offsets | Preserved; contiguous-ack rule. |
 | Rebalance callbacks | Preserved as `Revoked` / `RevokeDone` with a deadline. |
 | App chooses cluster, group and offset reset | Moved to the server configuration by design. |
@@ -758,6 +813,7 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 | End to end | The server binary and the Java client against real brokers: ordering, commit positions, rebalance with two servers | Kafka in KRaft mode (no ZooKeeper), provided by the environment: service containers in CI, containers started locally. Two brokers, so multi-cluster cases run in the same suite |
 | Fault | Kill the server mid-produce and mid-revoke; hang the app; drop the stream; stop a broker | End-to-end harness; assert no false acks and no committed-but-unprocessed offsets |
 | Dispatcher | The dispatch core against scripted and random events; declarations and batching; the Delivery service against Kafka's mock consumer; and, against a real broker with scripted sidecars (gRPC clients written in the test): more sidecars than partitions, per-key order, a sidecar killed mid-batch, a missed deadline, a blocked partition, a second topic declared while the first is consumed, the idle grace, a restart | Unit tests; `DispatchE2eTest` in the three end-to-end targets, the native image included |
+| Receiving from a dispatcher | The credit split, the mapping to partitions and epochs with acknowledgements over gaps, the replica list and the backoff, each on its own; the bridge against scripted replicas (in-process gRPC servers written in the test): several replicas, a list that changes, lost streams, refusals, both decode-error modes, an app that stops acknowledging, the three ways a stream ends; conformance scenarios for the client cores with gapped and repeated offsets; and, against a real broker with a real dispatcher and real sidecars, through the app's API: more sidecars than partitions, per-key order across sidecars, a sidecar killed mid-batch, a late acknowledgement, the dispatcher restarted, a sidecar started before the dispatcher, a declaration refused for good, both decode-error modes, mixed sources, two topics on one stream, an app that produces and consumes | Unit tests; `conformance/scenarios`; `ReceiveE2eTest` in the three end-to-end targets, the native image included |
 | Reload | ConfigMap-style `..data` symlink swap; invalid configuration keeps the last good one; producer swap under load keeps order and produces no duplicates; consumer rebuild commits before closing; credential rotation against a fake Workload API | Component and end-to-end harness |
 | Multi-cluster | Two brokers: a topic produced to both under load; one cluster failing as required and as best effort; a consumer moved with `startTimestamp` loses nothing; removing a cluster from a topic by reload | End-to-end harness |
 | Soak | Rolling restarts of app and server under load in a cluster | With the deployment work |

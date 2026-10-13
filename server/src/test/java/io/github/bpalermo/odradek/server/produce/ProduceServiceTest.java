@@ -142,7 +142,8 @@ class ProduceServiceTest {
                         codecs,
                         TlsSources.none(),
                         service.serverEpoch(),
-                        ServerMetrics.noop())))
+                        ServerMetrics.noop(),
+                        io.github.bpalermo.odradek.server.consume.DispatcherSource.NONE)))
             .build()
             .start();
     channel = InProcessChannelBuilder.forName(name).build();

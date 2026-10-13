@@ -1,7 +1,5 @@
 package io.github.bpalermo.odradek.server;
 
-import io.github.bpalermo.odradek.config.v1.Consumer;
-import io.github.bpalermo.odradek.config.v1.ConsumerSource;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.kafka.v1.OdradekServiceGrpc;
 import io.github.bpalermo.odradek.server.admin.AdminServer;
@@ -20,6 +18,7 @@ import io.github.bpalermo.odradek.server.dispatch.DispatchService;
 import io.github.bpalermo.odradek.server.produce.ClusterProducers;
 import io.github.bpalermo.odradek.server.produce.ProduceRoutes;
 import io.github.bpalermo.odradek.server.produce.ProduceService;
+import io.github.bpalermo.odradek.server.receive.ReceiveService;
 import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
 import io.github.bpalermo.odradek.server.telemetry.Telemetry;
 import io.github.bpalermo.odradek.server.tls.CredentialException;
@@ -28,10 +27,6 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,14 +81,6 @@ public final class Main {
       return;
     } catch (IOException e) {
       LOG.error("configuration {} cannot be read: {}", file, e.toString());
-      System.exit(2);
-      return;
-    }
-
-    List<String> notImplemented = notImplemented(config);
-    if (!notImplemented.isEmpty()) {
-      LOG.error("configuration {} rejected:", file);
-      notImplemented.forEach(problem -> LOG.error("  {}", problem));
       System.exit(2);
       return;
     }
@@ -159,8 +146,11 @@ public final class Main {
     ProduceService produce =
         new ProduceService(config, ProduceRoutes.create(config, producers, codecs), metrics);
 
+    // Connects to nothing until an app subscribes: readiness does not depend on the dispatcher,
+    // and an app that only produces starts without one.
+    ReceiveService receive = ReceiveService.create(config, metrics);
     ConsumeService consume =
-        new ConsumeService(config, codecs, tls, produce.serverEpoch(), metrics);
+        new ConsumeService(config, codecs, tls, produce.serverEpoch(), metrics, receive);
 
     // Before the socket exists: an app never talks to a server that has not reached the clusters
     // it must have. Waits as long as it takes; the startup probe's failure threshold bounds it.
@@ -204,8 +194,9 @@ public final class Main {
                 () -> {
                   // No new streams; then every record already accepted gets its broker answer,
                   // and with it its result, before the open streams are closed.
-                  // Consumers commit what was acked and leave their groups; a dispatcher's
-                  // first wait for what their sidecars hold.
+                  // Consumers commit what was acked and leave their groups, and the streams to
+                  // a dispatcher are closed in good order; a dispatcher's own consumers first
+                  // wait for what their sidecars hold.
                   readiness.stopping();
                   if (app != null) {
                     app.stopAccepting();
@@ -215,6 +206,7 @@ public final class Main {
                   }
                   producers.flush();
                   consume.shutdown(Duration.ofSeconds(15));
+                  receive.close();
                   if (dispatcher != null) {
                     dispatcher.shutdown(dispatcher.shutdownTimeout());
                     sidecars.close();
@@ -246,25 +238,6 @@ public final class Main {
     return !config.hasDispatch()
         || config.getProducersCount() > 0
         || config.getConsumersCount() > 0;
-  }
-
-  /**
-   * Returns one line for each setting that the schema accepts and the server cannot honour yet:
-   * receiving from a dispatcher (ADR 6), of which only the schema exists. Starting anyway would
-   * mean consuming nothing while looking healthy.
-   */
-  static List<String> notImplemented(ServerConfig config) {
-    List<String> problems = new ArrayList<>();
-    for (Map.Entry<String, Consumer> entry : new TreeMap<>(config.getConsumersMap()).entrySet()) {
-      if (entry.getValue().getSource() == ConsumerSource.CONSUMER_SOURCE_DISPATCHER) {
-        problems.add(
-            "consumers."
-                + entry.getKey()
-                + ".source is CONSUMER_SOURCE_DISPATCHER, and receiving from a dispatcher is not"
-                + " implemented yet");
-      }
-    }
-    return problems;
   }
 
   /** Loads the contracts and builds the codecs the configuration names. */
