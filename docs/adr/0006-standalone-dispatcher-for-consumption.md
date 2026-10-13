@@ -108,7 +108,7 @@ Records without a key are treated as `none` under `key`. Keys are compared as th
 
 - The dispatcher's replicas are the members of every group it consumes for, and of the coordination group. They change only when the dispatcher itself is rolled or resized.
 - The dispatcher is a plain Deployment with dynamic group membership. A replica that stops leaves the group and its partitions move to the others at once; a replica that starts joins and takes its share. Rebalances are cooperative, so partitions that do not move are not interrupted.
-- When a replica gives partitions up, it stops sending, waits a bounded time for in-flight acknowledgements, commits and releases them. What was still in flight is delivered again by the new owner.
+- When a replica gives partitions up, it stops sending anything new, finishes what lies below the highest offset it has sent (the records it had held back there, for an earlier record of their key, for credit or for the wait before a redelivery, sent under the usual rules), waits a bounded time for in-flight acknowledgements, commits and releases them. What was still in flight is delivered again by the new owner. It finishes those records because the commit position only moves over a contiguous run: one of them left unsent would stop the commit below records that are acknowledged, and the new owner would deliver all of those again, on every roll of the dispatcher under `key`. (As first accepted, this said only "it stops sending".)
 - A replica keeps its in-flight state in memory. After a crash, everything above its last commit is delivered again, whoever owns the partitions next.
 
 ### Security

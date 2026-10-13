@@ -14,6 +14,7 @@ import io.grpc.netty.NettyChannelBuilder;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -26,6 +27,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.slf4j.LoggerFactory;
 
 /**
  * A running dispatcher: a server whose configuration has a {@code dispatch} section and neither
@@ -73,6 +75,52 @@ final class DispatcherHarness {
 
   /** What the server logged, when it is a process: for assertions about its warnings. */
   final List<String> log = new CopyOnWriteArrayList<>();
+
+  /**
+   * What the dispatchers assembled in this JVM logged about the groups they consume for. Their
+   * loggers are the suite's own, so the lines of every one of them are here together.
+   */
+  private static final List<String> IN_PROCESS_LOG = new CopyOnWriteArrayList<>();
+
+  static {
+    if (!packaged()) {
+      captureInProcessLog();
+    }
+  }
+
+  /**
+   * Has every line the dispatcher's package logs in this JVM added to {@link #IN_PROCESS_LOG}, by
+   * an appender of logback's. Through reflection: an appender is a type of logback-core, which the
+   * suite has when it runs (it is what the server logs with) and not when it is compiled.
+   */
+  private static void captureInProcessLog() {
+    try {
+      Object logger = LoggerFactory.getLogger("io.github.bpalermo.odradek.server.dispatch");
+      Class<?> appenderType = Class.forName("ch.qos.logback.core.Appender");
+      Object appender =
+          Proxy.newProxyInstance(
+              appenderType.getClassLoader(),
+              new Class<?>[] {appenderType},
+              (proxy, method, arguments) ->
+                  switch (method.getName()) {
+                    case "doAppend" -> {
+                      Object event = arguments[0];
+                      IN_PROCESS_LOG.add(
+                          (String) event.getClass().getMethod("getFormattedMessage").invoke(event));
+                      yield null;
+                    }
+                    case "isStarted" -> true;
+                    case "getName", "toString" -> "odradek-e2e";
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    case "equals" -> proxy == arguments[0];
+                    // What is left configures an appender, or asks for what this one lacks.
+                    default -> null;
+                  });
+      logger.getClass().getMethod("addAppender", appenderType).invoke(logger, appender);
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalStateException("cannot read what a dispatcher in this JVM logs", e);
+    }
+  }
 
   private DispatcherHarness(String body) throws Exception {
     dir = Files.createTempDirectory(Path.of("/tmp"), "odradek-e2e-dispatch");
@@ -261,6 +309,16 @@ final class DispatcherHarness {
   }
 
   /**
+   * The lines containing {@code fragment} that this dispatcher logged, oldest first. For a
+   * dispatcher assembled in this JVM they are those of every such dispatcher, which cannot be told
+   * apart: {@code fragment} should name something only one of them has, or does.
+   */
+  List<String> logged(String fragment) {
+    return (packaged() ? log : IN_PROCESS_LOG)
+        .stream().filter(line -> line.contains(fragment)).toList();
+  }
+
+  /**
    * The pod is gone: the process is killed where it stands, without a commit, a word to its
    * sidecars, or leaving a group. A dispatcher assembled in this JVM cannot be killed, and is
    * stopped in good order instead.
@@ -278,7 +336,9 @@ final class DispatcherHarness {
   /** Stops the dispatcher: in process the way its shutdown hook does, otherwise with SIGTERM. */
   void stopDispatcher() throws Exception {
     if (process != null) {
-      process.destroy();
+      // Through its handle: Process.destroy() also closes the pipe its output is read from, and
+      // what the dispatcher logs while it stops would be lost.
+      process.toHandle().destroy();
       if (!process.waitFor(60, TimeUnit.SECONDS)) {
         process.destroyForcibly();
         fail("the dispatcher did not stop within 60s of SIGTERM");

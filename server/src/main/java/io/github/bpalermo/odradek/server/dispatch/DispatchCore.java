@@ -118,13 +118,42 @@ import java.util.TreeSet;
  *
  * <h2>Giving partitions up</h2>
  *
- * <p>{@link PartitionsRevoked} stops sending for those partitions and drops what was not in flight,
- * a record waiting to be sent again and a dead letter waiting to be written again included: only a
- * dead letter whose write is under way is still waited for. Each partition is released when nothing
- * of it is in flight or being written any more, or when {@link DispatchSettings#revokeGrace} has
- * passed: the core emits the last {@link Commit} if the position moved, a {@link Drop} for every
- * receiver still holding its records, and {@link PartitionReleased}. {@link PartitionsLost} emits
- * the {@link Drop}s and nothing else.
+ * <p>The commit position is a contiguous run, and under {@link Ordering#KEY} and {@link
+ * Ordering#NONE} records are acknowledged out of offset order: a record held back (behind its key,
+ * for credit, or for the wait before a redelivery) lies below records that receivers have
+ * acknowledged. A partition given up as it stands would be committed at that record, and its next
+ * owner would send everything acknowledged above it again. So {@link PartitionsRevoked} does not
+ * stop a partition dead: the core <b>finishes what it began</b>.
+ *
+ * <ul>
+ *   <li><b>Nothing new is sent.</b> The partition has a <em>limit</em>: the offset of the last
+ *       record that is acknowledged, in flight, being written as a dead letter, or still held by a
+ *       receiver past its deadline. No record at or above the limit is sent, for the first time or
+ *       again, and what lies above the last such record is forgotten: the next owner fetches it.
+ *   <li><b>What lies below the limit is sent as it would have been</b>: in the order of its key, to
+ *       a receiver with credit, the least loaded, after the wait a failed attempt asks for, and
+ *       dead-lettered when its attempts are used up. Each acknowledgement moves the commit position
+ *       as usual.
+ *   <li><b>Sending stops for good at the first record that cannot be finished</b>, which lowers the
+ *       limit to it: nothing can be committed past it, so whatever was sent above it would be sent
+ *       again by the next owner besides. Such a record is one that blocks the partition, or would;
+ *       one whose dead letter failed to be written; one whose wait before a redelivery ends after
+ *       the time left for sending; and every record not in flight once no receiver is connected.
+ *   <li><b>Sending has half of {@link DispatchSettings#revokeGrace}.</b> After that the limit drops
+ *       to the commit position, and the other half is left for the answers to what was sent: a
+ *       record sent as the wait ended would be handed out again by the next owner while a receiver
+ *       had barely begun on it.
+ *   <li><b>The partition is released</b> when everything below the limit is acknowledged and
+ *       nothing is in flight or being written, or when {@link DispatchSettings#revokeGrace} has
+ *       passed: the core emits the last {@link Commit} if the position moved, a {@link Drop} for
+ *       every receiver still holding its records, and {@link PartitionReleased}.
+ * </ul>
+ *
+ * <p>Under {@link Ordering#PARTITION} one record of a partition is unacknowledged at a time, so
+ * there is nothing below the limit: the partition waits for that record if it is in flight, and for
+ * nothing otherwise.
+ *
+ * <p>{@link PartitionsLost} emits the {@link Drop}s and nothing else.
  *
  * <h2>Time</h2>
  *
@@ -158,7 +187,7 @@ public final class DispatchCore<R> {
     DEAD_LETTERING,
     /** Exhausted, and blocking its partition. */
     BLOCKED,
-    /** Its partition is being handed over; it will not be sent again by this replica. */
+    /** Its partition is being handed over, and this replica will not send it (again). */
     DROPPED,
     ACKED
   }
@@ -266,6 +295,12 @@ public final class DispatchCore<R> {
     boolean draining;
     long drainStart;
 
+    /**
+     * While {@link #draining}: no record at or above this offset is sent. Every record below it is
+     * acknowledged, in flight, being written as a dead letter, or still to be sent.
+     */
+    long limit = Long.MAX_VALUE;
+
     /** Whether its oldest pending record is held back by the window. */
     boolean atWindow;
 
@@ -283,10 +318,14 @@ public final class DispatchCore<R> {
       return oldest == null ? end : oldest.offset;
     }
 
+    /** Whether a record of it may be sent now. Handed over: {@link #ready} is what is below. */
     boolean sendable() {
-      return !draining
-          && !ready.isEmpty()
-          && (blocked.isEmpty() || ready.firstKey() < blocked.first());
+      return !ready.isEmpty() && (blocked.isEmpty() || ready.firstKey() < blocked.first());
+    }
+
+    /** While {@link #draining}: whether everything below the limit is acknowledged. */
+    boolean drained() {
+      return commit() >= limit;
     }
   }
 
@@ -309,6 +348,10 @@ public final class DispatchCore<R> {
 
   private final DispatchSettings settings;
   private final long revokeGraceNanos;
+
+  /** How long a partition being handed over still sends: half of the wait, see the class. */
+  private final long handOverSendNanos;
+
   private final long redeliveryBackoffNanos;
   private final long redeliveryBackoffMaxNanos;
   private final long deadLetterRetryNanos;
@@ -366,6 +409,7 @@ public final class DispatchCore<R> {
     this.settings = settings;
     flights.add(new Flight<>(settings.maxProcessing().toNanos()));
     this.revokeGraceNanos = settings.revokeGrace().toNanos();
+    this.handOverSendNanos = revokeGraceNanos / 2;
     this.redeliveryBackoffNanos = settings.redeliveryBackoff().toNanos();
     this.redeliveryBackoffMaxNanos = settings.redeliveryBackoffMax().toNanos();
     this.deadLetterRetryNanos = settings.deadLetterRetry().toNanos();
@@ -461,8 +505,8 @@ public final class DispatchCore<R> {
 
   /**
    * When {@link TimePassed} is next needed: the earliest processing deadline, end of a wait before
-   * a redelivery or a dead letter, or end of a hand-over wait. Empty when nothing is in flight,
-   * nothing waits and nothing is being handed over.
+   * a redelivery or a dead letter, or, for a partition being handed over, the end of its sending or
+   * of its wait. Empty when nothing is in flight, nothing waits and nothing is being handed over.
    */
   public OptionalLong nextDeadlineNanos() {
     boolean any = !timers.isEmpty();
@@ -478,7 +522,7 @@ public final class DispatchCore<R> {
       }
     }
     for (Part<R> p : draining) {
-      long deadline = p.drainStart + revokeGraceNanos;
+      long deadline = p.drainStart + (p.drained() ? revokeGraceNanos : handOverSendNanos);
       if (!any || deadline - earliest < 0) {
         earliest = deadline;
         any = true;
@@ -510,39 +554,98 @@ public final class DispatchCore<R> {
     }
   }
 
-  /** Stops sending for the partition and keeps only what an acknowledgement can still reach. */
+  /**
+   * Begins the hand-over of a partition: nothing new is sent, and what lies below the last record
+   * that was sent and can still be answered is finished, as far as it can be.
+   */
   private void startHandOver(Part<R> p) {
     p.draining = true;
     p.drainStart = now;
     draining.add(p);
-    sendable.remove(p);
     atWindow(p, false);
     p.pending.clear();
-    p.ready.clear();
-    p.lanes.clear();
-    p.blocked.clear();
     p.buffered = 0;
     p.bufferedBytes = 0;
-    // A dead letter that waits to be written again is not written by this replica any more. One
-    // whose write is under way is still waited for.
-    p.deadLettering.values().removeIf(rec -> !rec.writing);
     // Whatever follows the last record that can still be acknowledged is forgotten: the next
     // owner fetches it again.
     for (Rec<R> last = p.log.peekLast();
         last != null && !reachable(last);
         last = p.log.peekLast()) {
       p.log.pollLast();
-      untime(last);
+      drop(last);
       p.end = last.offset;
     }
+    // That record is the newest this replica sent that still counts. It is not sent again, and
+    // neither is anything from the first record below it that cannot be finished in time.
+    Rec<R> last = p.log.peekLast();
+    long limit = last == null ? p.end : last.offset;
+    long sendUntil = now + handOverSendNanos;
     for (Rec<R> rec : p.log) {
-      if (rec.state != State.IN_FLIGHT && !writing(rec) && rec.state != State.ACKED) {
-        untime(rec);
-        rec.state = State.DROPPED;
-        rec.payload = null;
-        rec.key = null;
+      if (rec.offset >= limit) {
+        break;
+      }
+      if (!finishable(rec, sendUntil)) {
+        limit = rec.offset;
+        break;
       }
     }
+    cut(p, limit);
+  }
+
+  /** Whether a record of a partition being handed over can be done with before sending ends. */
+  private static <R> boolean finishable(Rec<R> rec, long sendUntil) {
+    return switch (rec.state) {
+      case ACKED, IN_FLIGHT, READY, WAITING -> true;
+      case DELAYED -> rec.dueAt - sendUntil < 0;
+      // A dead letter that failed is not written again by a replica that is leaving.
+      case DEAD_LETTERING -> rec.writing;
+      case BLOCKED, PENDING, DROPPED -> false;
+    };
+  }
+
+  /**
+   * Lowers the limit of a partition being handed over to {@code offset}: nothing at or above it is
+   * sent any more. What is in flight there, or being written, can still be answered.
+   */
+  private void cut(Part<R> p, long offset) {
+    if (offset >= p.limit) {
+      return;
+    }
+    p.limit = offset;
+    for (Iterator<Rec<R>> newest = p.log.descendingIterator(); newest.hasNext(); ) {
+      Rec<R> rec = newest.next();
+      if (rec.offset < offset) {
+        break;
+      }
+      drop(rec);
+    }
+    refresh(p);
+  }
+
+  /**
+   * This replica will not send the record (again): it is the next owner's. Nothing happens to a
+   * record that is in flight, being written as a dead letter, or acknowledged.
+   */
+  private void drop(Rec<R> rec) {
+    Part<R> p = rec.part;
+    switch (rec.state) {
+      case IN_FLIGHT, ACKED, DROPPED -> {
+        return;
+      }
+      case DEAD_LETTERING -> {
+        if (rec.writing) {
+          return;
+        }
+        p.deadLettering.remove(rec.offset);
+      }
+      case READY -> p.ready.remove(rec.offset);
+      case BLOCKED -> p.blocked.remove(rec.offset);
+      case PENDING, WAITING, DELAYED -> {}
+    }
+    untime(rec);
+    rec.state = State.DROPPED;
+    rec.payload = null;
+    rec.key = null;
   }
 
   private static <R> boolean writing(Rec<R> rec) {
@@ -567,14 +670,22 @@ public final class DispatchCore<R> {
     release(gone, false, out);
   }
 
-  /** Releases the revoked partitions that have nothing outstanding, or have waited long enough. */
+  /**
+   * Ends the sending of the revoked partitions whose time for it is over, and releases those that
+   * have nothing outstanding, or have waited long enough.
+   */
   private void finishHandOvers(List<DispatchAction<R>> out) {
     if (draining.isEmpty()) {
       return;
     }
     List<Part<R>> done = new ArrayList<>();
     for (Part<R> p : draining) {
-      if (answered(p) || now - p.drainStart >= revokeGraceNanos) {
+      long waited = now - p.drainStart;
+      if (waited >= handOverSendNanos || receivers.isEmpty()) {
+        // Nothing more is sent: the time for it is over, or there is nobody to send to.
+        cut(p, p.commit());
+      }
+      if ((answered(p) && p.drained()) || waited >= revokeGraceNanos) {
         done.add(p);
       }
     }
@@ -814,6 +925,10 @@ public final class DispatchCore<R> {
     if (!rec.delivered) {
       rec.delivered = true;
       p.sent++;
+      if (p.draining) {
+        // Nothing is fetched for a partition being handed over, and nothing counted as buffered.
+        return;
+      }
       p.buffered--;
       p.bufferedBytes -= rec.size;
       if (p.paused
@@ -860,9 +975,11 @@ public final class DispatchCore<R> {
     land(rec);
     p.inFlight--;
     rec.holder = null;
-    if (p.draining) {
+    if (p.draining && rec.offset >= p.limit) {
+      // Not sent again by this replica: the next owner has it.
       rec.state = State.DROPPED;
       rec.payload = null;
+      rec.key = null;
       return;
     }
     rec.attempts--;
@@ -1001,10 +1118,9 @@ public final class DispatchCore<R> {
     }
     rec.writing = false;
     if (p.draining) {
-      // The next owner delivers the record again, and dead-letters it if it must.
-      p.deadLettering.remove(rec.offset);
-      rec.state = State.DROPPED;
-      rec.payload = null;
+      // The next owner delivers the record again, and dead-letters it if it must. Nothing is
+      // committed past it here, so nothing above it is sent any more either.
+      giveUp(rec);
       return;
     }
     long wait = doubled(deadLetterRetryNanos, deadLetterRetryMaxNanos, rec.deadLetterFailures);
@@ -1031,9 +1147,11 @@ public final class DispatchCore<R> {
     rec.holder = null;
     rec.cause = cause;
     rec.detail = detail;
-    if (p.draining) {
+    if (p.draining && rec.offset >= p.limit) {
+      // Not sent again by this replica: the next owner has it.
       rec.state = State.DROPPED;
       rec.payload = null;
+      rec.key = null;
       return;
     }
     if (settings.maxAttempts() > 0 && rec.attempts >= settings.maxAttempts()) {
@@ -1041,6 +1159,9 @@ public final class DispatchCore<R> {
         rec.state = State.DEAD_LETTERING;
         p.deadLettering.put(rec.offset, rec);
         writeDeadLetter(rec, out);
+      } else if (p.draining) {
+        // It would block a partition that is leaving: its next owner counts its attempts anew.
+        giveUp(rec);
       } else {
         rec.state = State.BLOCKED;
         p.blocked.add(rec.offset);
@@ -1053,10 +1174,28 @@ public final class DispatchCore<R> {
     if (wait == 0) {
       ready(rec);
       refresh(p);
+    } else if (p.draining && now + wait - (p.drainStart + handOverSendNanos) >= 0) {
+      // It could be sent again only after sending has ended.
+      giveUp(rec);
     } else {
       rec.state = State.DELAYED;
       time(rec, now + wait);
     }
+  }
+
+  /**
+   * A record of a partition being handed over cannot be finished by this replica: it is left to the
+   * next owner, and so is everything above it that is not already with a receiver.
+   */
+  private void giveUp(Rec<R> rec) {
+    if (rec.state == State.DEAD_LETTERING) {
+      rec.part.deadLettering.remove(rec.offset);
+    }
+    untime(rec);
+    rec.state = State.DROPPED;
+    rec.payload = null;
+    rec.key = null;
+    cut(rec.part, rec.offset);
   }
 
   /** The record is done with. The caller settles the partition afterwards. */
@@ -1098,11 +1237,12 @@ public final class DispatchCore<R> {
     rec.payload = null;
     rec.detail = null;
     rec.state = State.ACKED;
-    if (rec.key != null && !p.draining) {
-      // The next record of the key takes its turn.
+    if (rec.key != null) {
+      // The next record of the key takes its turn; while the partition is handed over, only if
+      // it lies below the limit. The records that wait behind one that does not, do not either.
       Lane<R> lane = p.lanes.get(rec.key);
       Rec<R> next = lane.waiting == null ? null : lane.waiting.pollFirst();
-      if (next == null) {
+      if (next == null || next.state == State.DROPPED) {
         p.lanes.remove(rec.key);
       } else {
         ready(next);

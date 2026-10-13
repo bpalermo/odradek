@@ -20,8 +20,9 @@ import java.time.Duration;
  *     delivered at which the core asks for fetching to pause; at least 1
  * @param maxBufferedBytes the same bound in bytes, as the sum of the sizes given with the records;
  *     at least 1
- * @param revokeGrace longest a revoked partition waits for the acknowledgements of what is in
- *     flight before it is released; zero releases at once
+ * @param revokeGrace longest a revoked partition takes to be released: during the first half of it
+ *     the core still sends what lies below the newest record it had sent, and until its end it
+ *     waits for the acknowledgements of what is in flight; zero releases at once
  * @param redeliveryBackoff how long a record waits before it is sent again after its first failed
  *     attempt; the wait doubles with each further failed attempt, up to {@code
  *     redeliveryBackoffMax}. Zero sends again at once

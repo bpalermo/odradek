@@ -1003,6 +1003,35 @@ class DispatchServiceTest {
   }
 
   @Test
+  void aRevokedPartitionFinishesWhatItHeldBackBelowWhatItSentAndCommitsPastAllOfIt()
+      throws Exception {
+    start(config().setConsume(Consume.newBuilder().setRevokeDeadline(Durations.fromSeconds(30))));
+    Sidecar sidecar = declared(declare("orders"));
+    assign(P0, P1);
+    add(P0, 0, "a");
+    add(P0, 1, "a");
+    add(P0, 2, "b");
+    sidecar.credits(10);
+    // Offset 1 waits for 0, of its key; 2, of another key, is sent past it and acknowledged.
+    assertThat(sidecar.records(2)).containsExactly("0/0/1", "0/2/1");
+    sidecar.ack(0, 2, 2);
+    assign(P1);
+    sidecar.nothing();
+    assertThat(committed(P0)).isLessThanOrEqualTo(0);
+    // While the partition is handed over: 1 is sent once 0 is acknowledged, and the offset
+    // committed is past everything this replica was acknowledged, 2 included.
+    sidecar.ack(0, 0, 0);
+    assertThat(sidecar.records(1)).containsExactly("0/1/1");
+    sidecar.ack(0, 1, 1);
+    eventually("the revoked partition is committed", () -> committedNow(P0) == 3);
+    assertThat(metric("odradek.dispatch.handovers", "outcome", "completed")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.handovers")).isEqualTo(1);
+    // Nothing it sent is left for the next owner to send again.
+    assertThat(metric("odradek.dispatch.handover.records")).isZero();
+    assertThat(metric("odradek.dispatch.records")).isEqualTo(3);
+  }
+
+  @Test
   void whatIsStillHeldAfterTheGraceIsReleased() throws Exception {
     start(config());
     Sidecar sidecar = declared(declare("orders"));

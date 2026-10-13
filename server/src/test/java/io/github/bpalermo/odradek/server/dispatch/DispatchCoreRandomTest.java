@@ -53,6 +53,10 @@ class DispatchCoreRandomTest {
   private static final int MAX_RECEIVERS = 5;
   private static final long DEADLINE = 400;
   private static final long GRACE = 150;
+
+  /** How long a partition being handed over still sends: half of the wait. */
+  private static final long SEND = GRACE / 2;
+
   private static final long WINDOW = 12;
   private static final int MAX_BUFFERED = 6;
   private static final int MAX_FETCH = 4;
@@ -143,6 +147,7 @@ class DispatchCoreRandomTest {
 
   private static void run(
       Ordering ordering, int maxAttempts, OnExhausted onExhausted, boolean waits) {
+    long sentInHandOvers = 0;
     for (int seed = 0; seed < SEEDS; seed++) {
       Simulation simulation = new Simulation(ordering, maxAttempts, onExhausted, waits, seed);
       try {
@@ -152,6 +157,14 @@ class DispatchCoreRandomTest {
         throw new AssertionError(
             "seed " + seed + ", step " + simulation.step + ": " + simulation.last, e);
       }
+      sentInHandOvers += simulation.drainedRecords;
+    }
+    // The runs did meet what a hand-over finishes: records held back below records already sent.
+    // Under partition ordering there is no such record, and a hand-over sends nothing.
+    if (ordering == Ordering.PARTITION) {
+      assertThat(sentInHandOvers).as("records sent while a partition was handed over").isZero();
+    } else {
+      assertThat(sentInHandOvers).as("records sent while a partition was handed over").isPositive();
     }
   }
 
@@ -170,6 +183,13 @@ class DispatchCoreRandomTest {
     boolean assigned;
     boolean draining;
     long drainStart;
+
+    /** While it is handed over: nothing at or above this offset may be sent. */
+    long limit;
+
+    /** The highest offset acknowledged in this assignment. */
+    long highestAcked = -1;
+
     boolean paused;
 
     /** Index in {@link #offsets} of the next record to fetch. */
@@ -186,6 +206,9 @@ class DispatchCoreRandomTest {
 
     /** In flight: offset to when its processing deadline passes. */
     final Map<Long, Long> sentAt = new HashMap<>();
+
+    /** In flight: offset to its place among everything sent, which is the order deadlines pass. */
+    final Map<Long, Long> sentOrder = new HashMap<>();
 
     final Map<Long, Integer> attempts = new HashMap<>();
     final Set<Long> deadLettering = new HashSet<>();
@@ -213,12 +236,14 @@ class DispatchCoreRandomTest {
     void reset() {
       assigned = false;
       draining = false;
+      highestAcked = -1;
       paused = false;
       unacked.clear();
       unackedByKey.clear();
       lastDeliveredByKey.clear();
       inFlight.clear();
       sentAt.clear();
+      sentOrder.clear();
       attempts.clear();
       deadLettering.clear();
       blocked.clear();
@@ -227,6 +252,17 @@ class DispatchCoreRandomTest {
       letterFailures.clear();
       ended.clear();
       newestDelivered = -1;
+    }
+
+    /** While it is handed over: lowers the limit, and with it what may still be sent. */
+    void cut(long offset) {
+      limit = Math.min(limit, offset);
+      delayed.keySet().removeIf(waiting -> waiting >= limit);
+    }
+
+    /** While it is handed over: whether everything below the limit is acknowledged. */
+    boolean drained() {
+      return unacked.isEmpty() || unacked.firstKey() >= limit;
     }
 
     int buffered() {
@@ -272,6 +308,11 @@ class DispatchCoreRandomTest {
 
     int step;
     int receiverNames;
+    long sends;
+
+    /** Records sent of a partition while it was being handed over. */
+    long drainedRecords;
+
     String last = "";
 
     Simulation(
@@ -461,12 +502,16 @@ class DispatchCoreRandomTest {
                 p.inFlight.remove(offset);
                 p.sentAt.remove(offset);
                 p.ended.put(offset, Cause.RECEIVER_LEFT);
-                if (!p.draining) {
+                if (!p.draining || offset < p.limit) {
                   p.attempts.merge(offset, -1, Integer::sum);
                 }
               }
             }
           });
+      if (receivers.isEmpty()) {
+        // Nobody to send to: a partition being handed over sends nothing more.
+        partitions.stream().filter(p -> p.draining).forEach(p -> p.cut(Long.MIN_VALUE));
+      }
       on(new ReceiverLeft<>(name));
     }
 
@@ -533,11 +578,18 @@ class DispatchCoreRandomTest {
             expected.add("dead letter " + p.id + "/" + offset);
           }
         }
-        for (long offset : List.copyOf(p.inFlight.keySet())) {
+        // In the order they were sent: while a partition is handed over, a record that cannot be
+        // finished ends the sending of everything above it.
+        List<Long> sent = new ArrayList<>(p.inFlight.keySet());
+        sent.sort(java.util.Comparator.comparing(p.sentOrder::get));
+        for (long offset : sent) {
           if (now >= p.sentAt.get(offset)) {
             // The receiver keeps it, and may acknowledge it yet.
             attemptFailed(p, offset, Cause.DEADLINE);
           }
+        }
+        if (p.draining && now - p.drainStart >= SEND) {
+          p.cut(Long.MIN_VALUE);
         }
       }
       on(new TimePassed<>());
@@ -569,11 +621,41 @@ class DispatchCoreRandomTest {
       if (p.assigned && !p.draining) {
         p.draining = true;
         p.drainStart = now;
+        // Nothing is sent at or above the last record that is acknowledged, in flight, being
+        // written as a dead letter, or still with a receiver.
+        long limit = p.highestAcked;
+        for (long offset : p.inFlight.keySet()) {
+          limit = Math.max(limit, offset);
+        }
+        for (long offset : p.deadLettering) {
+          if (!p.letterDue.containsKey(offset)) {
+            limit = Math.max(limit, offset);
+          }
+        }
+        for (Receiver r : receivers.values()) {
+          TreeSet<Long> held = r.held.get(p.id);
+          if (held != null) {
+            limit = Math.max(limit, held.last());
+          }
+        }
+        // Nor from the first record below it that cannot be finished while sending lasts.
+        for (long offset : p.unacked.keySet()) {
+          if (offset >= limit) {
+            break;
+          }
+          if (p.blocked.contains(offset)
+              || p.letterDue.containsKey(offset)
+              || (p.delayed.containsKey(offset) && p.delayed.get(offset) >= now + SEND)) {
+            limit = offset;
+            break;
+          }
+        }
         p.blocked.clear();
-        p.delayed.clear();
         // A dead letter that waits to be written again is not written by this owner any more.
         p.deadLettering.removeAll(p.letterDue.keySet());
         p.letterDue.clear();
+        p.limit = Long.MAX_VALUE;
+        p.cut(receivers.isEmpty() ? Long.MIN_VALUE : limit);
       }
       if (!p.assigned) {
         expected.add("released " + p.id);
@@ -599,8 +681,9 @@ class DispatchCoreRandomTest {
       boolean pending = p.deadLettering.contains(letter[1]);
       if (random.nextInt(3) == 0) {
         if (pending && p.draining) {
-          // Left to the next owner.
+          // Left to the next owner, with everything above it that is not sent yet.
           p.deadLettering.remove(letter[1]);
+          p.cut(letter[1]);
         } else if (pending) {
           int failures = p.letterFailures.merge(letter[1], 1, Integer::sum);
           if (waits) {
@@ -626,18 +709,27 @@ class DispatchCoreRandomTest {
       p.inFlight.remove(offset);
       p.sentAt.remove(offset);
       p.ended.put(offset, cause);
-      if (p.draining) {
+      if (p.draining && offset >= p.limit) {
         return;
       }
       if (maxAttempts == 0 || p.attempts.get(offset) < maxAttempts) {
         if (waits) {
-          p.delayed.put(offset, now + doubled(BACKOFF, BACKOFF_MAX, p.attempts.get(offset) - 1));
+          long due = now + doubled(BACKOFF, BACKOFF_MAX, p.attempts.get(offset) - 1);
+          if (p.draining && due >= p.drainStart + SEND) {
+            // It could be sent again only after sending has ended.
+            p.cut(offset);
+          } else {
+            p.delayed.put(offset, due);
+          }
         }
         return;
       }
       if (onExhausted == OnExhausted.DEAD_LETTER) {
         p.deadLettering.add(offset);
         expected.add("dead letter " + p.id + "/" + offset);
+      } else if (p.draining) {
+        // It blocks nothing: the partition is leaving, and its next owner counts anew.
+        p.cut(offset);
       } else {
         p.blocked.add(offset);
         expected.add("blocked " + p.id + "/" + offset);
@@ -647,6 +739,7 @@ class DispatchCoreRandomTest {
     void acknowledged(Partition p, long offset) {
       String key = p.unacked.remove(offset);
       assertThat(key).as("acknowledged twice: %s/%s", p.id, offset).isNotNull();
+      p.highestAcked = Math.max(p.highestAcked, offset);
       TreeSet<Long> sameKey = p.unackedByKey.get(key);
       sameKey.remove(offset);
       p.inFlight.remove(offset);
@@ -672,7 +765,7 @@ class DispatchCoreRandomTest {
 
     /** Whether the rules allow the record to be sent now. */
     boolean sendable(Partition p, long offset, String key) {
-      if (!p.assigned || p.draining) {
+      if (!p.assigned || (p.draining && offset >= p.limit)) {
         return false;
       }
       if (p.inFlight.containsKey(offset)
@@ -753,7 +846,9 @@ class DispatchCoreRandomTest {
             }
             assertThat(p.draining).as("%s", a).isTrue();
             boolean answered = p.inFlight.isEmpty() && p.deadLettering.isEmpty();
-            assertThat(answered || now - p.drainStart >= GRACE).as("%s", a).isTrue();
+            assertThat((answered && p.drained()) || now - p.drainStart >= GRACE)
+                .as("%s", a)
+                .isTrue();
             assertThat(a.inTime()).as("%s", a).isEqualTo(answered);
             // What it had sent and leaves at or above the position it commits last.
             assertThat(a.resent())
@@ -808,8 +903,12 @@ class DispatchCoreRandomTest {
       if (ordering == Ordering.PARTITION) {
         assertThat(p.inFlight).as("in flight with %s", a).isEmpty();
       }
+      if (p.draining) {
+        drainedRecords++;
+      }
       p.inFlight.put(offset, a.receiver());
       p.sentAt.put(offset, now + deadline);
+      p.sentOrder.put(offset, sends++);
       p.newestDelivered = Math.max(p.newestDelivered, offset);
       r.held.computeIfAbsent(p.id, id -> new TreeSet<>()).add(offset);
     }
@@ -854,9 +953,17 @@ class DispatchCoreRandomTest {
                 p.blocked.isEmpty() ? OptionalLong.empty() : OptionalLong.of(p.blocked.first()));
         if (p.draining) {
           assertThat(now - p.drainStart).as("wait for partition %s", p.id).isLessThan(GRACE);
-          assertThat(!p.inFlight.isEmpty() || !p.deadLettering.isEmpty())
+          assertThat(!p.inFlight.isEmpty() || !p.deadLettering.isEmpty() || !p.drained())
               .as("partition %s is still waited for", p.id)
               .isTrue();
+          if (credit) {
+            // What it held back below what it had sent is not left waiting either.
+            p.unacked.forEach(
+                (offset, key) ->
+                    assertThat(sendable(p, offset, key))
+                        .as("%s/%s left unsent in a hand-over with credit available", p.id, offset)
+                        .isFalse());
+          }
           continue;
         }
         // Fetching is paused exactly between the two bounds.

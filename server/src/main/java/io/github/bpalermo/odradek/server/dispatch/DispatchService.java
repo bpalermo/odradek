@@ -296,10 +296,11 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
 
   /**
    * Stops dispatching: no declaration is accepted any more, every group hands its partitions over
-   * (it waits for what is in flight and for the dead letters being written, for at most the revoke
-   * grace, and commits), ends its streams with UNAVAILABLE and leaves its consumer group. Waits up
-   * to {@code timeout} for that, and then closes the dead-letter producers: a dead letter that was
-   * not acknowledged by then was not committed past, and its record is delivered again by the next
+   * (it sends nothing new, finishes what it had held back below the newest record it sent, waits
+   * for what is in flight and for the dead letters being written, for at most the revoke grace in
+   * all, and commits), ends its streams with UNAVAILABLE and leaves its consumer group. Waits up to
+   * {@code timeout} for that, and then closes the dead-letter producers: a dead letter that was not
+   * acknowledged by then was not committed past, and its record is delivered again by the next
    * owner of its partition.
    */
   public void shutdown(Duration timeout) {

@@ -95,7 +95,9 @@ public sealed interface DispatchAction<R> {
    *
    * @param inTime whether everything sent was answered before the hand-over wait ended; false when
    *     the wait ended with records still in flight or a dead letter still being written, which the
-   *     next owner then sends again while a receiver may still be working on them
+   *     next owner then sends again while a receiver may still be working on them. It says nothing
+   *     of records that were held back and could not be sent in the time there was: nobody has
+   *     those
    * @param resent how many records this core had sent and leaves at or above the commit position:
    *     what the next owner sends again, whether they were acknowledged here or not
    */

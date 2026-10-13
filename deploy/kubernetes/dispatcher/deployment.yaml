@@ -42,10 +42,12 @@ spec:
         app.kubernetes.io/part-of: odradek
     spec:
       serviceAccountName: odradek-dispatcher
-      # On SIGTERM a replica stops sending, waits up to consume.revokeDeadline
-      # (10 s in configmap.yaml) for the acknowledgements of what its sidecars
-      # hold and for the dead letters being written, commits, and leaves its
-      # groups; the server allows itself 15 s beyond the deadline for that.
+      # On SIGTERM a replica sends nothing new, finishes what it had held back
+      # below the newest record it sent, and waits for the acknowledgements of
+      # what its sidecars hold and for the dead letters being written: up to
+      # consume.revokeDeadline in all (10 s in configmap.yaml). Then it
+      # commits and leaves its groups; the server allows itself 15 s beyond
+      # the deadline for that.
       # Then it closes its dead-letter producers and leaves the coordination
       # group. A replica killed before it is done committed nothing for what
       # was acknowledged since its last commit, and that is delivered again.
