@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server.consume;
 import com.google.protobuf.util.Durations;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.Consumer;
+import io.github.bpalermo.odradek.config.v1.ConsumerSource;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.kafka.v1.ConsumeRequest;
 import io.github.bpalermo.odradek.kafka.v1.ConsumeResponse;
@@ -13,6 +14,7 @@ import io.github.bpalermo.odradek.server.codec.RecordDecoder;
 import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import java.time.Duration;
@@ -30,7 +32,11 @@ import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** The Consume RPC: one Kafka consumer, on its own poll thread, per stream. */
+/**
+ * The Consume RPC. A stream whose topics the server reads from Kafka is one Kafka consumer on its
+ * own poll thread; one whose topics come from a dispatcher is handed to the {@link
+ * DispatcherSource}. A stream is one or the other.
+ */
 public final class ConsumeService {
   private static final Logger LOG = LoggerFactory.getLogger(ConsumeService.class);
 
@@ -54,9 +60,10 @@ public final class ConsumeService {
   private final TlsSources tls;
   private final ServerMetrics metrics;
   private final Factory factory;
+  private final DispatcherSource dispatcher;
   private final String serverEpoch;
   private final LongSupplier nanoClock;
-  private final Set<ConsumeSession> sessions = ConcurrentHashMap.newKeySet();
+  private final Set<AppStream> sessions = ConcurrentHashMap.newKeySet();
   private final AtomicLong streamCounter = new AtomicLong();
   private final long defaultMaxProcessingMs;
   private final long maxMaxProcessingMs;
@@ -64,12 +71,16 @@ public final class ConsumeService {
   private final long commitIntervalMs;
   private volatile boolean shuttingDown;
 
+  /**
+   * @param dispatcher serves the streams whose topics are received from a dispatcher
+   */
   public ConsumeService(
       ServerConfig config,
       CodecRegistry codecs,
       TlsSources tls,
       String serverEpoch,
-      ServerMetrics metrics) {
+      ServerMetrics metrics,
+      DispatcherSource dispatcher) {
     this(
         config,
         codecs,
@@ -79,6 +90,7 @@ public final class ConsumeService {
         (cluster, properties) ->
             new KafkaConsumer<>(
                 properties, new ByteArrayDeserializer(), new ByteArrayDeserializer()),
+        dispatcher,
         System::nanoTime);
   }
 
@@ -88,7 +100,15 @@ public final class ConsumeService {
       String serverEpoch,
       Factory factory,
       LongSupplier nanoClock) {
-    this(config, codecs, TlsSources.none(), ServerMetrics.noop(), serverEpoch, factory, nanoClock);
+    this(
+        config,
+        codecs,
+        TlsSources.none(),
+        ServerMetrics.noop(),
+        serverEpoch,
+        factory,
+        DispatcherSource.NONE,
+        nanoClock);
   }
 
   ConsumeService(
@@ -98,6 +118,7 @@ public final class ConsumeService {
       ServerMetrics metrics,
       String serverEpoch,
       Factory factory,
+      DispatcherSource dispatcher,
       LongSupplier nanoClock) {
     this.config = config;
     this.codecs = codecs;
@@ -105,6 +126,7 @@ public final class ConsumeService {
     this.metrics = metrics;
     this.serverEpoch = serverEpoch;
     this.factory = factory;
+    this.dispatcher = dispatcher;
     this.nanoClock = nanoClock;
     var consume = config.getConsume();
     this.defaultMaxProcessingMs =
@@ -133,15 +155,16 @@ public final class ConsumeService {
   }
 
   /**
-   * Ends every stream: acked offsets are committed, the consumers leave their groups, and the
-   * streams close with UNAVAILABLE. Waits up to {@code timeout} for that to finish.
+   * Ends every stream: acked offsets are committed and the consumers leave their groups, the
+   * streams to a dispatcher are closed in good order, and the app's streams close with UNAVAILABLE.
+   * Waits up to {@code timeout} for that to finish.
    */
   public void shutdown(Duration timeout) {
     shuttingDown = true;
-    List<ConsumeSession> open = List.copyOf(sessions);
-    open.forEach(session -> session.submit(new ConsumeSession.Shutdown()));
+    List<AppStream> open = List.copyOf(sessions);
+    open.forEach(AppStream::shutdown);
     long deadline = System.nanoTime() + timeout.toNanos();
-    for (ConsumeSession session : open) {
+    for (AppStream session : open) {
       try {
         session.join(Math.max(1, (deadline - System.nanoTime()) / 1_000_000));
       } catch (InterruptedException e) {
@@ -154,14 +177,14 @@ public final class ConsumeService {
   /** The stream before its first message: validates Subscribe and starts the session. */
   private final class Handshake implements StreamObserver<ConsumeRequest> {
     private final ServerCallStreamObserver<ConsumeResponse> call;
-    private ConsumeSession session;
+    private AppStream session;
     private boolean failed;
 
     Handshake(ServerCallStreamObserver<ConsumeResponse> call) {
       this.call = call;
       call.setOnCancelHandler(
           () -> {
-            ConsumeSession current;
+            AppStream current;
             synchronized (this) {
               failed = true;
               current = session;
@@ -179,19 +202,13 @@ public final class ConsumeService {
       }
       if (session != null) {
         switch (request.getMsgCase()) {
-          case CREDITS ->
-              session.submit(new ConsumeSession.Credit(request.getCredits().getRecords()));
-          case ACK -> session.submit(new ConsumeSession.Acked(request.getAck()));
-          case REVOKE_DONE ->
-              session.submit(new ConsumeSession.RevokeDone(request.getRevokeDone().getRevokeId()));
+          case CREDITS -> session.credits(request.getCredits().getRecords());
+          case ACK -> session.ack(request.getAck());
+          case REVOKE_DONE -> session.revokeDone(request.getRevokeDone().getRevokeId());
           case SUBSCRIBE ->
-              session.submit(
-                  new ConsumeSession.Fail(
-                      Status.INVALID_ARGUMENT.withDescription("Subscribe was already sent")));
+              session.fail(Status.INVALID_ARGUMENT.withDescription("Subscribe was already sent"));
           case MSG_NOT_SET ->
-              session.submit(
-                  new ConsumeSession.Fail(
-                      Status.INVALID_ARGUMENT.withDescription("empty ConsumeRequest")));
+              session.fail(Status.INVALID_ARGUMENT.withDescription("empty ConsumeRequest"));
         }
         return;
       }
@@ -201,6 +218,8 @@ public final class ConsumeService {
       }
       try {
         subscribe(request.getSubscribe());
+      } catch (StatusRuntimeException e) {
+        fail(e.getStatus());
       } catch (RuntimeException e) {
         LOG.error("could not start a consume stream", e);
         fail(Status.INTERNAL.withDescription(e.toString()));
@@ -237,17 +256,33 @@ public final class ConsumeService {
                       + " does not match "
                       + topics.get(0)));
           return;
+        } else if (dispatched(first) != dispatched(entry)) {
+          // One stream has one source: its credits, its assignment epochs and its deadline mean
+          // one thing. An app that wants both opens a stream for each.
+          fail(
+              Status.FAILED_PRECONDITION.withDescription(
+                  "the topics of one stream must all be read from Kafka or all be received from"
+                      + " the dispatcher; the source of "
+                      + topic
+                      + " differs from that of "
+                      + topics.get(0)
+                      + ". Subscribe to them on separate streams"));
+          return;
         }
         entries.put(topic, entry);
       }
       String clusterName = first.getCluster();
-      Cluster cluster = config.getClustersOrThrow(clusterName);
       long maxProcessingMs =
           Math.min(
               subscribe.getMaxProcessingMs() == 0
                   ? defaultMaxProcessingMs
                   : subscribe.getMaxProcessingMs(),
               maxMaxProcessingMs);
+      if (dispatched(first)) {
+        receive(subscribe, topics, entries, first, maxProcessingMs);
+        return;
+      }
+      Cluster cluster = config.getClustersOrThrow(clusterName);
 
       Map<String, RecordDecoder> decoders = new HashMap<>();
       org.apache.kafka.clients.consumer.Consumer<byte[], byte[]> consumer;
@@ -280,6 +315,7 @@ public final class ConsumeService {
               .build());
       ConsumeSession started =
           new ConsumeSession(
+              "odradek-consume-" + first.getGroupId() + "-" + streamCounter.get(),
               call,
               consumer,
               topics,
@@ -318,12 +354,75 @@ public final class ConsumeService {
           });
       sessions.add(started);
       session = started;
-      started.start("odradek-consume-" + first.getGroupId() + "-" + streamCounter.get());
+      started.start();
+    }
+
+    /** Starts a stream whose topics a dispatcher delivers: no Kafka consumer, no cluster here. */
+    private void receive(
+        Subscribe subscribe,
+        List<String> topics,
+        Map<String, Consumer> entries,
+        Consumer first,
+        long maxProcessingMs) {
+      String clusterName = first.getCluster();
+      String group = first.getGroupId();
+      Map<String, RecordDecoder> decoders = new HashMap<>();
+      AppStream started;
+      try {
+        for (String topic : topics) {
+          decoders.put(topic, codecs.newDecoder(topic));
+        }
+        started =
+            dispatcher.open(
+                new DispatcherSource.Request(
+                    call,
+                    topics,
+                    entries,
+                    decoders,
+                    maxProcessingMs,
+                    new DispatcherSource.Listener() {
+                      @Override
+                      public void delivered(String topic, long records, long undecodable) {
+                        metrics.delivered(topic, records, undecodable);
+                      }
+
+                      @Override
+                      public void ended(AppStream stream, String reason) {
+                        sessions.remove(stream);
+                        metrics.consumeStreamClosed(clusterName, group, reason);
+                      }
+                    }));
+      } catch (RuntimeException e) {
+        decoders.values().forEach(RecordDecoder::close);
+        throw e;
+      }
+      // What the consumer entry says, as for a stream that reads Kafka: the app cannot tell.
+      call.onNext(
+          ConsumeResponse.newBuilder()
+              .setSubscribed(
+                  Subscribed.newBuilder()
+                      .setServerEpoch(serverEpoch)
+                      .setMaxProcessingMs((int) maxProcessingMs)
+                      .setCluster(clusterName)
+                      .setGroupId(group))
+              .build());
+      LOG.info(
+          "consume stream opened: topics {} group {} cluster {} client {} {}, received from the"
+              + " dispatcher",
+          topics,
+          group,
+          clusterName,
+          subscribe.getClient().getLanguage(),
+          subscribe.getClient().getVersion());
+      metrics.consumeStreamOpened(clusterName, group);
+      sessions.add(started);
+      session = started;
+      started.start();
     }
 
     @Override
     public void onCompleted() {
-      ConsumeSession current;
+      AppStream current;
       synchronized (this) {
         current = session;
         if (current == null && !failed) {
@@ -332,13 +431,13 @@ public final class ConsumeService {
         }
       }
       if (current != null) {
-        current.submit(new ConsumeSession.HalfClose());
+        current.halfClose();
       }
     }
 
     @Override
     public void onError(Throwable t) {
-      ConsumeSession current;
+      AppStream current;
       synchronized (this) {
         failed = true;
         current = session;
@@ -352,6 +451,10 @@ public final class ConsumeService {
       failed = true;
       call.onError(status.asRuntimeException());
     }
+  }
+
+  private static boolean dispatched(Consumer entry) {
+    return entry.getSource() == ConsumerSource.CONSUMER_SOURCE_DISPATCHER;
   }
 
   /**

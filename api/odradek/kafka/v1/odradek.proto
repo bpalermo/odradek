@@ -268,13 +268,20 @@ message Subscribe {
   // Topics to consume. Each must be declared under `consumers` in the server
   // configuration, which fixes its cluster and consumer group; the app cannot
   // choose them. All topics of one stream must resolve to the same cluster
-  // and the same group. At least one is required.
+  // and the same group, and must all be read from Kafka by the server or all
+  // be received from a dispatcher; otherwise the stream fails with
+  // FAILED_PRECONDITION. At least one is required.
   repeated string topics = 1;
   // Longest the app may hold a delivered record without acking it, in
-  // milliseconds, before the server declares the app hung, leaves the group
-  // and fails the stream with ABORTED. Zero uses the server default; values
-  // above the server maximum are clamped. The effective value is returned
-  // in Subscribed.
+  // milliseconds. Zero uses the server default; values above the server
+  // maximum are clamped. The effective value is returned in Subscribed.
+  //
+  // When the server reads Kafka itself, it then declares the app hung,
+  // leaves the group and fails the stream with ABORTED. When the topics are
+  // received from a dispatcher, the dispatcher gives the record to another
+  // pod and the stream stays open: the server asks the dispatcher for nothing
+  // more until the app has acked every record it has held for longer than
+  // this.
   uint32 max_processing_ms = 2;
   // The client library sending this stream. Optional.
   ClientInfo client = 3;
@@ -291,6 +298,11 @@ message Credits {
 // Ack marks the inclusive offset range [first_offset, last_offset] of one
 // partition as processed. Acks may arrive out of order; the server commits
 // the highest contiguous acked offset.
+//
+// The range covers the records of it that were delivered on this stream under
+// assignment_epoch and are not acked yet, and nothing else. The offsets of
+// the delivered records may have gaps (see RecordBatch): an offset in the
+// range that was not delivered here is not affected.
 message Ack {
   // Topic of the acked records.
   string topic = 1;
@@ -361,6 +373,12 @@ message PartitionAssignment {
 
 // Assigned reports newly assigned partitions. With cooperative rebalancing
 // it lists only the partitions added, not the full assignment.
+//
+// For topics received from a dispatcher the app's pod is not a member of the
+// consumer group and owns no partition: Assigned then only announces a
+// partition before the first records of it, with the epoch they carry, and
+// Revoked is never sent. A partition already announced may be announced again
+// with a new epoch, after Lost.
 message Assigned {
   // The partitions added to this consumer.
   repeated PartitionAssignment partitions = 1;
@@ -381,13 +399,23 @@ message Revoked {
 
 // Lost reports partitions that were taken away without a chance to commit.
 // The app must drop any in-flight work for them; acks will be ignored.
+//
+// For topics received from a dispatcher it means that the records the app
+// holds of those partitions will be delivered again, to this pod or another:
+// the dispatcher gave the partitions up, or the connection to it was lost.
 message Lost {
   // The partitions that were lost.
   repeated TopicPartition partitions = 1;
 }
 
-// RecordBatch carries consecutive records from one partition. Each record
-// consumes one credit.
+// RecordBatch carries records from one partition, in offset order. Each
+// record consumes one credit.
+//
+// The offsets need not be consecutive, within a batch or from one batch to
+// the next: compaction and transaction markers leave gaps, and for a topic
+// received from a dispatcher the records in between went to other pods. For
+// such a topic a later batch may also carry a lower offset than an earlier
+// one, when a record is delivered again.
 message RecordBatch {
   // Topic the records were read from.
   string topic = 1;

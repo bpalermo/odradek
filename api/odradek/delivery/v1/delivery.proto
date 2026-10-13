@@ -280,6 +280,13 @@ message Accepted {
   ReplicaList replicas = 2;
   // The dispatcher replica answering this stream.
   PeerInfo dispatcher = 3;
+  // Where the replica answering this stream serves DeliveryService, exactly
+  // as it appears in `replicas`. A sidecar that reached the replica through
+  // the address of the dispatcher's Service does not know which one answered:
+  // this is how it learns which replica it already has a stream to. When it
+  // is unset, or names a replica that is not listed, the sidecar opens a
+  // stream to every listed replica and closes this one.
+  string address = 4;
 }
 
 // ReplicaList is every dispatcher replica that consumes for the stream's
@@ -289,9 +296,10 @@ message Accepted {
 message ReplicaList {
   // Orders the lists of one consumer group: it grows every time the group's
   // membership changes, and every replica sends the same list under the same
-  // generation. A sidecar ignores a list whose generation is lower than that
-  // of the list it is acting on. A sidecar that has lost every stream forgets
-  // the generation it knew and starts again from the bootstrap address.
+  // generation. A sidecar ignores a list whose generation is not higher than
+  // that of the list it is acting on. A sidecar that has lost every stream
+  // forgets the generation it knew and starts again from the bootstrap
+  // address.
   uint64 generation = 1;
   // The replicas, in no particular order.
   repeated Replica replicas = 2;

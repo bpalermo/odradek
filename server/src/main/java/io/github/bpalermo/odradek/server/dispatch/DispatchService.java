@@ -158,6 +158,7 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
                     .setGeneration(1)
                     .addReplicas(Replica.newBuilder().setAddress(address)))
             .setDispatcher(PeerInfo.newBuilder().setVersion(Version.VERSION))
+            .setAddress(address)
             .build();
   }
 

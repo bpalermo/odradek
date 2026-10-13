@@ -29,9 +29,9 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 | --- | --- |
 | `api/odradek/kafka/v1/` | The gRPC API between an application and the server |
 | `api/odradek/config/v1/` | The server's configuration schema, validated with protovalidate |
-| `api/odradek/delivery/v1/` | The gRPC protocol between a sidecar and a dispatcher (ADR 6). The server serves it when it has a `dispatch` section; the sidecar's side is not built yet |
+| `api/odradek/delivery/v1/` | The gRPC protocol between a sidecar and a dispatcher (ADR 6). The server serves it when it has a `dispatch` section, and is its client for the consumers whose `source` is the dispatcher |
 | `api/odradek/client/v1/` | The client protocol as data: events, actions, conformance scenarios |
-| `server/` | The server: `config`, `codec`, `produce`, `consume`, `dispatch` (the dispatcher of ADR 6), `tls`, `admin` (health) and `telemetry` (metrics) packages under `io.github.bpalermo.odradek.server` |
+| `server/` | The server: `config`, `codec`, `produce`, `consume`, `dispatch` (the dispatcher of ADR 6), `receive` (the sidecar's side of it), `tls`, `admin` (health) and `telemetry` (metrics) packages under `io.github.bpalermo.odradek.server` |
 | `client/core/` | The client protocol with no I/O: `handle(event) -> actions`, shared by the JVM clients |
 | `client/java/`, `client/clojure/`, `client/python/` | The client libraries; Python has its own port of the core |
 | `conformance/scenarios/` | YAML scenarios that every core must pass |

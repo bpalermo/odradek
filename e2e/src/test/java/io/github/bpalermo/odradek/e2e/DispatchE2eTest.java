@@ -415,6 +415,9 @@ class DispatchE2eTest {
     assertThat(accepted.getReplicas().getReplicasCount()).isEqualTo(1);
     String address = accepted.getReplicas().getReplicas(0).getAddress();
     assertThat(address).endsWith(":" + harness.port());
+    // And it says which of the listed replicas it is: a sidecar that came through the Service's
+    // address knows it has this one already.
+    assertThat(accepted.getAddress()).isEqualTo(address);
     // Reachable as given: a sidecar connects to it and nowhere else.
     ManagedChannel direct = NettyChannelBuilder.forTarget(address).usePlaintext().build();
     try {
