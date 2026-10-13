@@ -634,6 +634,18 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ListenerTls"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ListenerTls$Builder"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.config.v1.ListenerTls$SourceCase"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.config.v1.OffsetReset"
     },
     {

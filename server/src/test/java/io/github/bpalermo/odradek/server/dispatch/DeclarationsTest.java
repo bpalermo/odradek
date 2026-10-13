@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server.dispatch;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
+import io.github.bpalermo.odradek.config.v1.PolicyRule;
 import io.github.bpalermo.odradek.delivery.v1.Declare;
 import io.github.bpalermo.odradek.delivery.v1.OffsetReset;
 import io.github.bpalermo.odradek.delivery.v1.OnExhausted;
@@ -12,6 +13,7 @@ import io.github.bpalermo.odradek.server.dispatch.Declarations.Declared;
 import io.github.bpalermo.odradek.server.dispatch.Declarations.Refused;
 import io.grpc.Status;
 import java.time.Duration;
+import java.util.List;
 import java.util.Set;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
@@ -35,12 +37,13 @@ class DeclarationsTest {
   }
 
   private static Declared accepted(Declare declare) throws Refused {
-    return Declarations.check(declare, CLUSTERS);
+    return Declarations.check(declare, CLUSTERS, null, null);
   }
 
   private static Status refused(Declare declare) {
     Refused refused =
-        catchThrowableOfType(Refused.class, () -> Declarations.check(declare, CLUSTERS));
+        catchThrowableOfType(
+            Refused.class, () -> Declarations.check(declare, CLUSTERS, null, null));
     assertThat(refused).as("refused: %s", declare).isNotNull();
     return refused.status();
   }
@@ -146,6 +149,117 @@ class DeclarationsTest {
     assertThat(status.getDescription())
         .isEqualTo(
             "not allowed to consume topic orders.created in group billing on cluster elsewhere");
+  }
+
+  // --- With a policy: the delivery port has TLS, and the sidecar an identity ---
+
+  private static final String BILLING = "spiffe://example.org/ns/billing/sa/billing";
+  private static final String AUDIT = "spiffe://example.org/ns/audit/sa/audit";
+
+  /** Billing may consume orders.* in its group, with one dead-letter topic; audit, one topic. */
+  private static final Policy POLICY =
+      Policy.of(
+          List.of(
+              PolicyRule.newBuilder()
+                  .addSpiffeIds(BILLING)
+                  .setCluster("main")
+                  .addTopics("orders.*")
+                  .addGroups("billing")
+                  .addDeadLetterTopics("billing.dlq")
+                  .build(),
+              PolicyRule.newBuilder()
+                  .addSpiffeIds(AUDIT)
+                  .setCluster("other")
+                  .addTopics("secret.ledger")
+                  .addGroups("audit")
+                  .build()));
+
+  private static Status refused(Declare declare, String spiffeId) {
+    Refused refused =
+        catchThrowableOfType(
+            Refused.class, () -> Declarations.check(declare, CLUSTERS, POLICY, spiffeId));
+    assertThat(refused).as("refused: %s", declare).isNotNull();
+    return refused.status();
+  }
+
+  @Test
+  void whatThePolicyAllowsIsAccepted() throws Refused {
+    Declared declared = Declarations.check(declare().build(), CLUSTERS, POLICY, BILLING);
+    assertThat(declared.topic()).isEqualTo("orders.created");
+  }
+
+  @Test
+  void whatThePolicyDoesNotAllowIsRefusedInTheDeclarationsOwnWords() {
+    // Another identity's topic, an identity with no rule, a group, a cluster that does not exist:
+    // one status, and a message made of nothing but who asked and what was asked.
+    Declare ledger =
+        declare().setCluster("other").setGroupId("audit").setTopic("secret.ledger").build();
+    Status status = refused(ledger, BILLING);
+    assertThat(status.getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+    assertThat(status.getDescription())
+        .isEqualTo(
+            BILLING
+                + " is not allowed to consume topic secret.ledger in group audit on cluster"
+                + " other");
+
+    assertThat(refused(declare().build(), "spiffe://example.org/nobody").getDescription())
+        .isEqualTo(
+            "spiffe://example.org/nobody is not allowed to consume topic orders.created in group"
+                + " billing on cluster main");
+    assertThat(refused(declare().setGroupId("audit").build(), BILLING).getDescription())
+        .isEqualTo(
+            BILLING
+                + " is not allowed to consume topic orders.created in group audit on cluster"
+                + " main");
+    assertThat(refused(declare().setCluster("elsewhere").build(), BILLING).getDescription())
+        .isEqualTo(
+            BILLING
+                + " is not allowed to consume topic orders.created in group billing on cluster"
+                + " elsewhere");
+  }
+
+  @Test
+  void aRefusalSaysNothingOfTheRulesOfOthers() {
+    // What audit may have appears in a refusal only when the declaration itself named it.
+    Status status = refused(declare().setTopic("payments").build(), BILLING);
+    assertThat(status.getDescription()).doesNotContain("secret.ledger", AUDIT, "audit", "other");
+  }
+
+  @Test
+  void aDeadLetterTopicThePolicyDoesNotAllowIsRefusedBeforeAnythingIsSaidOfDeadLettering() {
+    Declare elsewhere =
+        with(
+            s ->
+                s.setMaxAttempts(3)
+                    .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                    .setDeadLetterTopic("secret.ledger"));
+    Status status = refused(elsewhere, BILLING);
+    assertThat(status.getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+    assertThat(status.getDescription())
+        .isEqualTo(
+            BILLING
+                + " is not allowed to consume topic orders.created in group billing on cluster"
+                + " main with dead-letter topic secret.ledger");
+
+    // An allowed one gets as far as the answer that dead-lettering is not built yet.
+    Declare allowed =
+        with(
+            s ->
+                s.setMaxAttempts(3)
+                    .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                    .setDeadLetterTopic("billing.dlq"));
+    assertThat(refused(allowed, BILLING).getCode()).isEqualTo(Status.Code.UNIMPLEMENTED);
+  }
+
+  @Test
+  void aMalformedDeclarationIsReportedBeforeThePolicy() {
+    Refused refused =
+        catchThrowableOfType(
+            Refused.class,
+            () ->
+                Declarations.check(
+                    declare().clearGroupId().build(), CLUSTERS, POLICY, "spiffe://x.test/nobody"));
+    assertThat(refused.status().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
   }
 
   @Test

@@ -8,8 +8,9 @@ import java.util.List;
  * Whether the server can do its work right now, and if not, why.
  *
  * <p>Not ready while starting (which includes waiting for the first TLS credentials and for every
- * required cluster to answer), while any cluster's client certificate has expired, and once
- * shutdown has begun. A cluster that stops answering after startup does not change it.
+ * required cluster to answer), while a certificate in use has expired (a cluster's, or that of the
+ * delivery port on either of its ends), and once shutdown has begun. A cluster that stops answering
+ * after startup does not change it.
  */
 public final class Readiness {
   /** What startup or shutdown is doing; null between the two. */

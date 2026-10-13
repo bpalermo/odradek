@@ -959,7 +959,7 @@ final class ReceiveSession implements AppStream {
         topic.name,
         link.target(),
         status.getCode(),
-        status.getDescription());
+        reason(status));
     if (unanswered) {
       if (replicas.known()) {
         reconcile(topic);
@@ -977,8 +977,34 @@ final class ReceiveSession implements AppStream {
   }
 
   /**
+   * Why a stream ended, on one line. For a connection that was never made, gRPC's description is
+   * "io exception" and a dump of the channel's handlers; what happened is the cause underneath,
+   * which for a TLS handshake that failed is the one thing an operator needs: which end refused,
+   * and what (an identity that is not accepted, an authority that is not trusted, no certificate).
+   */
+  static String reason(Status status) {
+    String description = status.getDescription() == null ? "" : status.getDescription();
+    int newline = description.indexOf('\n');
+    StringBuilder reason =
+        new StringBuilder(newline < 0 ? description : description.substring(0, newline));
+    Throwable cause = status.getCause();
+    for (int depth = 0; cause != null && cause.getCause() != null && depth < 8; depth++) {
+      cause = cause.getCause();
+    }
+    if (cause != null) {
+      reason
+          .append(reason.isEmpty() ? "" : ": ")
+          .append(cause.getClass().getSimpleName())
+          .append(cause.getMessage() == null ? "" : ": " + cause.getMessage());
+    }
+    return reason.toString();
+  }
+
+  /**
    * Statuses that opening the stream again would meet again: a declaration the dispatcher refuses
-   * for what it says or for who says it. Everything else, a lost connection included, is retried.
+   * for what it says or for who says it. Everything else, a lost connection included, is retried: a
+   * TLS handshake that failed is among it, since gRPC reports that as UNAVAILABLE whichever end
+   * refused, and never as one of these.
    */
   static boolean permanent(Status.Code code) {
     return switch (code) {

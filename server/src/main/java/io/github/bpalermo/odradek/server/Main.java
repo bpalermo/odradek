@@ -148,7 +148,17 @@ public final class Main {
 
     // Connects to nothing until an app subscribes: readiness does not depend on the dispatcher,
     // and an app that only produces starts without one.
-    ReceiveService receive = ReceiveService.create(config, metrics);
+    ReceiveService receive;
+    try {
+      receive = ReceiveService.create(config, tls, metrics);
+    } catch (CredentialException e) {
+      LOG.error("TLS credentials unusable: {}", e.getMessage());
+      producers.close(Duration.ZERO);
+      tls.close();
+      codecs.close();
+      System.exit(1);
+      return;
+    }
     ConsumeService consume =
         new ConsumeService(config, codecs, tls, produce.serverEpoch(), metrics, receive);
 
@@ -169,9 +179,9 @@ public final class Main {
       }
       if (config.hasDispatch()) {
         dispatch = new DispatchService(config, tls, metrics);
-        delivery = DeliveryServer.start(config.getDispatch(), dispatch);
+        delivery = DeliveryServer.start(config.getDispatch(), dispatch, tls);
       }
-    } catch (IOException e) {
+    } catch (IOException | CredentialException e) {
       LOG.error("could not start", e);
       if (server != null) {
         server.close();

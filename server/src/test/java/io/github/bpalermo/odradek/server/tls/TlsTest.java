@@ -4,7 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.bpalermo.odradek.config.v1.Cluster;
+import io.github.bpalermo.odradek.config.v1.Dispatch;
+import io.github.bpalermo.odradek.config.v1.Dispatcher;
 import io.github.bpalermo.odradek.config.v1.FileSource;
+import io.github.bpalermo.odradek.config.v1.ListenerTls;
 import io.github.bpalermo.odradek.config.v1.ProduceTarget;
 import io.github.bpalermo.odradek.config.v1.Producer;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
@@ -18,6 +21,7 @@ import java.security.KeyStore;
 import java.security.cert.X509Certificate;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -286,6 +290,88 @@ class TlsTest {
         .hasMessageContaining("SASL_PLAINTEXT");
   }
 
+  // --- The delivery port's credentials ---
+
+  private static ServerConfig delivery(Path listenerDir, Path dispatcherDir) {
+    ServerConfig.Builder config = ServerConfig.newBuilder();
+    if (listenerDir != null) {
+      config.setDispatch(
+          Dispatch.newBuilder()
+              .setTls(
+                  ListenerTls.newBuilder()
+                      .setFiles(FileSource.newBuilder().setDir(listenerDir.toString()))));
+    }
+    if (dispatcherDir != null) {
+      config.setDispatcher(
+          Dispatcher.newBuilder()
+              .setAddress("dispatcher:9465")
+              .setTls(
+                  Tls.newBuilder()
+                      .setFiles(FileSource.newBuilder().setDir(dispatcherDir.toString()))
+                      .addAcceptedSpiffeIds(BROKER_ID)));
+    }
+    return config.build();
+  }
+
+  @Test
+  void deliveryCredentialsAreLoadedForBothRoles() throws Exception {
+    TestPki.write(dir.resolve("listener"), broker, ca);
+    TestPki.write(dir.resolve("dispatcher"), client, ca);
+    try (TlsSources tls =
+        TlsSources.create(delivery(dir.resolve("listener"), dir.resolve("dispatcher")))) {
+      assertThat(subject(tls.listener().current().chain().get(0))).isEqualTo("CN=broker");
+      assertThat(subject(tls.dispatcher().source().current().chain().get(0)))
+          .isEqualTo("CN=client");
+      assertThat(tls.dispatcher().policy()).isEqualTo(new PeerPolicy(Set.of(BROKER_ID), ""));
+      assertThat(tls.deliverySources()).containsOnlyKeys("dispatch.tls", "dispatcher.tls");
+      // Not clusters: nothing is given to a Kafka client for them.
+      assertThat(tls.sources()).isEmpty();
+    }
+  }
+
+  @Test
+  void withoutDeliveryTlsThereAreNoDeliveryCredentials() throws Exception {
+    try (TlsSources tls = TlsSources.create(delivery(null, null))) {
+      assertThat(tls.listener()).isNull();
+      assertThat(tls.dispatcher()).isNull();
+      assertThat(tls.deliverySources()).isEmpty();
+    }
+    assertThat(TlsSources.none().listener()).isNull();
+    assertThat(TlsSources.none().dispatcher()).isNull();
+  }
+
+  @Test
+  void anExpiredDeliveryCertificateIsAProblemInEitherRole() throws Exception {
+    TestPki.write(dir.resolve("listener"), broker, ca);
+    TestPki.write(dir.resolve("dispatcher"), client, ca);
+    try (TlsSources listener = TlsSources.create(delivery(dir.resolve("listener"), null));
+        TlsSources sidecar = TlsSources.create(delivery(null, dir.resolve("dispatcher")))) {
+      Instant now = Instant.now();
+      assertThat(listener.problems(now)).isEmpty();
+      assertThat(sidecar.problems(now)).isEmpty();
+      // The test authority issues for one day.
+      Instant later = now.plus(Duration.ofDays(3));
+      assertThat(listener.problems(later))
+          .singleElement()
+          .asString()
+          .startsWith("dispatch.tls: the certificate expired at ");
+      assertThat(sidecar.problems(later))
+          .singleElement()
+          .asString()
+          .startsWith("dispatcher.tls: the certificate expired at ");
+    }
+  }
+
+  @Test
+  void missingDeliveryCredentialsNameTheirSection() {
+    assertThatThrownBy(() -> TlsSources.create(delivery(dir.resolve("nowhere"), null)))
+        .isInstanceOf(CredentialException.class)
+        .hasMessageStartingWith("dispatch.tls: cannot read ");
+    assertThatThrownBy(() -> TlsSources.create(delivery(null, dir.resolve("nowhere"))))
+        .isInstanceOf(CredentialException.class)
+        .hasMessageStartingWith("dispatcher.tls: cannot read ");
+  }
+
   // --- Helpers ---
 
   private static ReloadingSslEngineFactory factory(CredentialSource source, PeerPolicy policy) {
@@ -315,22 +401,31 @@ class TlsTest {
     SSLEngine brokerEngine = brokerContext(broker, clientCa).createSSLEngine();
     brokerEngine.setUseClientMode(false);
     brokerEngine.setNeedClientAuth(true);
+    handshake(clientEngine, brokerEngine);
+    X509Certificate seen = (X509Certificate) brokerEngine.getSession().getPeerCertificates()[0];
+    return subject(seen);
+  }
 
+  /**
+   * Completes a handshake between two engines, in memory.
+   *
+   * @throws SSLException if either end refuses the other
+   */
+  static void handshake(SSLEngine clientEngine, SSLEngine serverEngine) throws SSLException {
     int size = clientEngine.getSession().getPacketBufferSize();
-    ByteBuffer clientToBroker = ByteBuffer.allocate(size * 4);
-    ByteBuffer brokerToClient = ByteBuffer.allocate(size * 4);
+    ByteBuffer clientToServer = ByteBuffer.allocate(size * 4);
+    ByteBuffer serverToClient = ByteBuffer.allocate(size * 4);
     ByteBuffer empty = ByteBuffer.allocate(0);
     ByteBuffer sink = ByteBuffer.allocate(clientEngine.getSession().getApplicationBufferSize());
 
     clientEngine.beginHandshake();
-    brokerEngine.beginHandshake();
+    serverEngine.beginHandshake();
     for (int round = 0; round < 100; round++) {
       boolean progress = false;
-      progress |= step(clientEngine, brokerToClient, clientToBroker, empty, sink);
-      progress |= step(brokerEngine, clientToBroker, brokerToClient, empty, sink);
-      if (done(clientEngine) && done(brokerEngine) && !progress) {
-        X509Certificate seen = (X509Certificate) brokerEngine.getSession().getPeerCertificates()[0];
-        return subject(seen);
+      progress |= step(clientEngine, serverToClient, clientToServer, empty, sink);
+      progress |= step(serverEngine, clientToServer, serverToClient, empty, sink);
+      if (done(clientEngine) && done(serverEngine) && !progress) {
+        return;
       }
     }
     throw new AssertionError("the handshake did not finish");

@@ -163,6 +163,12 @@ message ServerConfig {
 // declare, on the clusters of ServerConfig.clusters, as far as `policy`
 // allows.
 message Dispatch {
+  option (buf.validate.message).cel = {
+    id: "dispatch.policy_requires_tls"
+    message: "a policy needs tls: without it no sidecar has an identity a rule could match"
+    expression: "size(this.policy) == 0 || has(this.tls)"
+  };
+
   // TCP port on which sidecars connect (odradek.delivery.v1.DeliveryService).
   // Default: 9465. 0 picks a free port, which the server logs. Not
   // hot-reloadable: a change takes effect at the next server restart.
@@ -185,16 +191,52 @@ message Dispatch {
   // dispatcher restart. At least 1. Default: 1000.
   uint32 partition_window = 4 [(buf.validate.field).uint32.gte = 1];
   // Who may consume what. A declaration is accepted when at least one rule
-  // allows it; with no rule, every declaration is refused. A rule that is
-  // too wide gives an application topics it should not read: the dispatcher
-  // reads Kafka as itself, so the brokers' ACLs cannot tell its applications
-  // apart.
+  // allows it; with `tls` and no rule, every declaration is refused. A rule
+  // that is too wide gives an application topics it should not read: the
+  // dispatcher reads Kafka as itself, so the brokers' ACLs cannot tell its
+  // applications apart.
   //
-  // NOT ENFORCED YET. The delivery port has no TLS so far, so a sidecar has
-  // no identity to match a rule with: the rules are validated and then
-  // ignored, and every declaration naming a cluster of this configuration is
-  // accepted. A dispatcher is for tests until that changes.
+  // A rule matches a sidecar by the SPIFFE ID of its client certificate, so
+  // a policy needs `tls`: a configuration with rules and no `tls` is
+  // rejected. A declaration is checked when it is made, and a stream that
+  // was accepted stays until it ends. Not hot-reloadable.
   repeated PolicyRule policy = 5;
+  // Mutual TLS on the delivery port: the certificate this dispatcher presents
+  // to sidecars and the authorities their certificates must chain to. A
+  // connection without a client certificate, or with one that does not
+  // verify, is closed during the handshake. Rotated credentials are used
+  // from the next handshake on; connections that are open keep theirs.
+  //
+  // Unset, the port is PLAINTEXT and unauthenticated: there is no identity
+  // to check, `policy` must be empty, and every declaration that names one
+  // of this dispatcher's clusters is accepted, so whoever reaches the port
+  // reads every topic the dispatcher's Kafka credentials can. That is for
+  // tests and for a machine nobody else can reach, and the server says so
+  // loudly every time it starts. Not hot-reloadable.
+  ListenerTls tls = 6;
+}
+
+// ListenerTls configures the credentials of a port the server listens on
+// with mutual TLS. Which peers are accepted is not said here: every peer
+// whose certificate verifies completes the handshake, and what it may do is
+// decided by its identity afterwards (Dispatch.policy).
+message ListenerTls {
+  // Where the server certificate, private key and trust bundle come from.
+  // Exactly one must be set.
+  //
+  // With `spiffe`, a client certificate must carry a SPIFFE ID and chain to
+  // the bundle of the trust domain that ID names, so that an authority
+  // federated with can only vouch for its own identities. With `files`, it
+  // must chain to the CA bundle; one that carries no SPIFFE ID completes the
+  // handshake and is then refused everything, as UNAUTHENTICATED.
+  oneof source {
+    option (buf.validate.oneof).required = true;
+
+    // Take X.509 SVIDs and bundles from the SPIFFE Workload API.
+    SpiffeSource spiffe = 1;
+    // Take PEM files from a watched directory.
+    FileSource files = 2;
+  }
 }
 
 // PolicyRule allows some sidecars to consume some topics of one cluster in
@@ -265,6 +307,12 @@ message PolicyRule {
 // Dispatcher says where the dispatcher is, for a server that receives topics
 // from one.
 message Dispatcher {
+  option (buf.validate.message).cel = {
+    id: "dispatcher.tls_peer_identity"
+    message: "tls needs accepted_spiffe_ids or accepted_trust_domain: a dispatcher is recognized by its SPIFFE ID, never by host name"
+    expression: "!has(this.tls) || size(this.tls.accepted_spiffe_ids) > 0 || this.tls.accepted_trust_domain != ''"
+  };
+
   // The address of the dispatcher's Service, as host:port (e.g.
   // "odradek-dispatcher.kafka.svc:9465"). It is used for the first
   // connection only, and again after every connection has been lost: the
@@ -274,6 +322,22 @@ message Dispatcher {
     (buf.validate.field).required = true,
     (buf.validate.field).string.host_and_port = true
   ];
+  // Mutual TLS to the dispatcher: the client certificate this server
+  // presents, whose SPIFFE ID is what the dispatcher's policy is matched
+  // against, the authorities a dispatcher's certificate must chain to, and
+  // the dispatcher's identity. Rotated credentials are used from the next
+  // connection on.
+  //
+  // accepted_spiffe_ids or accepted_trust_domain is required, whatever the
+  // source: every replica must present a SPIFFE ID they accept. The host
+  // name is never checked, because replicas are connected to by IP address.
+  //
+  // Unset, the connection is PLAINTEXT: records and acknowledgements travel
+  // unencrypted, and nothing proves that what answers at `address` is the
+  // dispatcher. That is for tests, and the server says so loudly every time
+  // it starts. A dispatcher with `tls` does not answer such a server. Not
+  // hot-reloadable.
+  Tls tls = 2;
 }
 
 // Telemetry configures the export of the server's metrics over OTLP/gRPC.
@@ -685,9 +749,10 @@ message Cluster {
   Tls tls = 5;
 }
 
-// Tls configures mutual TLS to the brokers of one cluster: where the client
-// certificate and trust bundle come from, and which broker identities are
-// accepted.
+// Tls configures mutual TLS to a peer the server connects to, which is the
+// brokers of one cluster (Cluster.tls) or the dispatcher (Dispatcher.tls):
+// where the client certificate and trust bundle come from, and which peer
+// identities are accepted.
 message Tls {
   option (buf.validate.message).cel = {
     id: "tls.spiffe_peer_policy"
@@ -706,18 +771,19 @@ message Tls {
     FileSource files = 2;
   }
 
-  // Broker SPIFFE IDs accepted as peers, e.g.
-  // "spiffe://example.org/ns/kafka/sa/broker". A broker certificate whose
+  // SPIFFE IDs accepted as peers, e.g.
+  // "spiffe://example.org/ns/kafka/sa/broker". A peer certificate whose
   // SPIFFE ID is not listed is rejected, unless accepted_trust_domain covers
   // it. With a `spiffe` source, at least one of accepted_spiffe_ids and
-  // accepted_trust_domain is required.
+  // accepted_trust_domain is required. With neither, which only Cluster.tls
+  // allows, a broker is verified by host name instead.
   repeated string accepted_spiffe_ids = 3 [(buf.validate.field).repeated = {
     unique: true
     items: {
       string: {prefix: "spiffe://"}
     }
   }];
-  // Accept any broker SPIFFE ID in this trust domain, given without scheme
+  // Accept any peer SPIFFE ID in this trust domain, given without scheme
   // (e.g. "example.org").
   string accepted_trust_domain = 4;
 }
@@ -740,14 +806,14 @@ message FileSource {
     (buf.validate.field).required = true,
     (buf.validate.field).string.prefix = "/"
   ];
-  // Name, inside `dir`, of the PEM client certificate chain, leaf first.
-  // Default: tls.crt.
+  // Name, inside `dir`, of the PEM certificate chain the server presents,
+  // leaf first. Default: tls.crt.
   string cert_file = 2;
   // Name, inside `dir`, of the PEM private key (PKCS#8) matching the leaf
   // certificate. Default: tls.key.
   string key_file = 3;
   // Name, inside `dir`, of the PEM bundle of CA certificates used to verify
-  // brokers. Default: ca.crt.
+  // the peer. Default: ca.crt.
   string ca_file = 4;
 }
 

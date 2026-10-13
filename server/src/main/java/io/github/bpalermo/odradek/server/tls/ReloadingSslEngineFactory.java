@@ -1,22 +1,13 @@
 package io.github.bpalermo.odradek.server.tls;
 
-import java.net.Socket;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
-import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLParameters;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.TrustManagerFactory;
-import javax.net.ssl.X509ExtendedTrustManager;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.config.SslConfigs;
 import org.apache.kafka.common.security.auth.SslEngineFactory;
@@ -34,9 +25,6 @@ import org.apache.kafka.common.security.auth.SslEngineFactory;
 public final class ReloadingSslEngineFactory implements SslEngineFactory {
   /** Configuration key of the {@link TlsBinding}. Set by the server, never by a file. */
   public static final String BINDING_CONFIG = "odradek.tls.binding";
-
-  /** In-memory key store entries need a password; it protects nothing. */
-  private static final char[] PASSWORD = "in-memory".toCharArray();
 
   private TlsBinding binding;
   private List<String> protocols;
@@ -72,7 +60,7 @@ public final class ReloadingSslEngineFactory implements SslEngineFactory {
     if (!cipherSuites.isEmpty()) {
       parameters.setCipherSuites(cipherSuites.toArray(String[]::new));
     }
-    // A SPIFFE identity replaces the host name check; see SpiffeTrustManager.
+    // A SPIFFE identity replaces the host name check; see PeerTrust.
     parameters.setEndpointIdentificationAlgorithm(
         binding.policy().spiffe() ? "" : endpointIdentification);
     engine.setSSLParameters(parameters);
@@ -114,57 +102,16 @@ public final class ReloadingSslEngineFactory implements SslEngineFactory {
     Built latest = built;
     if (latest == null || latest.credentials() != credentials) {
       try {
-        latest = new Built(credentials, build(credentials, binding.policy()));
+        latest =
+            new Built(
+                credentials,
+                PeerTrust.context(credentials, PeerTrust.ofBroker(credentials, binding.policy())));
       } catch (GeneralSecurityException | java.io.IOException e) {
         throw new KafkaException("cannot build a TLS context from the credentials", e);
       }
       built = latest;
     }
     return latest.context();
-  }
-
-  private static SSLContext build(Credentials credentials, PeerPolicy policy)
-      throws GeneralSecurityException, java.io.IOException {
-    KeyStore keys = KeyStore.getInstance("PKCS12");
-    keys.load(null, null);
-    keys.setKeyEntry(
-        "client", credentials.key(), PASSWORD, credentials.chain().toArray(X509Certificate[]::new));
-    KeyManagerFactory keyManagers =
-        KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-    keyManagers.init(keys, PASSWORD);
-
-    X509ExtendedTrustManager trust = pkix(credentials.trust());
-    if (policy.spiffe()) {
-      Map<String, X509ExtendedTrustManager> byDomain = new HashMap<>();
-      for (var bundle : credentials.bundles().entrySet()) {
-        byDomain.put(bundle.getKey().toLowerCase(Locale.ROOT), pkix(bundle.getValue()));
-      }
-      trust = new SpiffeTrustManager(trust, byDomain, policy);
-    }
-
-    SSLContext context = SSLContext.getInstance("TLS");
-    context.init(keyManagers.getKeyManagers(), new TrustManager[] {trust}, null);
-    return context;
-  }
-
-  /** The JDK's chain validation against a set of authorities. */
-  private static X509ExtendedTrustManager pkix(List<X509Certificate> authorities)
-      throws GeneralSecurityException, java.io.IOException {
-    KeyStore store = KeyStore.getInstance("PKCS12");
-    store.load(null, null);
-    int n = 0;
-    for (X509Certificate certificate : authorities) {
-      store.setCertificateEntry("ca-" + n++, certificate);
-    }
-    TrustManagerFactory factory =
-        TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-    factory.init(store);
-    for (TrustManager manager : factory.getTrustManagers()) {
-      if (manager instanceof X509ExtendedTrustManager extended) {
-        return extended;
-      }
-    }
-    throw new GeneralSecurityException("the JDK offers no X.509 trust manager");
   }
 
   private static List<String> strings(Object value) {
@@ -175,81 +122,5 @@ public final class ReloadingSslEngineFactory implements SslEngineFactory {
       return List.of(text.split("\\s*,\\s*"));
     }
     return List.of();
-  }
-
-  /**
-   * Chain validation by the JDK, then the SPIFFE ID of the leaf against the policy. When the
-   * credentials carry a bundle per trust domain, the chain must verify against the bundle of the
-   * trust domain the leaf's SPIFFE ID names.
-   */
-  private static final class SpiffeTrustManager extends X509ExtendedTrustManager {
-    private final X509ExtendedTrustManager pkix;
-    private final Map<String, X509ExtendedTrustManager> byDomain;
-    private final PeerPolicy policy;
-
-    SpiffeTrustManager(
-        X509ExtendedTrustManager pkix,
-        Map<String, X509ExtendedTrustManager> byDomain,
-        PeerPolicy policy) {
-      this.pkix = pkix;
-      this.byDomain = byDomain;
-      this.policy = policy;
-    }
-
-    private X509ExtendedTrustManager authorityOf(X509Certificate leaf) throws CertificateException {
-      if (byDomain.isEmpty()) {
-        return pkix;
-      }
-      String domain = PeerPolicy.trustDomain(PeerPolicy.spiffeId(leaf));
-      X509ExtendedTrustManager manager = byDomain.get(domain);
-      if (manager == null) {
-        throw new CertificateException("no trust bundle for the broker's trust domain " + domain);
-      }
-      return manager;
-    }
-
-    @Override
-    public void checkServerTrusted(X509Certificate[] chain, String authType, SSLEngine engine)
-        throws CertificateException {
-      authorityOf(chain[0]).checkServerTrusted(chain, authType, engine);
-      policy.check(chain[0]);
-    }
-
-    @Override
-    public void checkServerTrusted(X509Certificate[] chain, String authType, Socket socket)
-        throws CertificateException {
-      authorityOf(chain[0]).checkServerTrusted(chain, authType, socket);
-      policy.check(chain[0]);
-    }
-
-    @Override
-    public void checkServerTrusted(X509Certificate[] chain, String authType)
-        throws CertificateException {
-      authorityOf(chain[0]).checkServerTrusted(chain, authType);
-      policy.check(chain[0]);
-    }
-
-    @Override
-    public void checkClientTrusted(X509Certificate[] chain, String authType, SSLEngine engine)
-        throws CertificateException {
-      throw new CertificateException("odradek only connects to brokers");
-    }
-
-    @Override
-    public void checkClientTrusted(X509Certificate[] chain, String authType, Socket socket)
-        throws CertificateException {
-      throw new CertificateException("odradek only connects to brokers");
-    }
-
-    @Override
-    public void checkClientTrusted(X509Certificate[] chain, String authType)
-        throws CertificateException {
-      throw new CertificateException("odradek only connects to brokers");
-    }
-
-    @Override
-    public X509Certificate[] getAcceptedIssuers() {
-      return pkix.getAcceptedIssuers();
-    }
   }
 }

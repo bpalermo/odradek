@@ -6,6 +6,11 @@ import io.github.bpalermo.odradek.server.Version;
 import io.github.bpalermo.odradek.server.consume.AppStream;
 import io.github.bpalermo.odradek.server.consume.DispatcherSource;
 import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
+import io.github.bpalermo.odradek.server.tls.CredentialException;
+import io.github.bpalermo.odradek.server.tls.PeerPolicy;
+import io.github.bpalermo.odradek.server.tls.ReloadingSslContext;
+import io.github.bpalermo.odradek.server.tls.TlsBinding;
+import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.netty.NettyChannelBuilder;
@@ -13,8 +18,10 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.epoll.EpollIoHandler;
 import io.netty.channel.epoll.EpollSocketChannel;
+import io.netty.handler.ssl.SslContext;
 import java.io.Closeable;
 import java.time.Duration;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -26,9 +33,11 @@ import org.slf4j.LoggerFactory;
  * stream; nothing is connected until an app subscribes, so a server starts, and is ready, whether
  * or not the dispatcher can be reached.
  *
- * <p><b>Plaintext, and unauthenticated</b>: mutual TLS on the delivery port is step 5 of the ADR's
- * plan. Until then the dispatcher cannot tell this server from any other, and nothing proves to
- * this server that what answers at {@code dispatcher.address} is the dispatcher.
+ * <p>With {@code dispatcher.tls} every connection is mutual TLS: this server presents its
+ * certificate, whose SPIFFE ID is what the dispatcher's policy goes by, and accepts only a
+ * dispatcher whose SPIFFE ID the configuration accepts. <b>Without it the connection is plaintext
+ * and unauthenticated</b>: the dispatcher cannot tell this server from any other, and nothing
+ * proves to this server that what answers at {@code dispatcher.address} is the dispatcher.
  */
 public final class ReceiveService implements DispatcherSource, Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(ReceiveService.class);
@@ -74,22 +83,46 @@ public final class ReceiveService implements DispatcherSource, Closeable {
    * consumer received from a dispatcher gets a service that refuses every stream and holds no
    * thread.
    */
-  public static ReceiveService create(ServerConfig config, ServerMetrics metrics) {
+  public static ReceiveService create(ServerConfig config, TlsSources tls, ServerMetrics metrics)
+      throws CredentialException {
     if (!receives(config)) {
       return new ReceiveService(null, metrics, null, null);
     }
     String address = config.getDispatcher().getAddress();
-    LOG.warn(
-        "THE CONNECTION TO THE DISPATCHER AT {} IS NOT AUTHENTICATED OR ENCRYPTED YET: records and"
-            + " acknowledgements travel in plaintext, the dispatcher cannot tell this server from"
-            + " any other, and nothing proves that what answers there is the dispatcher. Do not"
-            + " receive from a dispatcher outside tests",
-        address);
+    TlsBinding binding = tls.dispatcher();
+    if (config.getDispatcher().hasTls() != (binding != null)) {
+      // One configuration made both; a connection must never be less safe than it asks for.
+      throw new IllegalStateException("dispatcher.tls and the credentials loaded for it disagree");
+    }
+    SslContext context = binding == null ? null : ReloadingSslContext.forDispatcher(binding);
+    if (context == null) {
+      LOG.warn(
+          "THE CONNECTION TO THE DISPATCHER AT {} IS PLAINTEXT AND UNAUTHENTICATED (no"
+              + " dispatcher.tls): records and acknowledgements travel unencrypted, the dispatcher"
+              + " cannot tell this server from any other, and nothing proves that what answers"
+              + " there is the dispatcher. Do not receive from a dispatcher like this outside"
+              + " tests",
+          address);
+    } else {
+      LOG.info(
+          "the dispatcher at {} is connected to with mutual TLS and must present {}",
+          address,
+          accepted(binding.policy()));
+    }
     EventLoopGroup loops = new MultiThreadIoEventLoopGroup(1, EpollIoHandler.newFactory());
     ReceiveSession.Options options =
         new ReceiveSession.Options(
             address, Version.VERSION, REJECT_PAUSE, DRAIN, System::nanoTime, Backoff::new);
-    return new ReceiveService(options, metrics, target -> connect(target, loops), loops);
+    return new ReceiveService(options, metrics, target -> connect(target, loops, context), loops);
+  }
+
+  private static String accepted(PeerPolicy policy) {
+    if (policy.trustDomain().isEmpty()) {
+      return "one of " + new TreeSet<>(policy.spiffeIds());
+    }
+    return "a SPIFFE ID of trust domain "
+        + policy.trustDomain()
+        + (policy.spiffeIds().isEmpty() ? "" : " or one of " + new TreeSet<>(policy.spiffeIds()));
   }
 
   /** A service with these timings whose connections are made by {@code connector}, for tests. */
@@ -98,13 +131,26 @@ public final class ReceiveService implements DispatcherSource, Closeable {
     return new ReceiveService(options, metrics, connector, null);
   }
 
-  private static ManagedChannel connect(String target, EventLoopGroup loops) {
+  /**
+   * The one place a connection to a dispatcher is made, bootstrap address and replicas alike.
+   *
+   * @param context the TLS context of {@code dispatcher.tls}, or null for plaintext. It is asked
+   *     for an engine at every connection, with the credentials of that moment, and verifies the
+   *     dispatcher by SPIFFE ID: {@code target} is an IP address as often as a name.
+   */
+  private static ManagedChannel connect(String target, EventLoopGroup loops, SslContext context) {
     // "dns" also takes an address literal, which is what a replica's address is; the configured
     // address is normally the name of a Service, resolved again whenever it is connected to.
-    return NettyChannelBuilder.forTarget("dns:///" + target)
-        .eventLoopGroup(loops)
-        .channelType(EpollSocketChannel.class)
-        .usePlaintext()
+    NettyChannelBuilder builder =
+        NettyChannelBuilder.forTarget("dns:///" + target)
+            .eventLoopGroup(loops)
+            .channelType(EpollSocketChannel.class);
+    if (context == null) {
+      builder.usePlaintext();
+    } else {
+      builder.sslContext(context);
+    }
+    return builder
         // What arrives is only ever queued for the session's thread.
         .directExecutor()
         // A dispatcher that vanished without closing its connection is noticed, and the stream

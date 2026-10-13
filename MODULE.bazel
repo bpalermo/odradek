@@ -124,6 +124,10 @@ maven.install(
         # Named directly by the server: the event loop and the domain socket channel.
         "io.netty:netty-transport:4.2.16.Final",
         "io.netty:netty-transport-classes-epoll:4.2.16.Final",
+        # And the TLS context of the delivery port (ADR 6), which grpc-netty takes
+        # as Netty's own type. Both were already in the tree through grpc-netty.
+        "io.netty:netty-buffer:4.2.16.Final",
+        "io.netty:netty-handler:4.2.16.Final",
         # protovalidate (Java runtime) evaluates the buf.validate rules of the config
         # protos. Its jar bundles the generated build.buf.validate classes; see
         # //bazel/java:proto_toolchain for how they are kept off the classpath twice.

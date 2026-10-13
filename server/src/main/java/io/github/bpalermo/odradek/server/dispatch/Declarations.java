@@ -86,10 +86,15 @@ final class Declarations {
    * Checks a declaration and fills in its defaults.
    *
    * @param clusters the names of the clusters the dispatcher has
+   * @param policy what sidecars are allowed, or null when the delivery port has no TLS and so
+   *     nobody has an identity: every cluster the dispatcher has is then open to whoever asks
+   * @param spiffeId the sidecar's identity; not null when there is a policy
    * @throws Refused with INVALID_ARGUMENT when it is malformed, PERMISSION_DENIED when it names a
-   *     cluster the dispatcher does not have, UNIMPLEMENTED when it asks for dead-lettering
+   *     cluster the dispatcher does not have or the policy does not allow it, UNIMPLEMENTED when it
+   *     asks for dead-lettering
    */
-  static Declared check(Declare declare, Set<String> clusters) throws Refused {
+  static Declared check(Declare declare, Set<String> clusters, Policy policy, String spiffeId)
+      throws Refused {
     if (declare.getCluster().isEmpty()) {
       throw invalid("Declare.cluster is required");
     }
@@ -129,16 +134,29 @@ final class Declarations {
       }
     }
     // After everything that is wrong whoever asks, and before anything else: what a sidecar is
-    // told about a cluster it may not use must not depend on what else it asked for.
-    if (!clusters.contains(declare.getCluster())) {
+    // told about what it may not have must not depend on what else it asked for. One answer for
+    // every reason, in the declaration's own words: it tells a sidecar nothing about the clusters
+    // the dispatcher has, the rules of other identities, or which part of its own rules failed.
+    boolean allowed =
+        clusters.contains(declare.getCluster())
+            && (policy == null
+                || policy.allows(
+                    spiffeId,
+                    declare.getCluster(),
+                    declare.getGroupId(),
+                    declare.getTopic(),
+                    asked.getDeadLetterTopic()));
+    if (!allowed) {
       throw new Refused(
           Status.PERMISSION_DENIED.withDescription(
-              "not allowed to consume topic "
+              (policy == null ? "" : spiffeId + " is ")
+                  + "not allowed to consume topic "
                   + declare.getTopic()
                   + " in group "
                   + declare.getGroupId()
                   + " on cluster "
-                  + declare.getCluster()));
+                  + declare.getCluster()
+                  + (deadLetter ? " with dead-letter topic " + asked.getDeadLetterTopic() : "")));
     }
     if (deadLetter) {
       throw new Refused(

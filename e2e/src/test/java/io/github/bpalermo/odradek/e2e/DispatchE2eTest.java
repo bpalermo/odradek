@@ -851,7 +851,7 @@ class DispatchE2eTest {
 
   /** Needs the packaged server: the in-process harness runs neither Main nor the health service. */
   @Test
-  void aServerThatOnlyDispatchesStartsServesAndSaysItsPolicyIsNotEnforced() throws Exception {
+  void aServerThatOnlyDispatchesStartsServesAndSaysItsPortIsOpen() throws Exception {
     Assumptions.assumeTrue(DispatcherHarness.packaged(), "needs the packaged server");
     ManagedChannel probe =
         NettyChannelBuilder.forAddress("localhost", harness.healthPort()).usePlaintext().build();
@@ -878,6 +878,6 @@ class DispatchE2eTest {
     assertThat(Files.exists(harness.socket())).as("the app's socket exists").isFalse();
     assertThat(harness.log)
         .anyMatch(line -> line.contains("not listening on the app's Unix socket"))
-        .anyMatch(line -> line.contains("WARN") && line.contains("POLICY IS NOT ENFORCED"));
+        .anyMatch(line -> line.contains("WARN") && line.contains("DELIVERY PORT IS PLAINTEXT"));
   }
 }

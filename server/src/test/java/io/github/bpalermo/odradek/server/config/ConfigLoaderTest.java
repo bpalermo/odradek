@@ -95,6 +95,9 @@ class ConfigLoaderTest {
         advertisedAddress: 10.0.0.7:9465
         idleGrace: 600s
         partitionWindow: 500
+        tls:
+          spiffe:
+            workloadApiSocket: unix:///run/spire/agent/sockets/agent.sock
         policy:
           - spiffeIds: ["spiffe://example.org/ns/billing/sa/billing"]
             cluster: orders
@@ -116,6 +119,10 @@ class ConfigLoaderTest {
             bootstrap.servers: analytics-kafka:9093
       dispatcher:
         address: odradek-dispatcher.kafka.svc:9465
+        tls:
+          files:
+            dir: /etc/odradek/delivery
+          acceptedSpiffeIds: ["spiffe://example.org/ns/kafka/sa/odradek-dispatcher"]
       producers:
         clickstream:
           clusters:
@@ -180,12 +187,38 @@ class ConfigLoaderTest {
     assertThat(rule.getGroupsList()).containsExactly("billing");
     assertThat(rule.getDeadLetterTopicsList()).containsExactly("billing.dlq.*");
     assertThat(dispatch.getPolicy(1).getTrustDomain()).isEqualTo("example.org");
+    assertThat(dispatch.getTls().getSpiffe().getWorkloadApiSocket())
+        .isEqualTo("unix:///run/spire/agent/sockets/agent.sock");
+  }
+
+  @Test
+  void aPolicyWithoutTlsIsRejected() {
+    ConfigException e =
+        rejected(
+            DISPATCHER.replace(
+                """
+                  tls:
+                    spiffe:
+                      workloadApiSocket: unix:///run/spire/agent/sockets/agent.sock
+                """,
+                ""));
+    assertThat(e.problems())
+        .singleElement()
+        .satisfies(
+            p ->
+                assertThat(p)
+                    .startsWith("dispatch: a policy needs tls")
+                    .endsWith("[dispatch.policy_requires_tls]"));
   }
 
   @Test
   void loadsAServerThatReceivesFromADispatcher() throws Exception {
     ServerConfig config = ConfigLoader.parse(RECEIVING);
     assertThat(config.getDispatcher().getAddress()).isEqualTo("odradek-dispatcher.kafka.svc:9465");
+    assertThat(config.getDispatcher().getTls().getFiles().getDir())
+        .isEqualTo("/etc/odradek/delivery");
+    assertThat(config.getDispatcher().getTls().getAcceptedSpiffeIdsList())
+        .containsExactly("spiffe://example.org/ns/kafka/sa/odradek-dispatcher");
     var dispatched = config.getConsumersMap().get("orders.created");
     assertThat(dispatched.getSource()).isEqualTo(ConsumerSource.CONSUMER_SOURCE_DISPATCHER);
     assertThat(dispatched.getCluster()).isEqualTo("orders");
@@ -222,6 +255,9 @@ class ConfigLoaderTest {
                 properties:
                   bootstrap.servers: k:9092
             dispatch:
+              tls:
+                files:
+                  dir: /etc/odradek/delivery
               policy:
                 - trustDomain: example.org
                   cluster: main

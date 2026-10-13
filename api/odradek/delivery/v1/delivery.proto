@@ -41,7 +41,10 @@ service DeliveryService {
   //    is malformed (a required field is missing, or the settings contradict
   //    each other). Retrying unchanged fails again.
   //  - UNAUTHENTICATED: the sidecar presented no identity the dispatcher can
-  //    check.
+  //    check: its certificate carries no SPIFFE ID. Said before the first
+  //    message is looked at. A sidecar with no certificate, or with one that
+  //    does not verify, gets no status from the dispatcher at all: the TLS
+  //    handshake fails, which gRPC reports to it as UNAVAILABLE.
   //  - PERMISSION_DENIED: the dispatcher's policy has no rule allowing this
   //    identity to consume this topic in this group on this cluster, or to
   //    use the dead-letter topic it names. A cluster the dispatcher does not
@@ -58,7 +61,8 @@ service DeliveryService {
   //    older dispatcher. Retrying unchanged fails until the dispatcher is
   //    replaced.
   //  - UNAVAILABLE: the dispatcher is starting or stopping, or cannot reach
-  //    the cluster. Retry with backoff.
+  //    the cluster; or it was not reached at all, a TLS handshake that either
+  //    end refused included. Retry with backoff.
   //
   // After Accepted the stream ends with INVALID_ARGUMENT when the sidecar
   // breaks the protocol (a second Declare, for example), and with UNAVAILABLE
