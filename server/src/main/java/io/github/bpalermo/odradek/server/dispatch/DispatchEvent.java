@@ -20,9 +20,10 @@ public sealed interface DispatchEvent<R> {
   record PartitionAssigned<R>(int partition, long position) implements DispatchEvent<R> {}
 
   /**
-   * The replica is giving partitions up and can still commit for them. The core stops sending their
-   * records and answers each with one {@link DispatchAction.PartitionReleased}, at once or after
-   * the hand-over wait.
+   * The replica is giving partitions up and can still commit for them. The core sends nothing new
+   * of them, finishes what lies below the newest record it sent (see {@link DispatchCore}, Giving
+   * partitions up), and answers each with one {@link DispatchAction.PartitionReleased}: at once, or
+   * within the hand-over wait.
    */
   record PartitionsRevoked<R>(List<Integer> partitions) implements DispatchEvent<R> {
     public PartitionsRevoked {
@@ -98,8 +99,9 @@ public sealed interface DispatchEvent<R> {
 
   /**
    * Time passed, and nothing else happened. Processing deadlines, the waits before a redelivery and
-   * before a dead letter is written again, and the hand-over wait are checked on this event only;
-   * {@link DispatchCore#nextDeadlineNanos()} says when it is next needed.
+   * before a dead letter is written again, and the two times of a hand-over (the end of its sending
+   * and the end of its wait) are checked on this event only; {@link
+   * DispatchCore#nextDeadlineNanos()} says when it is next needed.
    */
   record TimePassed<R>() implements DispatchEvent<R> {}
 }

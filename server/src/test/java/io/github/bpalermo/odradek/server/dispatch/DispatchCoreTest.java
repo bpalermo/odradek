@@ -881,18 +881,296 @@ class DispatchCoreTest {
             deliver("b", 0, 3),
             deliver("a", 0, 4));
     assertThat(on(new PartitionsRevoked<>(List.of(0, 1)))).containsExactly(released(1));
-    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE));
-    // Sending has stopped: a rejected record is not tried again, new records are dropped.
-    assertThat(reject("b", 0, 3)).isEmpty();
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE / 2));
+    // Nothing new is sent: what is fetched now is dropped.
     assertThat(fetch(0, "5")).isEmpty();
     assertThat(credits("b", 5)).isEmpty();
     assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
     assertThat(ack("b", 0, 1)).containsExactly(commit(0, 2));
     assertThat(ack("a", 0, 4)).isEmpty();
-    // The last acknowledgement in flight ends the wait. 3 was given back, so the position stops.
-    // 3, sent and given back, and 4, acknowledged above it, are the next owner's to send again.
-    assertThat(ack("a", 0, 2)).containsExactly(commit(0, 3), new PartitionReleased<>(0, true, 2));
+    assertThat(ack("a", 0, 2)).containsExactly(commit(0, 3));
+    // The last acknowledgement in flight ends the wait.
+    assertThat(ack("b", 0, 3)).containsExactly(commit(0, 5), released(0));
     assertThat(core.nextDeadlineNanos()).isEmpty();
+  }
+
+  // What a hand-over finishes: a record held back below one that was sent. The commit position is
+  // a contiguous run, so such a record would stop it below records that are acknowledged, and the
+  // next owner would send those again.
+
+  @Test
+  void whatWasHeldBackBelowWhatWasSentIsFinishedInTheOrderOfItsKey() {
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 3);
+    assertThat(fetch(0, "0:x", "1:x", "2:y", "3:x", "4:y"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 2));
+    assertThat(ack("a", 0, 2)).containsExactly(deliver("a", 0, 4));
+    assertThat(ack("a", 0, 4)).isEmpty();
+    // Fetched, and never sent for want of credit: above everything that was sent.
+    assertThat(fetch(0, "5:z", "6:x")).isEmpty();
+    // 2 and 4 are acknowledged above 0, which is in flight, and above 1 and 3, which wait for it.
+    assertThat(core.committable(0)).isEqualTo(OptionalLong.of(0));
+
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE / 2));
+    // Credit changes nothing: 1 and 3 wait for their key, and 5 and 6 are not sent at all.
+    assertThat(credits("a", 10)).isEmpty();
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 3), deliver("a", 0, 3));
+    // Everything this replica sent is acknowledged and committed: its next owner starts at 5,
+    // the first record that was never sent, and sends nothing a second time.
+    assertThat(ack("a", 0, 3)).containsExactly(commit(0, 5), released(0));
+    assertThat(core.nextDeadlineNanos()).isEmpty();
+    assertThat(core.inFlight()).isZero();
+  }
+
+  @Test
+  void nothingAtOrAboveTheNewestRecordSentIsSentDuringAHandOver() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 3);
+    assertThat(fetch(0, "0", "1", "2", "3", "4"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 1), deliver("a", 0, 2));
+    assertThat(ack("a", 0, 2)).isEmpty();
+    // Given back, and not sent again yet for want of credit.
+    assertThat(reject("a", 0, 1)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    // 1 lies below 2, which is acknowledged: it is sent again. 3 and 4 were never sent.
+    assertThat(credits("a", 5)).containsExactly(deliver("a", 0, 1, 2));
+    assertThat(fetch(0, "5")).isEmpty();
+    assertThat(ack("a", 0, 0, 1)).containsExactly(commit(0, 3), released(0));
+  }
+
+  @Test
+  void theNewestRecordSentIsNotSentAgainDuringAHandOver() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0", "1", "2")).hasSize(3);
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    // Nothing is acknowledged above 2, so sending it again would spare the next owner nothing.
+    assertThat(reject("a", 0, 2)).isEmpty();
+    // 0 lies below 1, which may yet be acknowledged.
+    assertThat(reject("a", 0, 0)).containsExactly(deliver("a", 0, 0, 2));
+    assertThat(ack("a", 0, 0, 1))
+        .containsExactly(commit(0, 2), new PartitionReleased<>(0, true, 1));
+  }
+
+  @Test
+  void sendingEndsHalfwayThroughTheWaitAndWhatIsLeftIsTheNextOwners() {
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:x", "2:y"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 2));
+    assertThat(ack("a", 0, 2)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(after(GRACE / 2 - 1)).isEmpty();
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE / 2));
+    assertThat(after(1)).isEmpty();
+    // From here on there is only the wait for what is in flight.
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE));
+    // 1 is not sent any more: a record sent now would have little time to be answered in. It
+    // was never sent, so nobody has it; 2, acknowledged above it, is sent again by the next owner.
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), new PartitionReleased<>(0, true, 1));
+  }
+
+  @Test
+  void aRecordSentDuringAHandOverAndNotAnsweredIsDroppedWhenTheWaitIsOver() {
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:x", "2:y")).hasSize(2);
+    assertThat(ack("a", 0, 2)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(after(GRACE / 2 - 1)).isEmpty();
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+    assertThat(after(GRACE / 2)).isEmpty();
+    assertThat(after(1))
+        .containsExactly(new Drop<>("a", List.of(0)), new PartitionReleased<>(0, false, 2));
+  }
+
+  @Test
+  void aRecordWaitingToBeSentAgainIsSentDuringAHandOverWhenItsWaitEndsInTime() {
+    backoff = GRACE / 2 - 5;
+    backoffMax = GRACE;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0", "1")).hasSize(2);
+    assertThat(reject("a", 0, 0)).isEmpty();
+    assertThat(ack("a", 0, 1)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE / 2 - 5));
+    assertThat(after(GRACE / 2 - 5)).containsExactly(deliver("a", 0, 0, 2));
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 2), released(0));
+  }
+
+  @Test
+  void aRecordWhoseWaitEndsAfterSendingDoesIsNotWaitedFor() {
+    backoff = GRACE / 2;
+    backoffMax = GRACE;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0", "1", "2", "3", "4")).hasSize(5);
+    assertThat(reject("a", 0, 1)).isEmpty();
+    assertThat(ack("a", 0, 2)).isEmpty();
+    assertThat(ack("a", 0, 4)).isEmpty();
+    // 1 cannot be sent again while sending lasts, and nothing is committed past it. The
+    // hand-over does not wait for it; and 3, which lies below a record that is acknowledged, is
+    // not sent again when it comes back: the next owner starts at 1 and sends 3 whatever is done.
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(reject("a", 0, 3)).isEmpty();
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), new PartitionReleased<>(0, true, 4));
+    assertThat(after(GRACE)).isEmpty();
+  }
+
+  @Test
+  void aRecordThatFailsDuringAHandOverAndCannotBeSentAgainInTimeEndsTheSending() {
+    backoff = GRACE / 2;
+    backoffMax = GRACE;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:y", "2:y", "3:z")).hasSize(3);
+    assertThat(ack("a", 0, 3)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(after(1)).isEmpty();
+    // Its wait would end after sending does. Nothing is committed past it by this replica, so 2,
+    // which waits behind 1, is not sent either: the next owner would send it again besides.
+    assertThat(reject("a", 0, 0)).isEmpty();
+    assertThat(ack("a", 0, 1)).containsExactly(new PartitionReleased<>(0, true, 3));
+  }
+
+  @Test
+  void aBlockedRecordIsNotWaitedForAndNothingAboveItIsSentDuringAHandOver() {
+    maxAttempts = 1;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0", "1:x", "2:x", "3:y")).hasSize(3);
+    assertThat(reject("a", 0, 0)).containsExactly(new PartitionBlocked<>(0, 0));
+    assertThat(ack("a", 0, 3)).isEmpty();
+    // 1 is in flight above the blocked record, and 2 waits behind 1.
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(core.blockedOffset(0)).isEmpty();
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE));
+    // 2 is not sent: the position stays at the blocked record whatever is done above it.
+    assertThat(ack("a", 0, 1)).containsExactly(new PartitionReleased<>(0, true, 3));
+  }
+
+  @Test
+  void aRecordThatUsesItsAttemptsDuringAHandOverBlocksNothingAndEndsTheSending() {
+    maxAttempts = 1;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:x", "2:y")).hasSize(2);
+    assertThat(ack("a", 0, 2)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    // No PartitionBlocked: the partition is leaving, and its next owner counts the attempts anew.
+    assertThat(reject("a", 0, 0)).containsExactly(new PartitionReleased<>(0, true, 2));
+  }
+
+  @Test
+  void aDeadLetterBeingWrittenIsWaitedForAndWhatWaitedBehindItIsSent() {
+    maxAttempts = 1;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:x", "2:y")).hasSize(2);
+    assertThat(ack("a", 0, 2)).isEmpty();
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 1));
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(on(new DeadLetterWritten<>(0, 0))).containsExactly(commit(0, 1), deliver("a", 0, 1));
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 3), released(0));
+  }
+
+  @Test
+  void aRecordThatUsesItsAttemptsDuringAHandOverIsDeadLettered() {
+    maxAttempts = 1;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0", "1")).hasSize(2);
+    assertThat(ack("a", 0, 1)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 1));
+    assertThat(on(new DeadLetterWritten<>(0, 0))).containsExactly(commit(0, 2), released(0));
+  }
+
+  @Test
+  void aDeadLetterThatFailsDuringAHandOverEndsTheSending() {
+    maxAttempts = 1;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:y", "2:y", "3:z")).hasSize(3);
+    assertThat(ack("a", 0, 3)).isEmpty();
+    assertThat(reject("a", 0, 0)).containsExactly(letter(0, 0, 1));
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(on(new DeadLetterFailed<>(0, 0))).isEmpty();
+    // 2 waited behind 1, above the record that is now the next owner's: it is not sent.
+    assertThat(ack("a", 0, 1)).containsExactly(new PartitionReleased<>(0, true, 3));
+  }
+
+  @Test
+  void aRecordWhoseReceiverLeavesDuringAHandOverGoesToAnother() {
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0:x", "1:x", "2:y"))
+        .containsExactly(deliver("a", 0, 0), deliver("b", 0, 2));
+    assertThat(ack("b", 0, 2)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    assertThat(raw(new ReceiverLeft<>("a")))
+        .containsExactly(new Deliver<>("b", 0, 0, "0/0", 1, Cause.RECEIVER_LEFT));
+    assertThat(ack("b", 0, 0)).containsExactly(commit(0, 1), deliver("b", 0, 1));
+    assertThat(ack("b", 0, 1)).containsExactly(commit(0, 3), released(0));
+  }
+
+  @Test
+  void withNoReceiverLeftAHandOverWaitsForNothing() {
+    start(Ordering.KEY);
+    assign(0, 0);
+    assign(1, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:x", "2:y")).hasSize(2);
+    assertThat(fetch(1, "0:x", "1:x", "2:y")).hasSize(2);
+    assertThat(ack("a", 0, 2)).isEmpty();
+    assertThat(ack("a", 1, 2)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    // Nobody can be sent what was held back, in the partition being handed over...
+    assertThat(on(new ReceiverLeft<>("a"))).containsExactly(new PartitionReleased<>(0, true, 2));
+    // ... nor in one that is handed over with nobody there.
+    assertThat(on(new PartitionsRevoked<>(List.of(1))))
+        .containsExactly(new PartitionReleased<>(1, true, 2));
+    assertThat(core.nextDeadlineNanos()).isEmpty();
+  }
+
+  @Test
+  void underPartitionOrderingAHandOverSendsNothing() {
+    backoff = 1;
+    backoffMax = 1;
+    start(Ordering.PARTITION);
+    assign(0, 0);
+    assign(1, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0", "1", "2")).containsExactly(deliver("a", 0, 0));
+    assertThat(fetch(1, "0", "1", "2")).containsExactly(deliver("a", 1, 0));
+    assertThat(on(new PartitionsRevoked<>(List.of(0, 1)))).isEmpty();
+    // One record of a partition is unacknowledged at a time: there is nothing below it.
+    assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE));
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), released(0));
+    // Given back: it is the newest record sent, and is the next owner's.
+    assertThat(reject("a", 1, 0)).containsExactly(new PartitionReleased<>(1, true, 1));
+    assertThat(after(GRACE)).isEmpty();
   }
 
   @Test

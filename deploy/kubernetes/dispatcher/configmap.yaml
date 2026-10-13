@@ -48,10 +48,14 @@ data:
 
     consume:
       # How long a replica that gives partitions up (a rebalance, or its own
-      # shutdown) waits for the acknowledgements of what it has sent. It
-      # should cover the slowest honest handler: what is still unacknowledged
-      # when it ends is delivered again while a pod may still be working on
-      # it. terminationGracePeriodSeconds in deployment.yaml follows from it.
+      # shutdown) takes at most: in the first half it still sends the records
+      # it had held back below the newest one it sent, so that nothing the
+      # application acknowledged is delivered again by the next owner, and
+      # until the end it waits for the acknowledgements of what it has sent.
+      # It should cover the slowest honest handler twice: what is still
+      # unacknowledged when it ends is delivered again while a pod may still
+      # be working on it. terminationGracePeriodSeconds in deployment.yaml
+      # follows from it.
       revokeDeadline: 10s
       commitInterval: 5s
 

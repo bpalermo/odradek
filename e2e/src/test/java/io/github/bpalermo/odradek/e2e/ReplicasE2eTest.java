@@ -31,6 +31,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
@@ -85,6 +87,10 @@ class ReplicasE2eTest {
           groupId: odradek-e2e-replicas-%s
       """;
 
+  /** What a replica says when it has given partitions up: how many records it sent meanwhile. */
+  private static final Pattern HELD_BACK_AND_SENT =
+      Pattern.compile("having sent (\\d+) record\\(s\\) it had held back");
+
   private final String id = UUID.randomUUID().toString();
   private final String topic = "odradek-e2e-replicas-" + id;
   private final String group = "odradek-e2e-replicas-group-" + id;
@@ -108,6 +114,12 @@ class ReplicasE2eTest {
    */
   private final List<String> handedOutAfterCommit = new CopyOnWriteArrayList<>();
 
+  /** Every record an app was handed, as "partition/offset". */
+  private final Set<String> handedAt = ConcurrentHashMap.newKeySet();
+
+  /** The highest offset of each partition that an app has acknowledged. */
+  private final Map<Integer, Long> acknowledgedUpTo = new ConcurrentHashMap<>();
+
   private TcpRelay service;
   private KafkaProducer<String, String> producer;
   private Admin admin;
@@ -124,6 +136,11 @@ class ReplicasE2eTest {
     final CompletableFuture<Status> closed = new CompletableFuture<>();
     private final StreamObserver<ConsumeRequest> requests;
     private volatile boolean working = true;
+
+    /** Whether records of the slow keys are kept unacknowledged, and those that are. */
+    private boolean holding;
+
+    private final List<Ack> held = new ArrayList<>();
 
     App(ServerHarness sidecar) {
       this.sidecar = sidecar;
@@ -178,17 +195,50 @@ class ReplicasE2eTest {
         handled.add(value);
         received.add(value);
         partitions.add(batch.getPartition());
-        send(
-            ConsumeRequest.newBuilder()
-                .setAck(
-                    Ack.newBuilder()
-                        .setTopic(batch.getTopic())
-                        .setPartition(batch.getPartition())
-                        .setAssignmentEpoch(batch.getAssignmentEpoch())
-                        .setFirstOffset(record.getOffset())
-                        .setLastOffset(record.getOffset())));
-        send(ConsumeRequest.newBuilder().setCredits(Credits.newBuilder().setRecords(1)));
+        handedAt.add(batch.getPartition() + "/" + record.getOffset());
+        Ack ack =
+            Ack.newBuilder()
+                .setTopic(batch.getTopic())
+                .setPartition(batch.getPartition())
+                .setAssignmentEpoch(batch.getAssignmentEpoch())
+                .setFirstOffset(record.getOffset())
+                .setLastOffset(record.getOffset())
+                .build();
+        synchronized (this) {
+          if (holding && slow(record.getKey().toStringUtf8())) {
+            held.add(ack);
+            continue;
+          }
+        }
+        acknowledge(ack);
       }
+    }
+
+    /** Acknowledges one record and asks for one more. */
+    private void acknowledge(Ack ack) {
+      send(ConsumeRequest.newBuilder().setAck(ack));
+      acknowledgedUpTo.merge(ack.getPartition(), ack.getLastOffset(), Math::max);
+      send(ConsumeRequest.newBuilder().setCredits(Credits.newBuilder().setRecords(1)));
+    }
+
+    /**
+     * From now on the app keeps the records of the slow keys it is handed without acknowledging
+     * them: a handler that takes its time. The dispatcher sends it no further record of such a key
+     * meanwhile, and goes on with the other keys.
+     */
+    synchronized void hold() {
+      holding = true;
+    }
+
+    /** The slow handlers are done: what was kept is acknowledged, and nothing is kept any more. */
+    void release() {
+      List<Ack> kept;
+      synchronized (this) {
+        holding = false;
+        kept = List.copyOf(held);
+        held.clear();
+      }
+      kept.forEach(this::acknowledge);
     }
 
     /** Requests are written from the stream's thread and from the test's. */
@@ -216,6 +266,10 @@ class ReplicasE2eTest {
    */
   private final class Flow implements AutoCloseable {
     private final List<String> produced = new CopyOnWriteArrayList<>();
+
+    /** Where each value was written, as "partition/offset". */
+    private final Map<String, String> placed = new ConcurrentHashMap<>();
+
     private final AtomicBoolean stop = new AtomicBoolean();
     private final CompletableFuture<Void> done = new CompletableFuture<>();
     private final Thread thread;
@@ -228,9 +282,11 @@ class ReplicasE2eTest {
                   for (int sequence = 0; !stop.get(); sequence++) {
                     for (int key = 0; key < KEYS; key++) {
                       String value = "k" + key + ":" + sequence;
-                      producer
-                          .send(new ProducerRecord<>(topic, key % PARTITIONS, "k" + key, value))
-                          .get(30, TimeUnit.SECONDS);
+                      RecordMetadata written =
+                          producer
+                              .send(new ProducerRecord<>(topic, key % PARTITIONS, "k" + key, value))
+                              .get(30, TimeUnit.SECONDS);
+                      placed.put(value, written.partition() + "/" + written.offset());
                       produced.add(value);
                     }
                     // Paces the flow; nothing waits on it.
@@ -602,6 +658,37 @@ class ReplicasE2eTest {
         });
   }
 
+  /**
+   * Whether a key of the flow is one whose handler can be made slow: the first key of each
+   * partition. The other key of the partition is never held up.
+   */
+  private static boolean slow(String key) {
+    return key.startsWith("k") && Integer.parseInt(key.substring(1)) < PARTITIONS;
+  }
+
+  /**
+   * The records of the flow that a dispatcher holds back below a record it was acknowledged, by
+   * partition: written at a lower offset than one an app has acknowledged, and handed to no app
+   * yet. The group cannot commit past the first of them, whatever is acknowledged above.
+   */
+  private Map<Integer, List<String>> heldBack() {
+    Map<Integer, List<String>> byPartition = new TreeMap<>();
+    for (int partition = 0; partition < PARTITIONS; partition++) {
+      byPartition.put(partition, new ArrayList<>());
+    }
+    flow.placed.forEach(
+        (value, place) -> {
+          int slash = place.indexOf('/');
+          int partition = Integer.parseInt(place.substring(0, slash));
+          long offset = Long.parseLong(place.substring(slash + 1));
+          Long acknowledged = acknowledgedUpTo.get(partition);
+          if (acknowledged != null && offset < acknowledged && !handedAt.contains(place)) {
+            byPartition.get(partition).add(value);
+          }
+        });
+    return byPartition;
+  }
+
   /** The values handed to an app more than once. */
   private List<String> handledTwice() {
     Set<String> seen = new HashSet<>();
@@ -720,7 +807,7 @@ class ReplicasE2eTest {
     flow = new Flow();
     await("records flow", () -> handled.size() >= 10 * KEYS);
 
-    // It stops sending, waits for what its sidecars hold, commits, and only then leaves.
+    // It sends nothing new, waits for what its sidecars hold, commits, and only then leaves.
     replicas.get(1).stopDispatcher();
     int stoppedAt = flow.count();
     Map<String, Set<Integer>> left = awaitMembers(1);
@@ -732,6 +819,87 @@ class ReplicasE2eTest {
     awaitCommitted();
     assertThat(handledTwice()).as("handled twice across a hand-over in good order").isEmpty();
     assertOrderPerKey(produced);
+    assertThat(one.closed).as("the first app's stream").isNotDone();
+    assertThat(two.closed).as("the second app's stream").isNotDone();
+    await("the replica that is left lists itself alone", () -> replicas.get(0).replicaCount() == 1);
+  }
+
+  @Test
+  void aReplicaStoppedInGoodOrderFinishesWhatItHeldBackAndNothingAcknowledgedIsHandledTwice()
+      throws Exception {
+    replicas(2);
+    // Key ordering, and two keys to a partition: while the handler of one key takes its time,
+    // the later records of that key wait in the dispatcher, and those of the other key are sent
+    // and acknowledged past them. The group can commit nothing above the first of them.
+    App one = app();
+    App two = app();
+    awaitMembers(2);
+    watchCommits();
+    flow = new Flow();
+    await("records flow", () -> handled.size() >= 10 * KEYS);
+
+    one.hold();
+    two.hold();
+    await(
+        "every partition has records held back below a record that is acknowledged",
+        () -> heldBack().values().stream().allMatch(values -> values.size() >= 3));
+
+    DispatcherHarness stopped = replicas.get(1);
+    String givesUp = "group " + group + " on cluster a gives up";
+    String gaveUp = "group " + group + " on cluster a gave up";
+    int saidBefore = stopped.logged(givesUp).size();
+    int doneBefore = stopped.logged(gaveUp).size();
+    CompletableFuture<Void> stopping =
+        CompletableFuture.runAsync(
+            () -> {
+              try {
+                stopped.stopDispatcher();
+              } catch (Exception e) {
+                throw new CompletionException(e);
+              }
+            });
+    // The replica says so on the thread that then hands the partitions over, before anything
+    // else it is sent is looked at: whatever the apps do from here on meets a hand-over under way.
+    await("the replica gives its partitions up", () -> stopped.logged(givesUp).size() > saidBefore);
+
+    // This is what the test is about, so it is checked and not assumed: when the hand-over began,
+    // each partition had records that no app had been handed, below records that were
+    // acknowledged. Nothing could have been sent of them before: the first record of their key is
+    // still with an app, unacknowledged.
+    Map<Integer, List<String>> heldBack = heldBack();
+    assertThat(heldBack.values())
+        .as("records held back below acknowledged ones when the hand-over began: %s", heldBack)
+        .allMatch(values -> values.size() >= 3);
+
+    // The slow handlers finish. The replica that is leaving sends what waited behind them, in
+    // the order of each key, is acknowledged it, and only then commits and goes.
+    one.release();
+    two.release();
+    stopping.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+    int stoppedAt = flow.count();
+    Map<String, Set<Integer>> left = awaitMembers(1);
+    assertThat(left.values().iterator().next()).as("the replica that is left").hasSize(PARTITIONS);
+    await("records flow after the hand-over", () -> flow.count() >= stoppedAt + 10 * KEYS);
+
+    List<String> produced = flow.finish();
+    awaitHandled("everything is handled", produced);
+    awaitCommitted();
+    assertThat(handledTwice())
+        .as("handled twice across a hand-over in good order, under key ordering")
+        .isEmpty();
+    assertOrderPerKey(produced);
+    // It had half of the group's partitions, each with three such records or more, and says how
+    // many it sent while it gave them up.
+    List<String> done = stopped.logged(gaveUp);
+    long sent = 0;
+    for (String line : done.subList(doneBefore, done.size())) {
+      Matcher matcher = HELD_BACK_AND_SENT.matcher(line);
+      assertThat(matcher.find()).as(line).isTrue();
+      sent += Long.parseLong(matcher.group(1));
+    }
+    assertThat(sent)
+        .as("records the replica sent while it gave its partitions up: %s", done)
+        .isGreaterThanOrEqualTo(3 * PARTITIONS / 2);
     assertThat(one.closed).as("the first app's stream").isNotDone();
     assertThat(two.closed).as("the second app's stream").isNotDone();
     await("the replica that is left lists itself alone", () -> replicas.get(0).replicaCount() == 1);
@@ -789,8 +957,9 @@ class ReplicasE2eTest {
     awaitHandled("everything is handled", produced);
     awaitCommitted();
     // Under key ordering a record can be acknowledged above one of another key that was not
-    // sent yet. The first replica commits below that one, and the second hands out again what
-    // lies above it: twice, in the order of each key, and nothing that was committed.
+    // sent yet. The first replica sends it before it gives the partition up, so that what it
+    // commits is past everything it was acknowledged, and the second hands nothing out again.
+    assertThat(handledTwice()).as("handled twice across a hand-over in good order").isEmpty();
     assertOrderPerKey(produced);
     assertThat(service.accepted())
         .as("connections to the address of the Service")

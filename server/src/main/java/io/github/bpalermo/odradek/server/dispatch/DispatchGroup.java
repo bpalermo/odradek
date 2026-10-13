@@ -320,6 +320,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   /** The partitions being handed over that their cores have not released yet. */
   private final Set<TopicPartition> releasing = new HashSet<>();
 
+  /** Records sent of partitions that were being handed over, since the group exists. */
+  private long sentWhileGivingUp;
+
   /** Counts the runs of this group's topics. */
   private long incarnations;
 
@@ -695,6 +698,10 @@ final class DispatchGroup implements ConsumerRebalanceListener {
                 case REJECTED -> ServerMetrics.Redelivery.REJECTED;
                 case RECEIVER_LEFT -> ServerMetrics.Redelivery.RECEIVER_GONE;
               });
+          if (!releasing.isEmpty()
+              && releasing.contains(new TopicPartition(topic.name, deliver.partition()))) {
+            sentWhileGivingUp++;
+          }
           topic.batches.deliver(deliver);
         }
         case Drop<Held> drop -> topic.batches.released(drop);
@@ -1143,7 +1150,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     if (!partitions.isEmpty()) {
       metrics.rebalanced(key.cluster(), key.group(), "revoked");
     }
-    // Runs inside poll(): nothing is fetched while the cores wait for what is in flight.
+    // Runs inside poll(): nothing is fetched while the cores finish what they had sent.
     handOver(partitions);
     pausesChanged = true;
   }
@@ -1185,10 +1192,13 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   }
 
   /**
-   * Gives partitions up cleanly: their cores stop sending and wait, for at most the revoke grace,
-   * for the acknowledgements of what is in flight; then their positions are committed and the cores
-   * have forgotten them. Commands are handled while it waits, so those acknowledgements arrive, and
-   * the other partitions go on being acknowledged; only fetching stands still.
+   * Gives partitions up cleanly: their cores send nothing new, finish what lies below the newest
+   * record they sent (a record held back there would otherwise stop the commit below records that
+   * are acknowledged, which the next owner would deliver again) and wait for the acknowledgements
+   * of what is in flight, all within the revoke grace; then their positions are committed and the
+   * cores have forgotten them. Commands are handled while it waits, so those acknowledgements
+   * arrive and what they let through is sent, and the other partitions go on being delivered and
+   * acknowledged; only fetching stands still.
    */
   private void handOver(Collection<TopicPartition> partitions) {
     Map<Topic, List<Integer>> byTopic = byTopic(partitions);
@@ -1199,6 +1209,16 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     byTopic.forEach(
         (topic, numbers) -> numbers.forEach(n -> mine.add(new TopicPartition(topic.name, n))));
     releasing.addAll(mine);
+    long sentBefore = sentWhileGivingUp;
+    // Said before the cores are told: whatever a sidecar sends after this line is handled with
+    // the hand-over under way.
+    LOG.info(
+        "group {} on cluster {} gives up {}: nothing new of them is sent, and what lies below the"
+            + " newest record sent is finished, within {}",
+        key.group(),
+        key.cluster(),
+        mine,
+        options.revokeGrace());
     byTopic.forEach((topic, numbers) -> on(topic, new PartitionsRevoked<>(numbers)));
 
     // The cores release at the grace at the latest; a little more is only a guard.
@@ -1225,7 +1245,12 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     }
     commitSync(mine);
     mine.forEach(this::forget);
-    LOG.info("group {} on cluster {} gave up {}", key.group(), key.cluster(), mine);
+    LOG.info(
+        "group {} on cluster {} gave up {}, having sent {} record(s) it had held back",
+        key.group(),
+        key.cluster(),
+        mine,
+        sentWhileGivingUp - sentBefore);
   }
 
   private boolean waitingFor(List<TopicPartition> partitions) {
