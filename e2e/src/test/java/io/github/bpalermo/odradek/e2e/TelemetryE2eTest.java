@@ -37,6 +37,7 @@ class TelemetryE2eTest {
   private final String topic = "odradek-e2e-telemetry-" + id;
 
   private ServerHarness harness;
+  private DispatcherHarness dispatcher;
   private FakeCollector collector;
 
   @BeforeEach
@@ -52,6 +53,9 @@ class TelemetryE2eTest {
   void stop() throws Exception {
     if (harness != null) {
       harness.stop();
+    }
+    if (dispatcher != null) {
+      dispatcher.stop();
     }
     if (collector != null) {
       collector.close();
@@ -149,6 +153,49 @@ class TelemetryE2eTest {
         "odradek.kafka.consumer.records.lag",
         "odradek.kafka.consumer.connections",
         "odradek.kafka.producer.request.latency.avg");
+    consume.onCompleted();
+  }
+
+  @Test
+  void aServerThatReceivesFromADispatcherPushesTheStreamsItWantsAndHas() throws Exception {
+    dispatcher =
+        DispatcherHarness.start(
+            """
+            clusters:
+              a:
+                properties:
+                  bootstrap.servers: %s
+            dispatch:
+              port: 0
+            """,
+            ServerHarness.KAFKA_A);
+    harness =
+        ServerHarness.start(
+            """
+            listener:
+              socketPath: %s/kafka.sock
+            telemetry:
+              endpoint: %s
+              exportInterval: 1s
+            dispatcher:
+              address: localhost:%s
+            consumers:
+              %s:
+                source: CONSUMER_SOURCE_DISPATCHER
+                cluster: a
+                groupId: group-%s
+            """,
+            collector.endpoint(), dispatcher.port(), topic, id);
+    BlockingQueue<ConsumeResponse> consumed = new LinkedBlockingQueue<>();
+    StreamObserver<ConsumeRequest> consume =
+        OdradekServiceGrpc.newStub(harness.channel).consume(collecting(consumed));
+    consume.onNext(
+        ConsumeRequest.newBuilder().setSubscribe(Subscribe.newBuilder().addTopics(topic)).build());
+
+    // One replica is listed, so one stream is wanted, and it is open: the two numbers an alert
+    // compares, in one export with the group and topic they are about.
+    collector.await(
+        TIMEOUT, "odradek.receive.streams.wanted", "odradek.receive.streams", topic, "group-" + id);
     consume.onCompleted();
   }
 

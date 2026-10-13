@@ -18,6 +18,14 @@ final class Declarations {
   /** The names Kafka accepts for a topic. */
   private static final Pattern TOPIC = Pattern.compile("^[a-zA-Z0-9._-]{1,249}$");
 
+  /** The wait before a first redelivery, and the longest, when a declaration names neither. */
+  static final int DEFAULT_REDELIVERY_BACKOFF_MS = 1000;
+
+  static final int DEFAULT_REDELIVERY_BACKOFF_MAX_MS = 30_000;
+
+  /** The longest wait a declaration may ask for: a day. */
+  static final int MAX_REDELIVERY_BACKOFF_MS = 24 * 60 * 60 * 1000;
+
   private Declarations() {}
 
   /** A declaration that was refused, with the status the stream ends with. */
@@ -57,9 +65,19 @@ final class Declarations {
       return withoutDeadline(settings).equals(withoutDeadline(inForce));
     }
 
+    /** The dead-letter topic it declares, or null when it does not ask for dead-lettering. */
+    String deadLetterTopic() {
+      return settings.getDeadLetterTopic().isEmpty() ? null : settings.getDeadLetterTopic();
+    }
+
     /** The settings the core starts with, given the bounds the dispatcher sets itself. */
     DispatchSettings toCore(
-        long window, int maxBufferedRecords, long maxBufferedBytes, Duration revokeGrace) {
+        long window,
+        int maxBufferedRecords,
+        long maxBufferedBytes,
+        Duration revokeGrace,
+        Duration deadLetterRetry,
+        Duration deadLetterRetryMax) {
       return new DispatchSettings(
           switch (settings.getOrdering()) {
             case ORDERING_PARTITION -> DispatchSettings.Ordering.PARTITION;
@@ -74,7 +92,11 @@ final class Declarations {
           window,
           maxBufferedRecords,
           maxBufferedBytes,
-          revokeGrace);
+          revokeGrace,
+          Duration.ofMillis(settings.getRedeliveryBackoffMs()),
+          Duration.ofMillis(settings.getRedeliveryBackoffMaxMs()),
+          deadLetterRetry,
+          deadLetterRetryMax);
     }
   }
 
@@ -90,8 +112,7 @@ final class Declarations {
    *     nobody has an identity: every cluster the dispatcher has is then open to whoever asks
    * @param spiffeId the sidecar's identity; not null when there is a policy
    * @throws Refused with INVALID_ARGUMENT when it is malformed, PERMISSION_DENIED when it names a
-   *     cluster the dispatcher does not have or the policy does not allow it, UNIMPLEMENTED when it
-   *     asks for dead-lettering
+   *     cluster the dispatcher does not have or the policy does not allow it
    */
   static Declared check(Declare declare, Set<String> clusters, Policy policy, String spiffeId)
       throws Refused {
@@ -132,6 +153,26 @@ final class Declarations {
       if (asked.getDeadLetterTopic().equals(declare.getTopic())) {
         throw invalid("Declare.settings.dead_letter_topic must not be the topic itself");
       }
+      if (asked.getMaxAttempts() == 0) {
+        // Nothing would ever be exhausted: said here, where the mistake is, and not by a
+        // dead-letter topic that stays empty.
+        throw invalid("Declare.settings.on_exhausted needs max_attempts");
+      }
+    }
+    // Unsigned on the wire; anything above a day, the sign bit included, is refused.
+    if (asked.getRedeliveryBackoffMs() < 0
+        || asked.getRedeliveryBackoffMs() > MAX_REDELIVERY_BACKOFF_MS
+        || asked.getRedeliveryBackoffMaxMs() < 0
+        || asked.getRedeliveryBackoffMaxMs() > MAX_REDELIVERY_BACKOFF_MS) {
+      throw invalid(
+          "Declare.settings.redelivery_backoff_ms and redelivery_backoff_max_ms must not exceed "
+              + MAX_REDELIVERY_BACKOFF_MS);
+    }
+    if (asked.hasRedeliveryBackoffMs()
+        && asked.hasRedeliveryBackoffMaxMs()
+        && asked.getRedeliveryBackoffMs() > asked.getRedeliveryBackoffMaxMs()) {
+      throw invalid(
+          "Declare.settings.redelivery_backoff_ms must not exceed redelivery_backoff_max_ms");
     }
     // After everything that is wrong whoever asks, and before anything else: what a sidecar is
     // told about what it may not have must not depend on what else it asked for. One answer for
@@ -158,13 +199,18 @@ final class Declarations {
                   + declare.getCluster()
                   + (deadLetter ? " with dead-letter topic " + asked.getDeadLetterTopic() : "")));
     }
-    if (deadLetter) {
-      throw new Refused(
-          Status.UNIMPLEMENTED.withDescription(
-              "on_exhausted ON_EXHAUSTED_DEAD_LETTER is not implemented by this dispatcher yet;"
-                  + " declare ON_EXHAUSTED_BLOCK, or no max_attempts"));
-    }
 
+    // Each default gives way to the other bound when only that one is declared.
+    int backoff =
+        asked.hasRedeliveryBackoffMs()
+            ? asked.getRedeliveryBackoffMs()
+            : asked.hasRedeliveryBackoffMaxMs()
+                ? Math.min(DEFAULT_REDELIVERY_BACKOFF_MS, asked.getRedeliveryBackoffMaxMs())
+                : DEFAULT_REDELIVERY_BACKOFF_MS;
+    int backoffMax =
+        asked.hasRedeliveryBackoffMaxMs()
+            ? asked.getRedeliveryBackoffMaxMs()
+            : Math.max(DEFAULT_REDELIVERY_BACKOFF_MAX_MS, backoff);
     Settings.Builder settings =
         Settings.newBuilder()
             .setOrdering(
@@ -177,7 +223,13 @@ final class Declarations {
                     ? OffsetReset.OFFSET_RESET_EARLIEST
                     : asked.getOffsetReset())
             .setMaxAttempts(asked.getMaxAttempts())
-            .setOnExhausted(OnExhausted.ON_EXHAUSTED_BLOCK);
+            .setOnExhausted(
+                deadLetter ? OnExhausted.ON_EXHAUSTED_DEAD_LETTER : OnExhausted.ON_EXHAUSTED_BLOCK)
+            .setRedeliveryBackoffMs(backoff)
+            .setRedeliveryBackoffMaxMs(backoffMax);
+    if (deadLetter) {
+      settings.setDeadLetterTopic(asked.getDeadLetterTopic());
+    }
     if (asked.hasStartTimestampMs()) {
       settings.setStartTimestampMs(asked.getStartTimestampMs());
     }
@@ -207,6 +259,10 @@ final class Declarations {
     if (!settings.getDeadLetterTopic().isEmpty()) {
       text.append(", dead_letter_topic ").append(settings.getDeadLetterTopic());
     }
+    text.append(", redelivery_backoff_ms ")
+        .append(settings.getRedeliveryBackoffMs())
+        .append(" to ")
+        .append(settings.getRedeliveryBackoffMaxMs());
     return text.toString();
   }
 

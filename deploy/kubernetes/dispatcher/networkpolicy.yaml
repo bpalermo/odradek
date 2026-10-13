@@ -1,0 +1,32 @@
+# The one ingress rule the dispatcher needs: sidecars reach the delivery port,
+# through the Service's address and at each replica's pod IP. Application pods
+# listen on nothing for this; they only connect out.
+#
+# Who may consume what is not decided here but by `dispatch.policy`, from the
+# SPIFFE ID each sidecar proves in the TLS handshake. This only keeps everything
+# else away from the port. The health port is probed by the kubelet, from the
+# node, which network policies do not usually apply to; nothing else needs it.
+# Egress is left alone: the dispatcher connects to its brokers and to the
+# telemetry collector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: odradek-dispatcher
+  labels:
+    app.kubernetes.io/name: odradek-dispatcher
+    app.kubernetes.io/part-of: odradek
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: odradek-dispatcher
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        # The namespaces whose applications consume through this dispatcher.
+        # Label them, or name pods with a podSelector beside this.
+        - namespaceSelector:
+            matchLabels:
+              odradek.example.org/dispatcher-client: "true"
+      ports:
+        - protocol: TCP
+          port: delivery

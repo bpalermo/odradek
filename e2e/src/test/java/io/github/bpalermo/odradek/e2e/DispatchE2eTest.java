@@ -10,6 +10,7 @@ import io.github.bpalermo.odradek.delivery.v1.DeliverRequest;
 import io.github.bpalermo.odradek.delivery.v1.DeliverResponse;
 import io.github.bpalermo.odradek.delivery.v1.DeliveryServiceGrpc;
 import io.github.bpalermo.odradek.delivery.v1.OffsetReset;
+import io.github.bpalermo.odradek.delivery.v1.OnExhausted;
 import io.github.bpalermo.odradek.delivery.v1.Ordering;
 import io.github.bpalermo.odradek.delivery.v1.Record;
 import io.github.bpalermo.odradek.delivery.v1.RecordBatch;
@@ -17,14 +18,17 @@ import io.github.bpalermo.odradek.delivery.v1.Reject;
 import io.github.bpalermo.odradek.delivery.v1.Settings;
 import io.github.bpalermo.odradek.server.admin.HealthService;
 import io.github.bpalermo.odradek.server.admin.HealthService.ServingStatus;
+import io.github.bpalermo.odradek.server.telemetry.FakeCollector;
 import io.grpc.CallOptions;
 import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.ClientCalls;
 import io.grpc.stub.StreamObserver;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -48,12 +52,17 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.AlterConfigOp;
+import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
@@ -88,6 +97,7 @@ class DispatchE2eTest {
   private final String id = UUID.randomUUID().toString();
   private final String topic = "odradek-e2e-dispatch-" + id;
   private final String second = "odradek-e2e-dispatch-second-" + id;
+  private final String deadLetters = "odradek-e2e-dispatch-dlq-" + id;
   private final String group = "odradek-e2e-dispatch-" + id;
   private final List<String> topics = new ArrayList<>();
   private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
@@ -281,12 +291,13 @@ class DispatchE2eTest {
     topics.add(name);
   }
 
+  /** A declaration with a short wait before a redelivery, unless the test asks for another. */
   private Declare.Builder declare(String name) {
     return Declare.newBuilder()
         .setCluster("a")
         .setGroupId(group)
         .setTopic(name)
-        .setSettings(Settings.newBuilder().setMaxProcessingMs(120_000));
+        .setSettings(Settings.newBuilder().setMaxProcessingMs(120_000).setRedeliveryBackoffMs(50));
   }
 
   private Declare.Builder declare(String name, Consumer<Settings.Builder> settings) {
@@ -669,7 +680,11 @@ class DispatchE2eTest {
   @Test
   void aGroupWithoutCommittedOffsetsStartsWhereItsDeclarationSays() throws Exception {
     createTopic(topic, 2);
-    createTopic(second, 2);
+    // Its records are written with timestamps years old. Without this the brokers' retention
+    // check, when it happens to run before the group has read them (every five minutes), removes
+    // them all, and the group starts at an empty topic's end.
+    ServerHarness.createTopic(ServerHarness.KAFKA_A, second, 2, Map.of("retention.ms", "-1"));
+    topics.add(second);
     long before = java.time.Instant.parse("2023-06-01T00:00:00Z").toEpochMilli();
     long after = java.time.Instant.parse("2024-06-01T00:00:00Z").toEpochMilli();
     for (int partition = 0; partition < 2; partition++) {
@@ -706,6 +721,282 @@ class DispatchE2eTest {
           .as("what %s received", sidecar.name)
           .hasSize(20)
           .allMatch(value -> value.startsWith("new-"));
+    }
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Dead letters
+  // -------------------------------------------------------------------------------------------
+
+  /** Gives a record up after this many attempts, to {@link #deadLetters}. */
+  private Consumer<Settings.Builder> deadLettering(int maxAttempts) {
+    return s ->
+        s.setMaxAttempts(maxAttempts)
+            .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+            .setDeadLetterTopic(deadLetters);
+  }
+
+  @Test
+  void aRecordThatUsesItsAttemptsIsWrittenToTheDeadLetterTopicAndItsPartitionGoesOn()
+      throws Exception {
+    createTopic(topic, 1);
+    createTopic(deadLetters, 2);
+    long written = Instant.parse("2024-06-01T00:00:00Z").toEpochMilli();
+    produce(topic, 0, keys("k", 2), "v");
+    long poison =
+        producer
+            .send(
+                new ProducerRecord<>(
+                    topic,
+                    0,
+                    written,
+                    "poison",
+                    "cannot be processed",
+                    new RecordHeaders()
+                        .add("trace", "abc".getBytes(StandardCharsets.UTF_8))
+                        .add("empty", null)))
+            .get(TIMEOUT.toSeconds(), TimeUnit.SECONDS)
+            .offset();
+    produce(topic, 0, keys("later", 3), "v");
+    long before = System.currentTimeMillis();
+
+    // Three attempts, the second not before 300 ms after the first failed, the third not before
+    // 600 ms after the second did.
+    Map<Integer, Long> arrived = new ConcurrentHashMap<>();
+    Sidecar sidecar =
+        sidecar(
+            "s",
+            declare(
+                topic,
+                deadLettering(3)
+                    .andThen(
+                        s -> s.setRedeliveryBackoffMs(300).setRedeliveryBackoffMaxMs(10_000))));
+    sidecar.onRecord =
+        record -> {
+          if (record.offset() == poison) {
+            arrived.put(record.attempt(), System.nanoTime());
+            sidecar.reject(record);
+          } else {
+            sidecar.ack(record);
+          }
+          sidecar.credits(1);
+        };
+    sidecar.credits(1);
+
+    // Committed to the end: past the record, which no sidecar acknowledged.
+    awaitCommitted(topic, 1);
+    assertThat(arrived.keySet()).containsExactlyInAnyOrder(1, 2, 3);
+    assertThat(TimeUnit.NANOSECONDS.toMillis(arrived.get(2) - arrived.get(1)))
+        .as("the wait before the second attempt")
+        .isGreaterThanOrEqualTo(300);
+    assertThat(TimeUnit.NANOSECONDS.toMillis(arrived.get(3) - arrived.get(2)))
+        .as("the wait before the third attempt")
+        .isGreaterThanOrEqualTo(600);
+    List<Received> others =
+        sidecar.received.stream().filter(record -> record.offset() != poison).toList();
+    assertThat(others).as("the other records").hasSize(5).allMatch(r -> r.attempt() == 1);
+    // The other keys did not wait for it: all were delivered before its second attempt.
+    List<String> order = sidecar.received.stream().map(r -> r.at() + "#" + r.attempt()).toList();
+    assertThat(order.indexOf("0/" + (poison + 3) + "#1"))
+        .as("the last record, in %s", order)
+        .isLessThan(order.indexOf("0/" + poison + "#2"));
+
+    // In the dead-letter topic: the record as it was stored, and where it came from.
+    List<ConsumerRecord<String, String>> letters =
+        ServerHarness.read(ServerHarness.KAFKA_A, deadLetters, 2, 1);
+    assertThat(letters).as("dead letters").hasSize(1);
+    ConsumerRecord<String, String> letter = letters.get(0);
+    assertThat(letter.key()).isEqualTo("poison");
+    assertThat(letter.value()).isEqualTo("cannot be processed");
+    assertThat(ServerHarness.headers(letter))
+        .containsExactly(
+            "trace=abc",
+            "empty=null",
+            "odradek-source-cluster=a",
+            "odradek-source-topic=" + topic,
+            "odradek-source-partition=0",
+            "odradek-source-offset=" + poison,
+            "odradek-source-timestamp=" + written,
+            "odradek-source-group=" + group,
+            "odradek-attempts=3",
+            "odradek-failure=rejected",
+            "odradek-failure-detail=the test rejects it");
+    assertThat(letter.timestamp())
+        .as("when it was given up on, not the record's own time")
+        .isGreaterThanOrEqualTo(before);
+  }
+
+  @Test
+  void aRecordNobodyAcknowledgesInTimeIsDeadLetteredSayingSo() throws Exception {
+    createTopic(topic, 1);
+    createTopic(deadLetters, 1);
+    produce(topic, 0, keys("k", 2), "v");
+    Sidecar sidecar =
+        sidecar(
+            "s",
+            declare(
+                topic,
+                deadLettering(2)
+                    .andThen(
+                        s -> s.setMaxProcessingMs(400).setOrdering(Ordering.ORDERING_PARTITION))));
+    // It sits on the first record, both times, and works on what follows.
+    sidecar.onRecord =
+        record -> {
+          if (record.offset() != 0) {
+            sidecar.ack(record);
+          }
+          sidecar.credits(1);
+        };
+    sidecar.credits(1);
+
+    awaitCommitted(topic, 1);
+    assertThat(sidecar.received.stream().map(r -> r.at() + "#" + r.attempt()))
+        .containsExactly("0/0#1", "0/0#2", "0/1#1");
+    List<ConsumerRecord<String, String>> letters =
+        ServerHarness.read(ServerHarness.KAFKA_A, deadLetters, 1, 1);
+    assertThat(letters).hasSize(1);
+    assertThat(letters.get(0).key()).isEqualTo("k0");
+    assertThat(ServerHarness.header(letters.get(0), "odradek-attempts")).isEqualTo("2");
+    assertThat(ServerHarness.header(letters.get(0), "odradek-failure")).isEqualTo("deadline");
+    assertThat(ServerHarness.header(letters.get(0), "odradek-failure-detail")).isNull();
+  }
+
+  @Test
+  void aDeadLetterThatCannotBeWrittenHoldsItsPartitionUntilItCanBe() throws Exception {
+    createTopic(topic, 2);
+    // A dead-letter topic that takes no record the size of the one that will be given up on.
+    ServerHarness.createTopic(
+        ServerHarness.KAFKA_A, deadLetters, 1, Map.of("max.message.bytes", "1000"));
+    topics.add(deadLetters);
+    produce(topic, 0, keys("k", 1), "v");
+    long poison =
+        producer
+            .send(new ProducerRecord<>(topic, 0, "poison", "x".repeat(4000)))
+            .get(TIMEOUT.toSeconds(), TimeUnit.SECONDS)
+            .offset();
+    produce(topic, 0, keys("behind", 2), "v");
+
+    Sidecar sidecar =
+        sidecar(
+            "s",
+            declare(
+                topic, deadLettering(1).andThen(s -> s.setOrdering(Ordering.ORDERING_PARTITION))));
+    sidecar.onRecord =
+        record -> {
+          if (record.partition() == 0 && record.offset() == poison) {
+            sidecar.reject(record);
+          } else {
+            sidecar.ack(record);
+          }
+          sidecar.credits(1);
+        };
+    sidecar.credits(1);
+
+    await("the partition is committed up to the record", () -> committed(topic, 0) == poison);
+    // The other partition is not held up by it.
+    List<Long> elsewhere = produce(topic, 1, keys("other", 3), "v");
+    await("the other partition goes on", () -> committed(topic, 1) == elsewhere.get(2) + 1);
+    // The write is refused, and refused again a second later. Nothing is committed past the
+    // record, and nothing behind it is delivered.
+    Thread.sleep(1500);
+    assertThat(committed(topic, 0)).as("the commit position while it fails").isEqualTo(poison);
+    assertThat(sidecar.offsets().stream().filter(at -> at.startsWith("0/")))
+        .containsExactly("0/0", "0/" + poison);
+    if (DispatcherHarness.packaged()) {
+      assertThat(harness.log)
+          .as("the dispatcher says so")
+          .anyMatch(
+              line ->
+                  line.contains("WARN")
+                      && line.contains("to dead-letter topic " + deadLetters + " failed"));
+    }
+
+    // Someone mends the topic: the next try is acknowledged, and the partition goes on.
+    admin
+        .incrementalAlterConfigs(
+            Map.of(
+                new ConfigResource(ConfigResource.Type.TOPIC, deadLetters),
+                List.of(
+                    new AlterConfigOp(
+                        new ConfigEntry("max.message.bytes", "1048588"),
+                        AlterConfigOp.OpType.SET))))
+        .all()
+        .get(30, TimeUnit.SECONDS);
+    awaitCommitted(topic, 2);
+    assertThat(sidecar.offsets().stream().filter(at -> at.startsWith("0/")))
+        .containsExactly("0/0", "0/" + poison, "0/" + (poison + 1), "0/" + (poison + 2));
+    List<ConsumerRecord<String, String>> letters =
+        ServerHarness.read(ServerHarness.KAFKA_A, deadLetters, 1, 1);
+    assertThat(letters).as("written once").hasSize(1);
+    assertThat(letters.get(0).key()).isEqualTo("poison");
+    assertThat(letters.get(0).value()).hasSize(4000);
+  }
+
+  /** Needs the packaged server: the in-process harness records metrics nowhere. */
+  @Test
+  void whatTheDispatcherCountsOfFailedRecordsShowsInThePushedMetrics() throws Exception {
+    Assumptions.assumeTrue(DispatcherHarness.packaged(), "needs the packaged server");
+    harness.stop();
+    FakeCollector collector = FakeCollector.start();
+    try {
+      harness =
+          DispatcherHarness.start(
+              CONFIG + "telemetry:\n  endpoint: %s\n  exportInterval: 1s\n",
+              ServerHarness.KAFKA_A,
+              collector.endpoint());
+      createTopic(topic, 1);
+      createTopic(second, 1);
+      createTopic(deadLetters, 1);
+      produce(topic, 0, keys("k", 2), "v");
+      produce(second, 0, keys("k", 2), "v");
+
+      // One topic dead-letters its first record after two attempts; the other blocks at its
+      // first record after one.
+      Sidecar lettering = sidecar("lettering", declare(topic, deadLettering(2)));
+      lettering.onRecord =
+          record -> {
+            if (record.offset() == 0) {
+              lettering.reject(record);
+            } else {
+              lettering.ack(record);
+            }
+            lettering.credits(1);
+          };
+      lettering.credits(1);
+      Sidecar blocking =
+          sidecar(
+              "blocking",
+              declare(second, s -> s.setMaxAttempts(1).setOrdering(Ordering.ORDERING_PARTITION)));
+      blocking.onRecord =
+          record -> {
+            blocking.reject(record);
+            blocking.credits(1);
+          };
+      blocking.credits(1);
+      awaitCommitted(topic, 1);
+      await("the other topic delivered its first record", () -> blocking.received.size() == 1);
+
+      // Each with the topic it is about, in one export.
+      collector.await(TIMEOUT, "odradek.dispatch.redeliveries", "rejected", topic, group);
+      collector.await(TIMEOUT, "odradek.dispatch.exhausted", topic, second);
+      collector.await(TIMEOUT, "odradek.dispatch.dead_letter.writes", topic);
+      collector.await(TIMEOUT, "odradek.dispatch.partitions.blocked", second);
+      collector.awaitEach(
+          TIMEOUT,
+          "odradek.dispatch.receivers",
+          "odradek.dispatch.records",
+          "odradek.dispatch.in_flight",
+          // The groups it consumes for rebalance when it joins them.
+          "odradek.consume.rebalances",
+          // The producer it made for the dead letter reports like any other.
+          "odradek.kafka.producer.connections");
+      assertThat(collector.received("odradek.dispatch.handovers")).isFalse();
+
+      // It gives its partitions up when it stops, and says so in its last export.
+      harness.stopDispatcher();
+      collector.awaitEach(TIMEOUT, "odradek.dispatch.handovers");
+    } finally {
+      collector.close();
     }
   }
 

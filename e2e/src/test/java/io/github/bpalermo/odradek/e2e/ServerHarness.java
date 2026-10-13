@@ -22,9 +22,11 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.epoll.EpollDomainSocketChannel;
 import io.netty.channel.epoll.EpollIoHandler;
 import io.netty.channel.unix.DomainSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -34,8 +36,13 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.RetriableException;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.serialization.StringDeserializer;
 
 /**
  * A running server and a gRPC channel to its Unix socket, in a temporary directory.
@@ -220,8 +227,18 @@ final class ServerHarness {
    * does.
    */
   static void createTopic(String bootstrap, String name, int partitions) throws Exception {
+    createTopic(bootstrap, name, partitions, Map.of());
+  }
+
+  /** As above, for a topic with settings of its own. */
+  static void createTopic(
+      String bootstrap, String name, int partitions, Map<String, String> settings)
+      throws Exception {
     try (Admin admin = admin(bootstrap)) {
-      admin.createTopics(List.of(new NewTopic(name, partitions, (short) 1))).all().get();
+      admin
+          .createTopics(List.of(new NewTopic(name, partitions, (short) 1).configs(settings)))
+          .all()
+          .get();
       Map<TopicPartition, OffsetSpec> ends = new HashMap<>();
       for (int partition = 0; partition < partitions; partition++) {
         ends.put(new TopicPartition(name, partition), OffsetSpec.latest());
@@ -242,6 +259,58 @@ final class ServerHarness {
         }
       }
     }
+  }
+
+  /**
+   * Everything in a topic, from its beginning, in the order read: waits until it holds {@code
+   * atLeast} records, then a moment longer for any that should not be there.
+   */
+  static List<ConsumerRecord<String, String>> read(
+      String bootstrap, String name, int partitions, int atLeast) {
+    List<ConsumerRecord<String, String>> all = new ArrayList<>();
+    try (KafkaConsumer<String, String> consumer =
+        new KafkaConsumer<>(
+            Map.<String, Object>of(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap),
+            new StringDeserializer(),
+            new StringDeserializer())) {
+      List<TopicPartition> assignment = new ArrayList<>();
+      for (int partition = 0; partition < partitions; partition++) {
+        assignment.add(new TopicPartition(name, partition));
+      }
+      consumer.assign(assignment);
+      consumer.seekToBeginning(assignment);
+      long deadline = System.nanoTime() + START_TIMEOUT.toNanos();
+      while (all.size() < atLeast) {
+        if (System.nanoTime() > deadline) {
+          fail("%s holds %s records after %s, not %s", name, all.size(), START_TIMEOUT, atLeast);
+        }
+        consumer.poll(Duration.ofMillis(200)).forEach(all::add);
+      }
+      consumer.poll(Duration.ofMillis(500)).forEach(all::add);
+    }
+    return all;
+  }
+
+  /** The headers of a record, as "name=value", in order. */
+  static List<String> headers(ConsumerRecord<String, String> record) {
+    List<String> headers = new ArrayList<>();
+    for (Header header : record.headers()) {
+      headers.add(
+          header.key()
+              + "="
+              + (header.value() == null
+                  ? null
+                  : new String(header.value(), StandardCharsets.UTF_8)));
+    }
+    return headers;
+  }
+
+  /** The last header of a name, as text; null when the record has none. */
+  static String header(ConsumerRecord<String, String> record, String name) {
+    Header header = record.headers().lastHeader(name);
+    return header == null || header.value() == null
+        ? null
+        : new String(header.value(), StandardCharsets.UTF_8);
   }
 
   static void deleteTopics(String bootstrap, List<String> names) throws Exception {

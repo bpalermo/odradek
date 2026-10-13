@@ -1,0 +1,11 @@
+# An application pod with the Odradek sidecar, consuming through the dispatcher
+# of ../dispatcher. An example to copy from, in a namespace that is not created
+# here and that the dispatcher's NetworkPolicy must let in: label it
+# odradek.example.org/dispatcher-client=true.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: billing
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml

@@ -31,6 +31,7 @@ public final class ServerMetrics {
   static final AttributeKey<Boolean> REQUIRED = AttributeKey.booleanKey("required");
   static final AttributeKey<String> EVENT = AttributeKey.stringKey("event");
   static final AttributeKey<String> REASON = AttributeKey.stringKey("reason");
+  static final AttributeKey<String> ACTION = AttributeKey.stringKey("action");
 
   /**
    * On the TLS metrics, in place of {@code cluster}: the credentials are those of the delivery
@@ -55,7 +56,15 @@ public final class ServerMetrics {
   private final LongCounter dispatchRedeliveries;
   private final LongUpDownCounter dispatchInFlight;
   private final LongUpDownCounter dispatchBlocked;
+  private final LongCounter dispatchExhausted;
+  private final LongCounter dispatchDeadLetterWrites;
+  private final LongCounter dispatchWindowPauses;
+  private final LongUpDownCounter dispatchAtWindow;
+  private final LongCounter dispatchHandOvers;
+  private final LongCounter dispatchHandOverRecords;
+  private final LongCounter dispatchDeclarationsRefused;
   private final LongUpDownCounter receiveStreams;
+  private final LongUpDownCounter receiveStreamsWanted;
   private final LongCounter receiveRecords;
   private final LongCounter receiveRejects;
   private final LongCounter receiveReconnects;
@@ -139,8 +148,9 @@ public final class ServerMetrics {
         meter
             .counterBuilder("odradek.dispatch.redeliveries")
             .setDescription(
-                "Of the records sent, those that had been sent before: after a missed deadline, a"
-                    + " rejection, or a sidecar that went away.")
+                "Of the records sent, those this replica had sent before, by reason: deadline (the"
+                    + " processing deadline passed), rejected (a sidecar could not decode it) or"
+                    + " receiver_gone (the sidecar's stream ended).")
             .setUnit("{record}")
             .build();
     dispatchInFlight =
@@ -156,11 +166,74 @@ public final class ServerMetrics {
                 "Partitions stopped at a record that used all its attempts (ON_EXHAUSTED_BLOCK).")
             .setUnit("{partition}")
             .build();
+    dispatchExhausted =
+        meter
+            .counterBuilder("odradek.dispatch.exhausted")
+            .setDescription(
+                "Records that used all their attempts, by what became of them: block (the"
+                    + " partition stops) or dead_letter.")
+            .setUnit("{record}")
+            .build();
+    dispatchDeadLetterWrites =
+        meter
+            .counterBuilder("odradek.dispatch.dead_letter.writes")
+            .setDescription(
+                "Writes of a record to its dead-letter topic, by outcome. A write that failed is"
+                    + " made again, and nothing is committed past the record meanwhile.")
+            .setUnit("{write}")
+            .build();
+    dispatchWindowPauses =
+        meter
+            .counterBuilder("odradek.dispatch.window.pauses")
+            .setDescription(
+                "Times a partition stopped handing out new records because its oldest"
+                    + " unacknowledged record is dispatch.partitionWindow offsets behind.")
+            .setUnit("{pause}")
+            .build();
+    dispatchAtWindow =
+        meter
+            .upDownCounterBuilder("odradek.dispatch.partitions.at_window")
+            .setDescription(
+                "Partitions that hand out no new record now because of dispatch.partitionWindow.")
+            .setUnit("{partition}")
+            .build();
+    dispatchHandOvers =
+        meter
+            .counterBuilder("odradek.dispatch.handovers")
+            .setDescription(
+                "Partitions this replica gave up in good order, by outcome: completed (all it had"
+                    + " sent was answered first) or deadline (consume.revokeDeadline ended the"
+                    + " wait).")
+            .setUnit("{partition}")
+            .build();
+    dispatchHandOverRecords =
+        meter
+            .counterBuilder("odradek.dispatch.handover.records")
+            .setDescription(
+                "Records this replica had sent and left above the committed offset of a partition"
+                    + " it gave up: what the next owner sends again.")
+            .setUnit("{record}")
+            .build();
+    dispatchDeclarationsRefused =
+        meter
+            .counterBuilder("odradek.dispatch.declarations.refused")
+            .setDescription("Declarations a dispatcher refused, by gRPC status.")
+            .setUnit("{declaration}")
+            .build();
     receiveStreams =
         meter
             .upDownCounterBuilder("odradek.receive.streams")
             .setDescription(
                 "Deliver streams this server holds to dispatcher replicas, declaration accepted.")
+            .setUnit("{stream}")
+            .build();
+    receiveStreamsWanted =
+        meter
+            .upDownCounterBuilder("odradek.receive.streams.wanted")
+            .setDescription(
+                "Deliver streams this server should hold: one per listed dispatcher replica, one"
+                    + " while no list is known. More than odradek.receive.streams means a replica"
+                    + " that is not reached.")
             .setUnit("{stream}")
             .build();
     receiveRecords =
@@ -248,15 +321,51 @@ public final class ServerMetrics {
     consumeRebalances.add(1, Attributes.of(CLUSTER, cluster, GROUP, group, EVENT, event));
   }
 
+  /** A declaration was refused with the gRPC status code {@code reason}. */
+  public void declarationRefused(String reason) {
+    // Nothing of what was declared: whoever reaches the port chooses those names.
+    dispatchDeclarationsRefused.add(1, Attributes.of(REASON, reason));
+  }
+
+  /** Why a dispatcher sends a record again. The names are the values of {@code reason}. */
+  public enum Redelivery {
+    DEADLINE("deadline"),
+    REJECTED("rejected"),
+    RECEIVER_GONE("receiver_gone");
+
+    private final String reason;
+
+    Redelivery(String reason) {
+      this.reason = reason;
+    }
+  }
+
   /**
    * What a dispatcher reports about one topic of one group. A record sent is on the dispatcher's
    * hot path, so the attributes are built once here.
    */
   public final class DispatchTopic {
     private final Attributes attributes;
+    private final Attributes[] redelivered = new Attributes[Redelivery.values().length];
+    private final Attributes blocks;
+    private final Attributes deadLetters;
+    private final Attributes written;
+    private final Attributes notWritten;
+    private final Attributes completed;
+    private final Attributes deadline;
 
     private DispatchTopic(String cluster, String group, String topic) {
       attributes = Attributes.of(CLUSTER, cluster, GROUP, group, TOPIC, topic);
+      for (Redelivery redelivery : Redelivery.values()) {
+        redelivered[redelivery.ordinal()] =
+            attributes.toBuilder().put(REASON, redelivery.reason).build();
+      }
+      blocks = attributes.toBuilder().put(ACTION, "block").build();
+      deadLetters = attributes.toBuilder().put(ACTION, "dead_letter").build();
+      written = attributes.toBuilder().put(OUTCOME, OK).build();
+      notWritten = attributes.toBuilder().put(OUTCOME, ERROR).build();
+      completed = attributes.toBuilder().put(OUTCOME, "completed").build();
+      deadline = attributes.toBuilder().put(OUTCOME, "deadline").build();
     }
 
     /** Deliver streams opened (positive) or ended (negative). */
@@ -264,11 +373,11 @@ public final class ServerMetrics {
       dispatchReceivers.add(delta, attributes);
     }
 
-    /** A record was sent to a sidecar; {@code again} when it had been sent before. */
-    public void sent(boolean again) {
+    /** A record was sent to a sidecar; {@code again} says why when it had been sent before. */
+    public void sent(Redelivery again) {
       dispatchRecords.add(1, attributes);
-      if (again) {
-        dispatchRedeliveries.add(1, attributes);
+      if (again != null) {
+        dispatchRedeliveries.add(1, redelivered[again.ordinal()]);
       }
     }
 
@@ -280,6 +389,39 @@ public final class ServerMetrics {
     /** The number of blocked partitions changed by {@code delta}. */
     public void blocked(long delta) {
       dispatchBlocked.add(delta, attributes);
+    }
+
+    /** A record used all its attempts: it is dead-lettered, or blocks its partition. */
+    public void exhausted(boolean deadLettered) {
+      dispatchExhausted.add(1, deadLettered ? deadLetters : blocks);
+    }
+
+    /** The write of a record to its dead-letter topic was acknowledged, or failed. */
+    public void deadLetter(boolean ok) {
+      dispatchDeadLetterWrites.add(1, ok ? written : notWritten);
+    }
+
+    /** Partitions came to be held back by the window, {@code pauses} times. */
+    public void windowPauses(long pauses) {
+      dispatchWindowPauses.add(pauses, attributes);
+    }
+
+    /** The number of partitions held back by the window changed by {@code delta}. */
+    public void atWindow(long delta) {
+      dispatchAtWindow.add(delta, attributes);
+    }
+
+    /**
+     * A partition was given up in good order.
+     *
+     * @param inTime whether everything sent was answered before the revoke deadline
+     * @param resent the records sent that the next owner sends again
+     */
+    public void handedOver(boolean inTime, long resent) {
+      dispatchHandOvers.add(1, inTime ? completed : deadline);
+      if (resent > 0) {
+        dispatchHandOverRecords.add(resent, attributes);
+      }
     }
   }
 
@@ -302,6 +444,11 @@ public final class ServerMetrics {
     /** Deliver streams accepted by a replica (positive) or ended after that (negative). */
     public void streams(long delta) {
       receiveStreams.add(delta, attributes);
+    }
+
+    /** The number of Deliver streams the server should hold for the topic changed. */
+    public void wanted(long delta) {
+      receiveStreamsWanted.add(delta, attributes);
     }
 
     /** Records arrived from a dispatcher. */

@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server.dispatch;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.google.protobuf.ByteString;
+import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Cause;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Commit;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.DeadLetter;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Deliver;
@@ -56,9 +57,44 @@ class DispatchCoreRandomTest {
   private static final int MAX_BUFFERED = 6;
   private static final int MAX_FETCH = 4;
 
+  /** The waits of the runs that have them: before a redelivery, and before a dead letter again. */
+  private static final long BACKOFF = 30;
+
+  private static final long BACKOFF_MAX = 200;
+  private static final long RETRY = 20;
+  private static final long RETRY_MAX = 100;
+
+  /** How far time moves in each round of the end of a run: less than any processing deadline. */
+  private static final long DRAIN_STEP = 100;
+
   @Test
   void keyOrdering() {
     run(Ordering.KEY, 0, OnExhausted.BLOCK);
+  }
+
+  @Test
+  void keyOrderingWithWaits() {
+    run(Ordering.KEY, 0, OnExhausted.BLOCK, true);
+  }
+
+  @Test
+  void keyOrderingWithDeadLettersAndWaits() {
+    run(Ordering.KEY, 3, OnExhausted.DEAD_LETTER, true);
+  }
+
+  @Test
+  void partitionOrderingWithDeadLettersAndWaits() {
+    run(Ordering.PARTITION, 2, OnExhausted.DEAD_LETTER, true);
+  }
+
+  @Test
+  void noOrderingWithDeadLettersAndWaits() {
+    run(Ordering.NONE, 3, OnExhausted.DEAD_LETTER, true);
+  }
+
+  @Test
+  void keyOrderingWithBlockingAndWaits() {
+    run(Ordering.KEY, 3, OnExhausted.BLOCK, true);
   }
 
   @Test
@@ -102,8 +138,13 @@ class DispatchCoreRandomTest {
   }
 
   private static void run(Ordering ordering, int maxAttempts, OnExhausted onExhausted) {
+    run(ordering, maxAttempts, onExhausted, false);
+  }
+
+  private static void run(
+      Ordering ordering, int maxAttempts, OnExhausted onExhausted, boolean waits) {
     for (int seed = 0; seed < SEEDS; seed++) {
-      Simulation simulation = new Simulation(ordering, maxAttempts, onExhausted, seed);
+      Simulation simulation = new Simulation(ordering, maxAttempts, onExhausted, waits, seed);
       try {
         simulation.chaos(STEPS);
         simulation.drain();
@@ -149,6 +190,19 @@ class DispatchCoreRandomTest {
     final Map<Long, Integer> attempts = new HashMap<>();
     final Set<Long> deadLettering = new HashSet<>();
     final TreeSet<Long> blocked = new TreeSet<>();
+
+    /** Failed and not to be sent again yet: offset to when it may be. */
+    final Map<Long, Long> delayed = new HashMap<>();
+
+    /** Dead letters whose write failed, waiting to be asked for again: offset to when. */
+    final Map<Long, Long> letterDue = new HashMap<>();
+
+    /** How many writes of an offset's dead letter failed. */
+    final Map<Long, Integer> letterFailures = new HashMap<>();
+
+    /** How the last delivery of an offset ended, when it was not acknowledged. */
+    final Map<Long, Cause> ended = new HashMap<>();
+
     long lastCommit;
     long newestDelivered = -1;
 
@@ -168,6 +222,10 @@ class DispatchCoreRandomTest {
       attempts.clear();
       deadLettering.clear();
       blocked.clear();
+      delayed.clear();
+      letterDue.clear();
+      letterFailures.clear();
+      ended.clear();
       newestDelivered = -1;
     }
 
@@ -193,6 +251,7 @@ class DispatchCoreRandomTest {
     final Ordering ordering;
     final int maxAttempts;
     final OnExhausted onExhausted;
+    final boolean waits;
     final Random random;
     final DispatchCore<String> core;
     final List<Partition> partitions = new ArrayList<>();
@@ -215,22 +274,31 @@ class DispatchCoreRandomTest {
     int receiverNames;
     String last = "";
 
-    Simulation(Ordering ordering, int maxAttempts, OnExhausted onExhausted, long seed) {
+    Simulation(
+        Ordering ordering, int maxAttempts, OnExhausted onExhausted, boolean waits, long seed) {
       this.ordering = ordering;
       this.maxAttempts = maxAttempts;
       this.onExhausted = onExhausted;
+      this.waits = waits;
       this.random = new Random(seed);
+      DispatchSettings settings =
+          new DispatchSettings(
+              ordering,
+              Duration.ofNanos(DEADLINE),
+              maxAttempts,
+              onExhausted,
+              WINDOW,
+              MAX_BUFFERED,
+              Long.MAX_VALUE,
+              Duration.ofNanos(GRACE));
       this.core =
           new DispatchCore<>(
-              new DispatchSettings(
-                  ordering,
-                  Duration.ofNanos(DEADLINE),
-                  maxAttempts,
-                  onExhausted,
-                  WINDOW,
-                  MAX_BUFFERED,
-                  Long.MAX_VALUE,
-                  Duration.ofNanos(GRACE)));
+              waits
+                  ? settings
+                      .withRedeliveryBackoff(
+                          Duration.ofNanos(BACKOFF), Duration.ofNanos(BACKOFF_MAX))
+                      .withDeadLetterRetry(Duration.ofNanos(RETRY), Duration.ofNanos(RETRY_MAX))
+                  : settings);
       for (int id = 0; id < PARTITIONS; id++) {
         partitions.add(new Partition(id));
       }
@@ -292,6 +360,10 @@ class DispatchCoreRandomTest {
       }
       for (int round = 0; round < 10_000 && !settled(); round++) {
         step++;
+        // What waits to be sent or written again gets its time; nothing in flight runs out of
+        // it, since everything held is acknowledged in each round.
+        now += DRAIN_STEP;
+        timePassed();
         for (Partition p : partitions) {
           assign(p);
           fetch(p, MAX_FETCH, p.offsets.size());
@@ -388,6 +460,7 @@ class DispatchCoreRandomTest {
                 // Taken back, not failed: the delivery does not count as an attempt.
                 p.inFlight.remove(offset);
                 p.sentAt.remove(offset);
+                p.ended.put(offset, Cause.RECEIVER_LEFT);
                 if (!p.draining) {
                   p.attempts.merge(offset, -1, Integer::sum);
                 }
@@ -445,21 +518,38 @@ class DispatchCoreRandomTest {
       Partition p = partitions.get(partition);
       unhold(r, partition, offset);
       if (name.equals(p.inFlight.get(offset))) {
-        attemptFailed(p, offset);
+        attemptFailed(p, offset, Cause.REJECTED);
       }
-      on(new Rejected<>(name, partition, offset));
+      on(new Rejected<>(name, partition, offset, "rejected at step " + step));
     }
 
     void timePassed() {
       for (Partition p : partitions) {
+        // What has waited long enough, before what starts to wait now.
+        p.delayed.values().removeIf(due -> now >= due);
+        for (long offset : List.copyOf(p.letterDue.keySet())) {
+          if (now >= p.letterDue.get(offset)) {
+            p.letterDue.remove(offset);
+            expected.add("dead letter " + p.id + "/" + offset);
+          }
+        }
         for (long offset : List.copyOf(p.inFlight.keySet())) {
           if (now >= p.sentAt.get(offset)) {
             // The receiver keeps it, and may acknowledge it yet.
-            attemptFailed(p, offset);
+            attemptFailed(p, offset, Cause.DEADLINE);
           }
         }
       }
       on(new TimePassed<>());
+    }
+
+    /** {@code first} doubled {@code doublings} times, and at most {@code longest}. */
+    static long doubled(long first, long longest, int doublings) {
+      long wait = first;
+      for (int i = 0; i < doublings && wait < longest; i++) {
+        wait *= 2;
+      }
+      return Math.min(wait, longest);
     }
 
     void assign(Partition p) {
@@ -480,6 +570,10 @@ class DispatchCoreRandomTest {
         p.draining = true;
         p.drainStart = now;
         p.blocked.clear();
+        p.delayed.clear();
+        // A dead letter that waits to be written again is not written by this owner any more.
+        p.deadLettering.removeAll(p.letterDue.keySet());
+        p.letterDue.clear();
       }
       if (!p.assigned) {
         expected.add("released " + p.id);
@@ -504,8 +598,16 @@ class DispatchCoreRandomTest {
       Partition p = partitions.get((int) letter[0]);
       boolean pending = p.deadLettering.contains(letter[1]);
       if (random.nextInt(3) == 0) {
-        if (pending) {
-          expected.add("dead letter " + p.id + "/" + letter[1]);
+        if (pending && p.draining) {
+          // Left to the next owner.
+          p.deadLettering.remove(letter[1]);
+        } else if (pending) {
+          int failures = p.letterFailures.merge(letter[1], 1, Integer::sum);
+          if (waits) {
+            p.letterDue.put(letter[1], now + doubled(RETRY, RETRY_MAX, failures - 1));
+          } else {
+            expected.add("dead letter " + p.id + "/" + letter[1]);
+          }
         }
         on(new DeadLetterFailed<>(p.id, letter[1]));
       } else {
@@ -520,10 +622,17 @@ class DispatchCoreRandomTest {
     // The model
     // -----------------------------------------------------------------------------------------
 
-    void attemptFailed(Partition p, long offset) {
+    void attemptFailed(Partition p, long offset, Cause cause) {
       p.inFlight.remove(offset);
       p.sentAt.remove(offset);
-      if (p.draining || maxAttempts == 0 || p.attempts.get(offset) < maxAttempts) {
+      p.ended.put(offset, cause);
+      if (p.draining) {
+        return;
+      }
+      if (maxAttempts == 0 || p.attempts.get(offset) < maxAttempts) {
+        if (waits) {
+          p.delayed.put(offset, now + doubled(BACKOFF, BACKOFF_MAX, p.attempts.get(offset) - 1));
+        }
         return;
       }
       if (onExhausted == OnExhausted.DEAD_LETTER) {
@@ -543,6 +652,9 @@ class DispatchCoreRandomTest {
       p.inFlight.remove(offset);
       p.sentAt.remove(offset);
       p.deadLettering.remove(offset);
+      p.delayed.remove(offset);
+      p.letterDue.remove(offset);
+      p.ended.remove(offset);
       if (p.blocked.remove(offset) && p.blocked.isEmpty()) {
         expected.add("unblocked " + p.id);
       }
@@ -565,7 +677,8 @@ class DispatchCoreRandomTest {
       }
       if (p.inFlight.containsKey(offset)
           || p.deadLettering.contains(offset)
-          || p.blocked.contains(offset)) {
+          || p.blocked.contains(offset)
+          || p.delayed.containsKey(offset)) {
         return false;
       }
       if (!p.blocked.isEmpty() && offset > p.blocked.first()) {
@@ -600,6 +713,11 @@ class DispatchCoreRandomTest {
             Partition p = partitions.get(a.partition());
             assertThat(a.payload()).isEqualTo(p.id + "/" + a.offset());
             assertThat(a.attempts()).isEqualTo(p.attempts.get(a.offset())).isEqualTo(maxAttempts);
+            assertThat(a.cause()).as("%s", a).isEqualTo(p.ended.get(a.offset()));
+            assertThat(a.detail() != null).as("%s", a).isEqualTo(a.cause() == Cause.REJECTED);
+            assertThat(a.retries())
+                .as("%s", a)
+                .isEqualTo(p.letterFailures.getOrDefault(a.offset(), 0));
             deadLetters.add(new long[] {a.partition(), a.offset()});
           }
           case PartitionBlocked<String> a ->
@@ -634,11 +752,17 @@ class DispatchCoreRandomTest {
               continue;
             }
             assertThat(p.draining).as("%s", a).isTrue();
-            assertThat(
-                    (p.inFlight.isEmpty() && p.deadLettering.isEmpty())
-                        || now - p.drainStart >= GRACE)
+            boolean answered = p.inFlight.isEmpty() && p.deadLettering.isEmpty();
+            assertThat(answered || now - p.drainStart >= GRACE).as("%s", a).isTrue();
+            assertThat(a.inTime()).as("%s", a).isEqualTo(answered);
+            // What it had sent and leaves at or above the position it commits last.
+            assertThat(a.resent())
                 .as("%s", a)
-                .isTrue();
+                .isEqualTo(
+                    (int)
+                        p.attempts.keySet().stream()
+                            .filter(offset -> offset >= p.lastCommit)
+                            .count());
             released.add(p.id);
           }
         }
@@ -663,6 +787,9 @@ class DispatchCoreRandomTest {
       assertThat(key).as("%s is unacknowledged", a).isNotNull();
       assertThat(a.payload()).isEqualTo(p.id + "/" + offset);
       assertThat(sendable(p, offset, key)).as("%s is allowed", a).isTrue();
+      assertThat(a.cause())
+          .as("why %s is sent", a)
+          .isEqualTo(p.attempts.containsKey(offset) ? p.ended.get(offset) : Cause.NONE);
       int attempt = p.attempts.merge(offset, 1, Integer::sum);
       assertThat(a.attempt()).isEqualTo(attempt);
       if (maxAttempts > 0) {
@@ -751,7 +878,10 @@ class DispatchCoreRandomTest {
       }
       assertThat(core.inFlight()).isEqualTo(inFlight);
       assertThat(core.nextDeadlineNanos().isPresent())
-          .isEqualTo(inFlight > 0 || partitions.stream().anyMatch(p -> p.draining));
+          .isEqualTo(
+              inFlight > 0
+                  || partitions.stream()
+                      .anyMatch(p -> p.draining || !p.delayed.isEmpty() || !p.letterDue.isEmpty()));
     }
 
     // -----------------------------------------------------------------------------------------

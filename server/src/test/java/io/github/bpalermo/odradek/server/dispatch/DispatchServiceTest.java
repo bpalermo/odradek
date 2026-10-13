@@ -32,6 +32,11 @@ import io.grpc.Status;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.stub.StreamObserver;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.LongPointData;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -50,8 +55,15 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
+import org.apache.kafka.clients.producer.MockProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RoundRobinPartitioner;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.RecordTooLargeException;
+import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -100,6 +112,44 @@ class DispatchServiceTest {
   private final List<RecordingConsumer> consumers = new CopyOnWriteArrayList<>();
 
   private final List<Map<String, Object>> consumerProperties = new CopyOnWriteArrayList<>();
+
+  /** The dead-letter producers the service asked for, with the properties it gave. */
+  private final List<MockProducer<byte[], byte[]>> producers = new CopyOnWriteArrayList<>();
+
+  private final List<Map<String, Object>> producerProperties = new CopyOnWriteArrayList<>();
+
+  /** Metrics are read back from the SDK, so that what a dashboard would show is what is checked. */
+  private final InMemoryMetricReader reader = InMemoryMetricReader.create();
+
+  private final SdkMeterProvider provider =
+      SdkMeterProvider.builder().registerMetricReader(reader).build();
+  private final ServerMetrics metrics = new ServerMetrics(provider.get("odradek"));
+
+  /**
+   * The sum of the points of a metric whose attributes include these, given as name and value in
+   * turn; 0 when it has none.
+   */
+  private long metric(String name, String... attributes) {
+    long total = 0;
+    for (MetricData data : reader.collectAllMetrics()) {
+      if (!data.getName().equals(name)) {
+        continue;
+      }
+      for (LongPointData point : data.getLongSumData().getPoints()) {
+        boolean matches = true;
+        for (int i = 0; i < attributes.length; i += 2) {
+          matches &=
+              attributes[i + 1].equals(
+                  point.getAttributes().get(AttributeKey.stringKey(attributes[i])));
+        }
+        if (matches) {
+          total += point.getValue();
+        }
+      }
+    }
+    return total;
+  }
+
   private Server server;
   private ManagedChannel channel;
   private DispatchService service;
@@ -137,6 +187,12 @@ class DispatchServiceTest {
           DeliverRequest.newBuilder()
               .setReject(
                   Reject.newBuilder().setPartition(partition).setOffset(offset).setReason("test")));
+    }
+
+    /** The next record, as "partition/offset/attempt", and how long after {@code since}. */
+    long millisUntil(String record, long since) throws InterruptedException {
+      assertThat(records(1)).containsExactly(record);
+      return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - since);
     }
 
     DeliverResponse next() throws InterruptedException {
@@ -201,13 +257,29 @@ class DispatchServiceTest {
         new DispatchService(
             config.build(),
             TlsSources.none(),
-            ServerMetrics.noop(),
+            metrics,
             (cluster, properties) -> {
               consumerProperties.add(properties);
               RecordingConsumer consumer = new RecordingConsumer();
               consumers.add(consumer);
               return consumer;
             },
+            new DeadLetters(
+                config.build(),
+                TlsSources.none(),
+                metrics,
+                (cluster, properties) -> {
+                  producerProperties.add(properties);
+                  // Completed by the test: a write is acknowledged when the test says so.
+                  MockProducer<byte[], byte[]> producer =
+                      new MockProducer<>(
+                          false,
+                          new RoundRobinPartitioner(),
+                          new ByteArraySerializer(),
+                          new ByteArraySerializer());
+                  producers.add(producer);
+                  return producer;
+                }),
             System::nanoTime);
     service.advertise("10.1.2.3:9465");
     if (joined) {
@@ -226,6 +298,7 @@ class DispatchServiceTest {
       service.shutdown(Duration.ofSeconds(5));
       server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
     }
+    provider.close();
   }
 
   private Sidecar stream() {
@@ -252,12 +325,13 @@ class DispatchServiceTest {
     return sidecar;
   }
 
+  /** Declares a topic with no wait before a redelivery, unless the test asks for one. */
   private static Declare.Builder declare(String topic) {
     return Declare.newBuilder()
         .setCluster("main")
         .setGroupId("billing")
         .setTopic(topic)
-        .setSettings(Settings.newBuilder().setMaxProcessingMs(60_000));
+        .setSettings(Settings.newBuilder().setMaxProcessingMs(60_000).setRedeliveryBackoffMs(0));
   }
 
   private static Declare.Builder declare(String topic, Consumer<Settings.Builder> settings) {
@@ -349,20 +423,36 @@ class DispatchServiceTest {
     sidecar.declare(declare("orders").setCluster("elsewhere"));
     assertThat(sidecar.status().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
     assertThat(consumers).isEmpty();
+    // Counted by its status alone: what was declared is whatever a caller chose to say.
+    assertThat(metric("odradek.dispatch.declarations.refused", "reason", "PERMISSION_DENIED"))
+        .isEqualTo(1);
+    assertThat(metric("odradek.dispatch.declarations.refused")).isEqualTo(1);
   }
 
   @Test
-  void deadLetteringIsRefusedForNow() throws Exception {
+  void aDeadLetterTopicIsPartOfTheSettingsInForce() throws Exception {
     start(config());
+    Consumer<Settings.Builder> deadLettering =
+        s ->
+            s.setMaxAttempts(3)
+                .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                .setDeadLetterTopic("orders.dlq");
     Sidecar sidecar = stream();
-    sidecar.declare(
-        declare(
-            "orders",
-            s ->
-                s.setMaxAttempts(3)
-                    .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
-                    .setDeadLetterTopic("orders.dlq")));
-    assertThat(sidecar.status().getCode()).isEqualTo(Status.Code.UNIMPLEMENTED);
+    sidecar.declare(declare("orders", deadLettering));
+    Settings inForce = sidecar.accepted().getSettings();
+    assertThat(inForce.getOnExhausted()).isEqualTo(OnExhausted.ON_EXHAUSTED_DEAD_LETTER);
+    assertThat(inForce.getDeadLetterTopic()).isEqualTo("orders.dlq");
+    // No producer until there is something to write.
+    assertThat(producers).isEmpty();
+
+    Sidecar elsewhere = stream();
+    elsewhere.declare(
+        declare("orders", deadLettering.andThen(s -> s.setDeadLetterTopic("orders.other"))));
+    Status status = elsewhere.status();
+    assertThat(status.getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+    assertThat(status.getDescription())
+        .contains("dead_letter_topic orders.dlq")
+        .contains("dead_letter_topic orders.other");
   }
 
   @Test
@@ -379,6 +469,8 @@ class DispatchServiceTest {
                 .setOffsetReset(OffsetReset.OFFSET_RESET_EARLIEST)
                 .setMaxAttempts(0)
                 .setOnExhausted(OnExhausted.ON_EXHAUSTED_BLOCK)
+                .setRedeliveryBackoffMs(0)
+                .setRedeliveryBackoffMaxMs(30_000)
                 .build());
     assertThat(accepted.getReplicas().getGeneration()).isEqualTo(1);
     assertThat(accepted.getReplicas().getReplicasList().stream().map(Replica::getAddress).toList())
@@ -621,6 +713,12 @@ class DispatchServiceTest {
     survivor.nothing();
     doomed.requests.onError(Status.CANCELLED.asRuntimeException());
     assertThat(survivor.records(2)).containsExactly("0/0/1", "0/1/1");
+    assertThat(metric("odradek.dispatch.records", "topic", "orders")).isEqualTo(4);
+    assertThat(metric("odradek.dispatch.redeliveries", "reason", "receiver_gone")).isEqualTo(2);
+    assertThat(metric("odradek.dispatch.redeliveries")).isEqualTo(2);
+    eventually("one stream is left", () -> metric("odradek.dispatch.receivers") == 1);
+    assertThat(metric("odradek.consume.rebalances", "group", "billing", "event", "assigned"))
+        .isEqualTo(1);
   }
 
   @Test
@@ -661,6 +759,218 @@ class DispatchServiceTest {
     eventually("the blocked one is committed up to the record", () -> committedNow(P0) == 1);
     sidecar.nothing();
     assertThat(committed(P0)).isEqualTo(1);
+    // And it shows: one partition of the topic is blocked, by one record given up on.
+    assertThat(
+            metric(
+                "odradek.dispatch.partitions.blocked",
+                "cluster",
+                "main",
+                "group",
+                "billing",
+                "topic",
+                "orders"))
+        .isEqualTo(1);
+    assertThat(metric("odradek.dispatch.exhausted", "action", "block")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.exhausted")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.redeliveries", "reason", "rejected")).isEqualTo(1);
+    eventually("nothing is in flight", () -> metric("odradek.dispatch.in_flight") == 0);
+    // Until the partition changes owner.
+    assign(P1);
+    eventually("no longer blocked", () -> metric("odradek.dispatch.partitions.blocked") == 0);
+  }
+
+  @Test
+  void aPartitionHeldBackByTheWindowIsCountedWhileItIs() throws Exception {
+    start(config().setDispatch(config().getDispatchBuilder().setPartitionWindow(2)));
+    Sidecar sidecar = declared(declare("orders", s -> s.setOrdering(Ordering.ORDERING_NONE)));
+    assign(P0);
+    for (int offset = 0; offset < 4; offset++) {
+      add(P0, offset, "k" + offset);
+    }
+    sidecar.credits(10);
+    // Offsets 0 and 1 are two offsets of unacknowledged records: 2 waits for the first of them.
+    assertThat(sidecar.records(2)).containsExactly("0/0/1", "0/1/1");
+    eventually("held back", () -> metric("odradek.dispatch.partitions.at_window") == 1);
+    assertThat(metric("odradek.dispatch.window.pauses", "topic", "orders")).isEqualTo(1);
+    sidecar.nothing();
+    sidecar.ack(0, 0, 1);
+    assertThat(sidecar.records(2)).containsExactly("0/2/1", "0/3/1");
+    eventually("no longer held back", () -> metric("odradek.dispatch.partitions.at_window") == 0);
+    assertThat(metric("odradek.dispatch.window.pauses")).isEqualTo(1);
+  }
+
+  @Test
+  void aFailedRecordIsNotSentAgainBeforeItsWaitWhichDoubles() throws Exception {
+    start(config());
+    Sidecar sidecar =
+        declared(
+            declare(
+                "orders", s -> s.setRedeliveryBackoffMs(150).setRedeliveryBackoffMaxMs(10_000)));
+    assign(P0);
+    add(P0, 0, "a");
+    add(P0, 1, "a");
+    add(P0, 2, "b");
+    sidecar.credits(10);
+    assertThat(sidecar.records(2)).containsExactly("0/0/1", "0/2/1");
+    long rejected = System.nanoTime();
+    sidecar.reject(0, 0);
+    assertThat(sidecar.millisUntil("0/0/2", rejected)).isGreaterThanOrEqualTo(150);
+    rejected = System.nanoTime();
+    sidecar.reject(0, 0);
+    // Meanwhile another key goes on, and the record's own waits behind it.
+    add(P0, 3, "b");
+    sidecar.ack(0, 2, 2);
+    assertThat(sidecar.records(1)).containsExactly("0/3/1");
+    assertThat(sidecar.millisUntil("0/0/3", rejected)).isGreaterThanOrEqualTo(300);
+    sidecar.ack(0, 0, 0);
+    assertThat(sidecar.records(1)).containsExactly("0/1/1");
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Dead letters
+  // -------------------------------------------------------------------------------------------
+
+  private static Declare.Builder deadLettering(int maxAttempts) {
+    return declare(
+        "orders",
+        s ->
+            s.setOrdering(Ordering.ORDERING_PARTITION)
+                .setMaxAttempts(maxAttempts)
+                .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                .setDeadLetterTopic("orders.dlq"));
+  }
+
+  private MockProducer<byte[], byte[]> producer() throws InterruptedException {
+    eventually("a dead-letter producer was created", () -> !producers.isEmpty());
+    assertThat(producers).hasSize(1);
+    return producers.get(0);
+  }
+
+  private static String header(ProducerRecord<byte[], byte[]> record, String name) {
+    Header header = record.headers().lastHeader(name);
+    return header == null ? null : new String(header.value(), StandardCharsets.UTF_8);
+  }
+
+  @Test
+  void anExhaustedRecordIsWrittenToTheDeadLetterTopicAndCountsOnlyOnceTheBrokerAcknowledged()
+      throws Exception {
+    start(config());
+    Sidecar sidecar = declared(deadLettering(2));
+    assign(P0);
+    add(P0, 0, "a");
+    add(P0, 1, "b");
+    sidecar.credits(10);
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+    sidecar.reject(0, 0);
+    assertThat(sidecar.records(1)).containsExactly("0/0/2");
+    assertThat(producers).isEmpty();
+    sidecar.reject(0, 0);
+
+    MockProducer<byte[], byte[]> producer = producer();
+    eventually("the dead letter is sent", () -> producer.history().size() == 1);
+    ProducerRecord<byte[], byte[]> letter = producer.history().get(0);
+    assertThat(letter.topic()).isEqualTo("orders.dlq");
+    assertThat(letter.partition()).as("left to the partitioner").isNull();
+    assertThat(letter.timestamp()).as("the time of the write").isNull();
+    assertThat(new String(letter.key(), StandardCharsets.UTF_8)).isEqualTo("a");
+    assertThat(new String(letter.value(), StandardCharsets.UTF_8)).isEqualTo("v0");
+    assertThat(header(letter, DeadLetters.SOURCE_CLUSTER)).isEqualTo("main");
+    assertThat(header(letter, DeadLetters.SOURCE_TOPIC)).isEqualTo("orders");
+    assertThat(header(letter, DeadLetters.SOURCE_PARTITION)).isEqualTo("0");
+    assertThat(header(letter, DeadLetters.SOURCE_OFFSET)).isEqualTo("0");
+    assertThat(header(letter, DeadLetters.SOURCE_GROUP)).isEqualTo("billing");
+    assertThat(header(letter, DeadLetters.ATTEMPTS)).isEqualTo("2");
+    assertThat(header(letter, DeadLetters.FAILURE)).isEqualTo("rejected");
+    assertThat(header(letter, DeadLetters.FAILURE_DETAIL)).isEqualTo("test");
+
+    // Not acknowledged yet: nothing is committed past it, and the partition waits for it.
+    sidecar.nothing();
+    assertThat(committed(P0)).isLessThanOrEqualTo(0);
+    assertThat(metric("odradek.dispatch.dead_letter.writes")).isZero();
+    assertThat(producer.completeNext()).isTrue();
+    assertThat(sidecar.records(1)).containsExactly("0/1/1");
+    eventually("the dead-lettered record is committed", () -> committedNow(P0) == 1);
+    assertThat(producer.history()).hasSize(1);
+    assertThat(metric("odradek.dispatch.exhausted", "action", "dead_letter")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.dead_letter.writes", "outcome", "ok", "topic", "orders"))
+        .isEqualTo(1);
+    assertThat(metric("odradek.dispatch.dead_letter.writes")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.partitions.blocked")).isZero();
+  }
+
+  @Test
+  void aDeadLetterThatCannotBeWrittenIsWrittenAgainAndNothingIsCommittedPastIt() throws Exception {
+    start(config());
+    Sidecar sidecar = declared(deadLettering(1));
+    assign(P0, P1);
+    add(P0, 0, "a");
+    add(P0, 1, "b");
+    sidecar.credits(10);
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+    long rejected = System.nanoTime();
+    sidecar.reject(0, 0);
+    MockProducer<byte[], byte[]> producer = producer();
+    eventually("the dead letter is sent", () -> producer.history().size() == 1);
+    assertThat(producer.errorNext(new RecordTooLargeException("too large for the test"))).isTrue();
+
+    // The other partition is not held up by it.
+    add(P1, 0, "z");
+    assertThat(sidecar.records(1)).containsExactly("1/0/1");
+    sidecar.ack(1, 0, 0);
+    eventually("the other partition is committed", () -> committedNow(P1) == 1);
+
+    // Written again, not at once, with the same content; the record still holds its partition.
+    eventually("the dead letter is sent again", () -> producer.history().size() == 2);
+    assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - rejected))
+        .isGreaterThanOrEqualTo(DispatchService.DEAD_LETTER_RETRY.toMillis());
+    assertThat(producer.history().get(1).headers()).isEqualTo(producer.history().get(0).headers());
+    sidecar.nothing();
+    assertThat(committedNow(P0)).isLessThanOrEqualTo(0);
+    assertThat(metric("odradek.dispatch.dead_letter.writes", "outcome", "error")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.dead_letter.writes", "outcome", "ok")).isZero();
+    assertThat(producer.completeNext()).isTrue();
+    assertThat(sidecar.records(1)).containsExactly("0/1/1");
+    eventually("the dead-lettered record is committed", () -> committedNow(P0) == 1);
+    assertThat(metric("odradek.dispatch.dead_letter.writes", "outcome", "ok")).isEqualTo(1);
+    // Given up on once, however many times it had to be written.
+    assertThat(metric("odradek.dispatch.exhausted")).isEqualTo(1);
+  }
+
+  @Test
+  void theDeadLetterProducerCarriesTheGuaranteesAndIsNotAnAppsProducer() throws Exception {
+    start(config());
+    Sidecar sidecar = declared(deadLettering(1));
+    assign(P0);
+    add(P0, 0, "a");
+    sidecar.credits(1);
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+    sidecar.reject(0, 0);
+    producer();
+    Map<String, Object> properties = producerProperties.get(0);
+    assertThat(properties)
+        .containsEntry(ProducerConfig.ACKS_CONFIG, "all")
+        .containsEntry(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
+        .containsEntry(ProducerConfig.CLIENT_ID_CONFIG, "odradek-main-dead-letter");
+  }
+
+  @Test
+  void aDeadLetterStillBeingWrittenWhenTheDispatcherStopsIsNotCommittedPast() throws Exception {
+    start(config());
+    Sidecar sidecar = declared(deadLettering(1));
+    assign(P0);
+    add(P0, 0, "a");
+    add(P0, 1, "b");
+    sidecar.credits(10);
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+    sidecar.reject(0, 0);
+    MockProducer<byte[], byte[]> producer = producer();
+    eventually("the dead letter is sent", () -> producer.history().size() == 1);
+    RecordingConsumer kafka = kafka();
+    // Never acknowledged: the hand-over waits out its grace, and the record is the next owner's.
+    service.shutdown(Duration.ofSeconds(5));
+    assertThat(sidecar.status().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+    assertThat(kafka.commits.getOrDefault(P0, -1L)).isLessThanOrEqualTo(0);
+    assertThat(producer.closed()).isTrue();
   }
 
   // -------------------------------------------------------------------------------------------
@@ -686,6 +996,10 @@ class DispatchServiceTest {
     add(P1, 1, "c");
     sidecar.ack(1, 0, 0);
     assertThat(sidecar.records(1)).containsExactly("1/1/1");
+    assertThat(metric("odradek.dispatch.handovers", "outcome", "completed")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.handovers")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.handover.records")).isZero();
+    assertThat(metric("odradek.consume.rebalances", "event", "revoked")).isEqualTo(1);
   }
 
   @Test
@@ -702,7 +1016,12 @@ class DispatchServiceTest {
     DeliverResponse response = sidecar.next();
     assertThat(response.hasReleased()).as("%s", response).isTrue();
     assertThat(response.getReleased().getPartitionsList()).containsExactly(0);
-    assertThat(committed(P0)).isEqualTo(1);
+    // The sidecar is told first and the commit follows, before the partition is given up.
+    eventually("what was acknowledged is committed", () -> committedNow(P0) == 1);
+    // The wait ran out, with one record sent that the next owner sends again.
+    assertThat(metric("odradek.dispatch.handovers", "outcome", "deadline")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.handovers")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.handover.records", "topic", "orders")).isEqualTo(1);
   }
 
   @Test

@@ -37,6 +37,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 | `conformance/scenarios/` | YAML scenarios that every core must pass |
 | `extension/java/` | `RecordTransform`, the interface codec extension jars implement |
 | `e2e/` | Suites against real brokers, for the server and each client |
+| `deploy/kubernetes/` | Example manifests: a dispatcher, and an application pod that consumes through it. Not built or published; `ExampleManifestsTest` loads the configurations they embed |
 | `bazel/` | Build rules and macros shared across packages |
 
 ## Things to know before changing code
@@ -49,6 +50,8 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 - **Version.** One version for everything, in `bazel/version.bzl`. Do not edit it by hand; the release workflow sets it from the tag with `scripts/set-version.sh`.
 - **Tests that create topics** must wait for partition leaders before producing (see `ServerHarness.createTopic`); producing sooner can wedge Kafka's idempotent producer for minutes.
 - **Tests that start a dispatcher** go through `DispatcherHarness`, which gives each one a coordination group of its own: every suite uses the same brokers, and dispatchers that shared a group would be each other's replicas. Further replicas of one dispatcher come from `replica()`.
+- **Dead-letter headers.** The `odradek-*` headers a dispatcher adds to a dead letter (`DeadLetters`) are a contract with whoever reads dead-letter topics, like metric names: add, do not rename.
+- **Example manifests.** A change to the configuration schema, a default port, a probe or how long a dispatcher takes to stop has to stay true in `deploy/kubernetes`; `ExampleManifestsTest` (in `//server:main_test`) fails on what it can check. Nothing applies them to a cluster.
 - **Design changes.** Update `docs/design.md` in the same change. A decision that constrains future work gets a new ADR in `docs/adr/`, in the format of the existing ones.
 
 ## Workflow

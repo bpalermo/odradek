@@ -7,6 +7,7 @@ import build.buf.protovalidate.Validator;
 import build.buf.protovalidate.ValidatorFactory;
 import build.buf.protovalidate.exceptions.ValidationException;
 import com.google.protobuf.Duration;
+import com.google.protobuf.util.Durations;
 import io.github.bpalermo.odradek.config.v1.Admin;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.Codec;
@@ -868,7 +869,9 @@ class ServerConfigValidationTest {
             c ->
                 c.setMaxAttempts(3)
                     .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
-                    .setDeadLetterTopic("orders.dlq"));
+                    .setDeadLetterTopic("orders.dlq"),
+            c -> c.setRedeliveryBackoff(Durations.fromSeconds(1)),
+            c -> c.setRedeliveryBackoffMax(Durations.fromSeconds(1)));
     for (var setting : settings) {
       var direct = ordersConsumer();
       setting.accept(direct);
@@ -902,6 +905,40 @@ class ServerConfigValidationTest {
                 .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
                 .setDeadLetterTopic("payments.dlq")),
         "consumer.on_exhausted_needs_max_attempts");
+  }
+
+  @Test
+  void theRedeliveryBackoffMustNotExceedItsMaximum() throws ValidationException {
+    assertViolates(
+        receiving(
+            dispatched()
+                .setRedeliveryBackoff(Durations.fromSeconds(5))
+                .setRedeliveryBackoffMax(Durations.fromSeconds(4))),
+        "consumer.redelivery_backoff_within_max");
+    // Either alone, both equal, and none at all are fine.
+    for (var consumer :
+        List.of(
+            dispatched().setRedeliveryBackoff(Durations.fromSeconds(90)),
+            dispatched().setRedeliveryBackoffMax(Durations.fromMillis(100)),
+            dispatched()
+                .setRedeliveryBackoff(Durations.fromSeconds(2))
+                .setRedeliveryBackoffMax(Durations.fromSeconds(2)),
+            dispatched().setRedeliveryBackoff(Durations.ZERO))) {
+      assertThat(ruleIds(receiving(consumer))).isEmpty();
+    }
+  }
+
+  @Test
+  void aRedeliveryBackoffIsNeitherNegativeNorLongerThanADay() throws ValidationException {
+    assertViolates(
+        receiving(dispatched().setRedeliveryBackoff(Durations.fromSeconds(-1))),
+        "duration.gte_lte");
+    assertViolates(
+        receiving(dispatched().setRedeliveryBackoffMax(Durations.fromSeconds(86_401))),
+        "duration.gte_lte");
+    assertThat(
+            ruleIds(receiving(dispatched().setRedeliveryBackoffMax(Durations.fromSeconds(86_400)))))
+        .isEmpty();
   }
 
   @Test

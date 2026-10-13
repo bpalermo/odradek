@@ -522,8 +522,13 @@ message Consumer {
   // 2 is CONSUMER_SOURCE_DISPATCHER.
   option (buf.validate.message).cel = {
     id: "consumer.dispatcher_settings"
-    message: "ordering, max_attempts, on_exhausted and dead_letter_topic need source CONSUMER_SOURCE_DISPATCHER"
-    expression: "this.source == 2 || (!has(this.ordering) && !has(this.max_attempts) && !has(this.on_exhausted) && !has(this.dead_letter_topic))"
+    message: "ordering, max_attempts, on_exhausted, dead_letter_topic, redelivery_backoff and redelivery_backoff_max need source CONSUMER_SOURCE_DISPATCHER"
+    expression: "this.source == 2 || (!has(this.ordering) && !has(this.max_attempts) && !has(this.on_exhausted) && !has(this.dead_letter_topic) && !has(this.redelivery_backoff) && !has(this.redelivery_backoff_max))"
+  };
+  option (buf.validate.message).cel = {
+    id: "consumer.redelivery_backoff_within_max"
+    message: "redelivery_backoff must not exceed redelivery_backoff_max"
+    expression: "!has(this.redelivery_backoff) || !has(this.redelivery_backoff_max) || this.redelivery_backoff <= this.redelivery_backoff_max"
   };
   option (buf.validate.message).cel = {
     id: "consumer.on_exhausted_needs_max_attempts"
@@ -597,6 +602,11 @@ message Consumer {
   // used one up. At least 1. Unset means there is no limit: the record is
   // delivered again until it is acknowledged. Only with
   // CONSUMER_SOURCE_DISPATCHER.
+  //
+  // The count is kept in the memory of the dispatcher replica that owns the
+  // record's partition, and starts again when the partition moves to another
+  // replica: a record can be delivered more than max_attempts times in all
+  // when the dispatcher is rolled, resized or restarted meanwhile.
   uint32 max_attempts = 11 [(buf.validate.field).uint32.gte = 1];
   // What happens to a record that has been delivered max_attempts times
   // without being acknowledged. Needs max_attempts. Only with
@@ -607,6 +617,28 @@ message Consumer {
   // cannot be the topic itself. Required with ON_EXHAUSTED_DEAD_LETTER and
   // rejected otherwise.
   string dead_letter_topic = 13 [(buf.validate.field).string.pattern = "^[a-zA-Z0-9._-]{1,249}$"];
+  // How long the dispatcher waits before it delivers a record again after
+  // its first failed delivery (a missed processing deadline, or a record
+  // that could not be decoded). The wait doubles with each further failure
+  // of the same record, up to redelivery_backoff_max. Meanwhile the record
+  // holds back what the ordering makes wait for it: the later records of its
+  // key under ORDERING_KEY, of its partition under ORDERING_PARTITION. Zero
+  // delivers again at once. A record delivered again because the app's
+  // stream ended does not wait. At most 24h. Every server of the group must
+  // say the same. Only with CONSUMER_SOURCE_DISPATCHER. Default: 1s, or
+  // redelivery_backoff_max when that is less.
+  google.protobuf.Duration redelivery_backoff = 14 [(buf.validate.field).duration = {
+    gte: {}
+    lte: {seconds: 86400}
+  }];
+  // The longest wait before a record is delivered again, however many times
+  // it has failed. At most 24h. Every server of the group must say the same.
+  // Only with CONSUMER_SOURCE_DISPATCHER. Default: 30s, or
+  // redelivery_backoff when that is more.
+  google.protobuf.Duration redelivery_backoff_max = 15 [(buf.validate.field).duration = {
+    gte: {}
+    lte: {seconds: 86400}
+  }];
 }
 
 // ConsumerSource says who reads a topic from Kafka on behalf of the app.
@@ -655,7 +687,11 @@ enum OnExhausted {
   // lost, and the partition's lag grows until someone intervenes.
   ON_EXHAUSTED_BLOCK = 1;
   // The dispatcher writes the record, as stored, to
-  // Consumer.dead_letter_topic and moves on. The app never processes it.
+  // Consumer.dead_letter_topic, with headers that say where it came from,
+  // and moves on once the brokers have acknowledged the write. A write that
+  // fails is tried again, and nothing is committed past the record
+  // meanwhile. A record can be written there more than once (a dispatcher
+  // that stops between the write and the commit), never lost.
   ON_EXHAUSTED_DEAD_LETTER = 2;
 }
 

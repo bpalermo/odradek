@@ -1,6 +1,7 @@
 package io.github.bpalermo.odradek.server.dispatch;
 
 import com.google.protobuf.ByteString;
+import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Cause;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Commit;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.DeadLetter;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Deliver;
@@ -64,14 +65,22 @@ import java.util.TreeSet;
  *       attempt, and the record is delivered again. It goes to a different receiver if one has
  *       credit at that moment, and back to the same one otherwise: waiting for another receiver
  *       could wait for ever.
+ *   <li><b>The wait before a redelivery.</b> A record whose attempt failed is not sent again before
+ *       {@link DispatchSettings#redeliveryBackoff}, doubled for each failed attempt after the first
+ *       and at most {@link DispatchSettings#redeliveryBackoffMax}. While it waits it is
+ *       unacknowledged like any other: under {@link Ordering#KEY} the later records of its key wait
+ *       behind it, under {@link Ordering#PARTITION} the rest of its partition does, the commit
+ *       position stays at or below it, and so the window still bounds what the other keys are sent
+ *       meanwhile. A record whose receiver left does not wait.
  *   <li><b>A receiver that leaves</b> fails nothing: what was in flight to it is delivered again
  *       <em>with the same attempt number</em>. A stream that ends says something about the pod, not
  *       about the record, and rolling the application must not use up the attempts of whatever
  *       happened to be in flight (with a limit and {@link OnExhausted#BLOCK} it would block
  *       partitions).
  *   <li><b>Exhaustion.</b> A record whose attempts are used up is either dead-lettered (it stays
- *       unacknowledged until {@link DeadLetterWritten}; a failed write is asked for again) or
- *       blocks its partition, see below.
+ *       unacknowledged until {@link DeadLetterWritten}; a failed write is asked for again, after
+ *       {@link DispatchSettings#deadLetterRetry} doubled for each failure, for as long as the core
+ *       has the partition) or blocks its partition, see below.
  *   <li><b>The commit position</b> of a partition: the offset of its oldest record that is not
  *       acknowledged, or one past the last fetched record when there is none. Offsets that hold no
  *       record (compacted away, transaction markers) are not waited for. {@link Commit} is emitted
@@ -109,17 +118,19 @@ import java.util.TreeSet;
  *
  * <h2>Giving partitions up</h2>
  *
- * <p>{@link PartitionsRevoked} stops sending for those partitions and drops what was not in flight.
- * Each is released when nothing of it is in flight or being dead-lettered any more, or when {@link
- * DispatchSettings#revokeGrace} has passed: the core emits the last {@link Commit} if the position
- * moved, a {@link Drop} for every receiver still holding its records, and {@link
- * PartitionReleased}. {@link PartitionsLost} emits the {@link Drop}s and nothing else.
+ * <p>{@link PartitionsRevoked} stops sending for those partitions and drops what was not in flight,
+ * a record waiting to be sent again and a dead letter waiting to be written again included: only a
+ * dead letter whose write is under way is still waited for. Each partition is released when nothing
+ * of it is in flight or being written any more, or when {@link DispatchSettings#revokeGrace} has
+ * passed: the core emits the last {@link Commit} if the position moved, a {@link Drop} for every
+ * receiver still holding its records, and {@link PartitionReleased}. {@link PartitionsLost} emits
+ * the {@link Drop}s and nothing else.
  *
  * <h2>Time</h2>
  *
  * <p>Times are nanoseconds of a monotonic clock, compared as {@link System#nanoTime} values are. A
- * time earlier than one already seen is taken as that one. Deadlines are checked only on {@link
- * TimePassed}; {@link #nextDeadlineNanos} says when the next one is due.
+ * time earlier than one already seen is taken as that one. Deadlines and waits are checked only on
+ * {@link TimePassed}; {@link #nextDeadlineNanos} says when the next one is due.
  *
  * <p>The processing deadline is the one setting that can change while the core runs ({@link
  * #maxProcessing}): a record keeps the deadline in force when it was sent.
@@ -140,7 +151,10 @@ public final class DispatchCore<R> {
     WAITING,
     /** May be sent as soon as a receiver has credit. */
     READY,
+    /** Its last attempt failed, and it is not to be sent again yet. */
+    DELAYED,
     IN_FLIGHT,
+    /** Exhausted; its dead letter is being written, or waits to be written again. */
     DEAD_LETTERING,
     /** Exhausted, and blocking its partition. */
     BLOCKED,
@@ -176,6 +190,24 @@ public final class DispatchCore<R> {
 
     /** Where the last attempt failed. */
     Receiver<R> avoid;
+
+    /** Why it is next sent again, or was given up on: how its last delivery ended. */
+    Cause cause = Cause.NONE;
+
+    /** What the receiver that rejected it last said, if it said anything. */
+    String detail;
+
+    /** While {@link State#DEAD_LETTERING}: whether the write was asked for and not answered. */
+    boolean writing;
+
+    /** Writes of its dead letter that failed. */
+    int deadLetterFailures;
+
+    /** While it is among the timers: when it is due, and what orders it among those due then. */
+    long dueAt;
+
+    long timerSeq;
+    boolean timed;
 
     Rec(Part<R> part, long offset, int size, ByteString key, R payload) {
       this.part = part;
@@ -234,6 +266,12 @@ public final class DispatchCore<R> {
     boolean draining;
     long drainStart;
 
+    /** Whether its oldest pending record is held back by the window. */
+    boolean atWindow;
+
+    /** The records this core sent that are still at or above the commit position. */
+    int sent;
+
     Part(int id, long position) {
       this.id = id;
       this.end = position;
@@ -271,6 +309,28 @@ public final class DispatchCore<R> {
 
   private final DispatchSettings settings;
   private final long revokeGraceNanos;
+  private final long redeliveryBackoffNanos;
+  private final long redeliveryBackoffMaxNanos;
+  private final long deadLetterRetryNanos;
+  private final long deadLetterRetryMaxNanos;
+
+  /**
+   * The records waiting for a time: {@link State#DELAYED} ones to be sent again, and {@link
+   * State#DEAD_LETTERING} ones whose write failed to be written again. Earliest first.
+   */
+  private final TreeSet<Rec<R>> timers =
+      new TreeSet<>(
+          (a, b) -> {
+            // Times of a monotonic clock, a few waits apart: compared as nanoTime values are.
+            long difference = a.dueAt - b.dueAt;
+            return difference != 0
+                ? (difference < 0 ? -1 : 1)
+                : Long.compare(a.timerSeq, b.timerSeq);
+          });
+
+  private long timerSeq;
+  private int atWindow;
+  private long windowPauses;
 
   private final TreeMap<Integer, Part<R>> partitions = new TreeMap<>();
 
@@ -306,6 +366,10 @@ public final class DispatchCore<R> {
     this.settings = settings;
     flights.add(new Flight<>(settings.maxProcessing().toNanos()));
     this.revokeGraceNanos = settings.revokeGrace().toNanos();
+    this.redeliveryBackoffNanos = settings.redeliveryBackoff().toNanos();
+    this.redeliveryBackoffMaxNanos = settings.redeliveryBackoffMax().toNanos();
+    this.deadLetterRetryNanos = settings.deadLetterRetry().toNanos();
+    this.deadLetterRetryMaxNanos = settings.deadLetterRetryMax().toNanos();
   }
 
   /** Applies one event at the given time and returns what the caller must do, in order. */
@@ -362,6 +426,20 @@ public final class DispatchCore<R> {
   }
 
   /**
+   * The number of partitions held back by the window now: those with a fetched record that is not
+   * sent because the partition's oldest unacknowledged record is {@link DispatchSettings#window}
+   * offsets or more below it.
+   */
+  public int atWindow() {
+    return atWindow;
+  }
+
+  /** How many times a partition came to be held back by the window, since the core exists. */
+  public long windowPauses() {
+    return windowPauses;
+  }
+
+  /**
    * Changes the processing deadline, for the records sent from now on: it comes from the
    * application, and so changes with its versions while the other settings stay. What is in flight
    * keeps the deadline it was sent under.
@@ -382,12 +460,13 @@ public final class DispatchCore<R> {
   }
 
   /**
-   * When {@link TimePassed} is next needed: the earliest processing deadline or end of a hand-over
-   * wait. Empty when nothing is in flight and nothing is being handed over.
+   * When {@link TimePassed} is next needed: the earliest processing deadline, end of a wait before
+   * a redelivery or a dead letter, or end of a hand-over wait. Empty when nothing is in flight,
+   * nothing waits and nothing is being handed over.
    */
   public OptionalLong nextDeadlineNanos() {
-    boolean any = false;
-    long earliest = 0;
+    boolean any = !timers.isEmpty();
+    long earliest = any ? timers.first().dueAt : 0;
     for (Flight<R> flight : flights) {
       if (flight.records.isEmpty()) {
         continue;
@@ -424,7 +503,7 @@ public final class DispatchCore<R> {
     for (int id : e.partitions()) {
       Part<R> p = partitions.get(id);
       if (p == null) {
-        out.add(new PartitionReleased<>(id));
+        out.add(new PartitionReleased<>(id, true, 0));
       } else if (!p.draining) {
         startHandOver(p);
       }
@@ -437,24 +516,28 @@ public final class DispatchCore<R> {
     p.drainStart = now;
     draining.add(p);
     sendable.remove(p);
+    atWindow(p, false);
     p.pending.clear();
     p.ready.clear();
     p.lanes.clear();
     p.blocked.clear();
     p.buffered = 0;
     p.bufferedBytes = 0;
+    // A dead letter that waits to be written again is not written by this replica any more. One
+    // whose write is under way is still waited for.
+    p.deadLettering.values().removeIf(rec -> !rec.writing);
     // Whatever follows the last record that can still be acknowledged is forgotten: the next
     // owner fetches it again.
     for (Rec<R> last = p.log.peekLast();
         last != null && !reachable(last);
         last = p.log.peekLast()) {
       p.log.pollLast();
+      untime(last);
       p.end = last.offset;
     }
     for (Rec<R> rec : p.log) {
-      if (rec.state != State.IN_FLIGHT
-          && rec.state != State.DEAD_LETTERING
-          && rec.state != State.ACKED) {
+      if (rec.state != State.IN_FLIGHT && !writing(rec) && rec.state != State.ACKED) {
+        untime(rec);
         rec.state = State.DROPPED;
         rec.payload = null;
         rec.key = null;
@@ -462,9 +545,13 @@ public final class DispatchCore<R> {
     }
   }
 
+  private static <R> boolean writing(Rec<R> rec) {
+    return rec.state == State.DEAD_LETTERING && rec.writing;
+  }
+
   private static <R> boolean reachable(Rec<R> rec) {
     return rec.state == State.IN_FLIGHT
-        || rec.state == State.DEAD_LETTERING
+        || writing(rec)
         || rec.state == State.ACKED
         || (rec.former != null && !rec.former.isEmpty());
   }
@@ -487,12 +574,16 @@ public final class DispatchCore<R> {
     }
     List<Part<R>> done = new ArrayList<>();
     for (Part<R> p : draining) {
-      if ((p.inFlight == 0 && p.deadLettering.isEmpty())
-          || now - p.drainStart >= revokeGraceNanos) {
+      if (answered(p) || now - p.drainStart >= revokeGraceNanos) {
         done.add(p);
       }
     }
     release(done, true, out);
+  }
+
+  /** Whether nothing of the partition is in flight or being written as a dead letter. */
+  private static <R> boolean answered(Part<R> p) {
+    return p.inFlight == 0 && p.deadLettering.isEmpty();
   }
 
   /** Forgets partitions, and tells the receivers that hold their records to drop them. */
@@ -500,14 +591,18 @@ public final class DispatchCore<R> {
     if (gone.isEmpty()) {
       return;
     }
+    List<PartitionReleased<R>> released = new ArrayList<>();
     for (Part<R> p : gone) {
       if (handOver) {
         commit(p, out);
+        released.add(new PartitionReleased<>(p.id, answered(p), p.sent));
       }
       partitions.remove(p.id);
       sendable.remove(p);
       draining.remove(p);
+      atWindow(p, false);
       for (Rec<R> rec : p.log) {
+        untime(rec);
         if (rec.state == State.IN_FLIGHT) {
           land(rec);
         }
@@ -529,11 +624,7 @@ public final class DispatchCore<R> {
         out.add(new Drop<>(r.id, dropped));
       }
     }
-    if (handOver) {
-      for (Part<R> p : gone) {
-        out.add(new PartitionReleased<>(p.id));
-      }
-    }
+    out.addAll(released);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -587,8 +678,10 @@ public final class DispatchCore<R> {
     long commit = p.commit();
     for (Rec<R> rec = p.pending.peekFirst(); rec != null; rec = p.pending.peekFirst()) {
       if (rec.offset - commit >= settings.window()) {
+        atWindow(p, true);
         return;
       }
+      atWindow(p, false);
       if (settings.ordering() == Ordering.PARTITION && p.log.peekFirst() != rec) {
         return;
       }
@@ -609,6 +702,44 @@ public final class DispatchCore<R> {
         rec.state = State.WAITING;
       }
     }
+    atWindow(p, false);
+  }
+
+  private void atWindow(Part<R> p, boolean held) {
+    if (p.atWindow == held) {
+      return;
+    }
+    p.atWindow = held;
+    if (held) {
+      atWindow++;
+      windowPauses++;
+    } else {
+      atWindow--;
+    }
+  }
+
+  /** Makes a record wait until {@code dueAt}. */
+  private void time(Rec<R> rec, long dueAt) {
+    rec.dueAt = dueAt;
+    rec.timerSeq = timerSeq++;
+    rec.timed = true;
+    timers.add(rec);
+  }
+
+  private void untime(Rec<R> rec) {
+    if (rec.timed) {
+      timers.remove(rec);
+      rec.timed = false;
+    }
+  }
+
+  /** {@code first} doubled {@code doublings} times, and at most {@code longest}. */
+  private static long doubled(long first, long longest, int doublings) {
+    if (first <= 0) {
+      return 0;
+    }
+    int shift = Math.min(Math.max(doublings, 0), 62);
+    return first > (longest >> shift) ? longest : first << shift;
   }
 
   private void ready(Rec<R> rec) {
@@ -672,9 +803,17 @@ public final class DispatchCore<R> {
     rec.flight.records.add(rec);
     inFlight++;
     p.inFlight++;
-    out.add(new Deliver<>(r.id, p.id, rec.offset, rec.payload, rec.attempts));
+    out.add(
+        new Deliver<>(
+            r.id,
+            p.id,
+            rec.offset,
+            rec.payload,
+            rec.attempts,
+            rec.delivered ? rec.cause : Cause.NONE));
     if (!rec.delivered) {
       rec.delivered = true;
+      p.sent++;
       p.buffered--;
       p.bufferedBytes -= rec.size;
       if (p.paused
@@ -727,6 +866,7 @@ public final class DispatchCore<R> {
       return;
     }
     rec.attempts--;
+    rec.cause = Cause.RECEIVER_LEFT;
     ready(rec);
     refresh(p);
   }
@@ -772,7 +912,8 @@ public final class DispatchCore<R> {
     unhold(r, rec);
     if (rec.holder == r) {
       rec.avoid = r;
-      failed(rec, out);
+      failed(
+          rec, Cause.REJECTED, e.reason() == null || e.reason().isEmpty() ? null : e.reason(), out);
     } else {
       // Given back after its deadline passed: that attempt has failed already.
       rec.former.remove(r);
@@ -791,9 +932,40 @@ public final class DispatchCore<R> {
         }
         rec.former.add(rec.holder);
         rec.avoid = rec.holder;
-        failed(rec, out);
+        failed(rec, Cause.DEADLINE, null, out);
       }
     }
+    // What has waited long enough: a record to send again, a dead letter to write again.
+    for (Rec<R> rec = due(); rec != null; rec = due()) {
+      untime(rec);
+      if (rec.state == State.DELAYED) {
+        ready(rec);
+        refresh(rec.part);
+      } else {
+        writeDeadLetter(rec, out);
+      }
+    }
+  }
+
+  private Rec<R> due() {
+    if (timers.isEmpty()) {
+      return null;
+    }
+    Rec<R> first = timers.first();
+    return now - first.dueAt >= 0 ? first : null;
+  }
+
+  private void writeDeadLetter(Rec<R> rec, List<DispatchAction<R>> out) {
+    rec.writing = true;
+    out.add(
+        new DeadLetter<>(
+            rec.part.id,
+            rec.offset,
+            rec.payload,
+            rec.attempts,
+            rec.cause,
+            rec.detail,
+            rec.deadLetterFailures));
   }
 
   private static <R> Rec<R> oldest(Flight<R> flight) {
@@ -823,8 +995,24 @@ public final class DispatchCore<R> {
   private void deadLetterFailed(DeadLetterFailed<R> e, List<DispatchAction<R>> out) {
     Part<R> p = partitions.get(e.partition());
     Rec<R> rec = p == null ? null : p.deadLettering.get(e.offset());
-    if (rec != null) {
-      out.add(new DeadLetter<>(p.id, rec.offset, rec.payload, rec.attempts));
+    if (rec == null || !rec.writing) {
+      // Not being written: the answer to a write this core has given up on, or asked for again.
+      return;
+    }
+    rec.writing = false;
+    if (p.draining) {
+      // The next owner delivers the record again, and dead-letters it if it must.
+      p.deadLettering.remove(rec.offset);
+      rec.state = State.DROPPED;
+      rec.payload = null;
+      return;
+    }
+    long wait = doubled(deadLetterRetryNanos, deadLetterRetryMaxNanos, rec.deadLetterFailures);
+    rec.deadLetterFailures++;
+    if (wait == 0) {
+      writeDeadLetter(rec, out);
+    } else {
+      time(rec, now + wait);
     }
   }
 
@@ -833,14 +1021,16 @@ public final class DispatchCore<R> {
   // ---------------------------------------------------------------------------------------------
 
   /**
-   * The attempt in flight failed: the record is to be delivered again, or is exhausted. The caller
-   * has dealt with the receiver's side of it.
+   * The attempt in flight failed: the record is to be delivered again, after a wait, or is
+   * exhausted. The caller has dealt with the receiver's side of it.
    */
-  private void failed(Rec<R> rec, List<DispatchAction<R>> out) {
+  private void failed(Rec<R> rec, Cause cause, String detail, List<DispatchAction<R>> out) {
     Part<R> p = rec.part;
     land(rec);
     p.inFlight--;
     rec.holder = null;
+    rec.cause = cause;
+    rec.detail = detail;
     if (p.draining) {
       rec.state = State.DROPPED;
       rec.payload = null;
@@ -850,7 +1040,7 @@ public final class DispatchCore<R> {
       if (settings.onExhausted() == OnExhausted.DEAD_LETTER) {
         rec.state = State.DEAD_LETTERING;
         p.deadLettering.put(rec.offset, rec);
-        out.add(new DeadLetter<>(p.id, rec.offset, rec.payload, rec.attempts));
+        writeDeadLetter(rec, out);
       } else {
         rec.state = State.BLOCKED;
         p.blocked.add(rec.offset);
@@ -859,8 +1049,14 @@ public final class DispatchCore<R> {
       }
       return;
     }
-    ready(rec);
-    refresh(p);
+    long wait = doubled(redeliveryBackoffNanos, redeliveryBackoffMaxNanos, rec.attempts - 1);
+    if (wait == 0) {
+      ready(rec);
+      refresh(p);
+    } else {
+      rec.state = State.DELAYED;
+      time(rec, now + wait);
+    }
   }
 
   /** The record is done with. The caller settles the partition afterwards. */
@@ -871,7 +1067,12 @@ public final class DispatchCore<R> {
         land(rec);
         p.inFlight--;
       }
-      case DEAD_LETTERING -> p.deadLettering.remove(rec.offset);
+      case DEAD_LETTERING -> {
+        p.deadLettering.remove(rec.offset);
+        untime(rec);
+        rec.writing = false;
+      }
+      case DELAYED -> untime(rec);
       case BLOCKED -> {
         p.blocked.remove(rec.offset);
         if (p.blocked.isEmpty()) {
@@ -895,6 +1096,7 @@ public final class DispatchCore<R> {
     rec.former = null;
     rec.avoid = null;
     rec.payload = null;
+    rec.detail = null;
     rec.state = State.ACKED;
     if (rec.key != null && !p.draining) {
       // The next record of the key takes its turn.
@@ -915,6 +1117,8 @@ public final class DispatchCore<R> {
         oldest != null && oldest.state == State.ACKED;
         oldest = p.log.peekFirst()) {
       p.log.pollFirst();
+      // Only a record that was sent is ever acknowledged.
+      p.sent--;
     }
     admit(p);
     refresh(p);

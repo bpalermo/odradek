@@ -168,9 +168,13 @@ class ConsumeE2eTest {
 
   @BeforeEach
   void start() throws Exception {
-    for (String name : List.of(topic, timed, latest)) {
+    for (String name : List.of(topic, latest)) {
       ServerHarness.createTopic(ServerHarness.KAFKA_A, name, PARTITIONS);
     }
+    // Its records are written with timestamps years old: kept whatever their age, or the brokers'
+    // retention check removes them when it happens to run before they are read.
+    ServerHarness.createTopic(
+        ServerHarness.KAFKA_A, timed, PARTITIONS, java.util.Map.of("retention.ms", "-1"));
     harness =
         ServerHarness.start(
             """

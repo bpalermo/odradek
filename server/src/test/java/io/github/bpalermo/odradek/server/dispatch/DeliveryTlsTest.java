@@ -183,6 +183,7 @@ class DeliveryTlsTest {
               consumers.add(consumer);
               return consumer;
             },
+            new DeadLetters(config, TlsSources.none(), ServerMetrics.noop()),
             System::nanoTime);
     delivery = DeliveryServer.start(config.getDispatch(), service, listenerCredentials);
     service.replicas(ReplicaAssignor.self(delivery.advertisedAddress(), 1));

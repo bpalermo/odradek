@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server.receive;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.util.Durations;
 import com.google.protobuf.util.Timestamps;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.Codec;
@@ -47,6 +48,11 @@ import io.grpc.Status;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.stub.StreamObserver;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.LongPointData;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -354,6 +360,38 @@ class ReceiveServiceTest {
         .putConsumers("refunds", dispatched().build());
   }
 
+  /** Metrics are read back from the SDK, so that what a dashboard would show is what is checked. */
+  private final InMemoryMetricReader reader = InMemoryMetricReader.create();
+
+  private final SdkMeterProvider provider =
+      SdkMeterProvider.builder().registerMetricReader(reader).build();
+  private final ServerMetrics metrics = new ServerMetrics(provider.get("odradek"));
+
+  /**
+   * The sum of the points of a metric whose attributes include these, given as name and value in
+   * turn; 0 when it has none.
+   */
+  private long metric(String name, String... attributes) {
+    long total = 0;
+    for (MetricData data : reader.collectAllMetrics()) {
+      if (!data.getName().equals(name)) {
+        continue;
+      }
+      for (LongPointData point : data.getLongSumData().getPoints()) {
+        boolean matches = true;
+        for (int i = 0; i < attributes.length; i += 2) {
+          matches &=
+              attributes[i + 1].equals(
+                  point.getAttributes().get(AttributeKey.stringKey(attributes[i])));
+        }
+        if (matches) {
+          total += point.getValue();
+        }
+      }
+    }
+    return total;
+  }
+
   private void start(ServerConfig.Builder builder) throws Exception {
     ServerConfig config = builder.build();
     codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
@@ -362,12 +400,11 @@ class ReceiveServiceTest {
             new ReceiveSession.Options(
                 service,
                 "1.2.3",
-                Duration.ofMillis(50),
                 Duration.ofSeconds(2),
                 System::nanoTime,
                 // The shortest delays: 50 ms, 100 ms, 200 ms and so on.
                 () -> new Backoff(bound -> 0)),
-            ServerMetrics.noop(),
+            metrics,
             address -> {
               ManagedChannel channel = InProcessChannelBuilder.forName(address).build();
               synchronized (dispatcherChannels) {
@@ -411,6 +448,7 @@ class ReceiveServiceTest {
     for (Server server : servers) {
       server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
     }
+    provider.close();
   }
 
   private App app() {
@@ -474,6 +512,8 @@ class ReceiveServiceTest {
                         io.github.bpalermo.odradek.config.v1.OffsetReset.OFFSET_RESET_LATEST)
                     .setStartTimestamp(Timestamps.fromMillis(1_700_000_000_000L))
                     .setMaxAttempts(3)
+                    .setRedeliveryBackoff(Durations.fromMillis(250))
+                    .setRedeliveryBackoffMax(Durations.fromSeconds(90))
                     .build()));
     App app = app();
     app.subscribe(45_000, "orders");
@@ -494,6 +534,8 @@ class ReceiveServiceTest {
     assertThat(declare.getSettings().getMaxAttempts()).isEqualTo(3);
     assertThat(declare.getSettings().getMaxProcessingMs()).isEqualTo(45_000);
     assertThat(declare.getSettings().hasDeadLetterTopic()).isFalse();
+    assertThat(declare.getSettings().getRedeliveryBackoffMs()).isEqualTo(250);
+    assertThat(declare.getSettings().getRedeliveryBackoffMaxMs()).isEqualTo(90_000);
   }
 
   @Test
@@ -507,6 +549,8 @@ class ReceiveServiceTest {
         .isEqualTo(OffsetReset.OFFSET_RESET_UNSPECIFIED);
     assertThat(declare.getSettings().hasStartTimestampMs()).isFalse();
     assertThat(declare.getSettings().getMaxAttempts()).isZero();
+    assertThat(declare.getSettings().hasRedeliveryBackoffMs()).isFalse();
+    assertThat(declare.getSettings().hasRedeliveryBackoffMaxMs()).isFalse();
     // The server's default deadline, as for a stream that reads Kafka.
     assertThat(declare.getSettings().getMaxProcessingMs()).isEqualTo(60_000);
   }
@@ -865,14 +909,15 @@ class ReceiveServiceTest {
     assertThat(offsets(batch)).containsExactly(0L, 2L);
     assertThat(values(batch)).containsExactly("a", "c");
 
-    // The credits the three records used are the app's again but for the two it holds; the
-    // rejection follows after its pause.
-    assertThat(stream.credits()).isEqualTo(1);
+    // The rejection goes back at once, before anything else is said: how long the record waits
+    // before it is delivered again is the dispatcher's business. The credits the three records
+    // used are the app's again but for the two it holds.
     DeliverRequest reject = stream.next();
     assertThat(reject.hasReject()).as("%s", reject).isTrue();
     assertThat(reject.getReject().getPartition()).isZero();
     assertThat(reject.getReject().getOffset()).isEqualTo(1);
     assertThat(reject.getReject().getReason()).contains("codec suffix value");
+    assertThat(stream.credits()).isEqualTo(1);
 
     // The stream to the app is open, and so is the one to the dispatcher.
     app.ack("orders", 0, batch.getAssignmentEpoch(), 0, 2);
@@ -946,6 +991,53 @@ class ReceiveServiceTest {
     assertThat(range(first.ack())).isEqualTo(List.of(0, 4L, 4L));
     first.nothing();
     second.nothing();
+  }
+
+  @Test
+  void aListedReplicaThatIsNotReachedShowsAsAStreamWantedAndNotOpen() throws Exception {
+    // Two replicas are listed; nothing answers at the address of the second.
+    FakeReplica one = new FakeReplica(r1);
+    serve(service, one);
+    serve(r1, one);
+    listed = list(1, r1, r2);
+    start(config());
+    App app = subscribed();
+    one.accepted();
+    waitFor("two streams are wanted", () -> metric("odradek.receive.streams.wanted") == 2);
+    assertThat(
+            metric(
+                "odradek.receive.streams.wanted",
+                "cluster",
+                "main",
+                "group",
+                "billing",
+                "topic",
+                "orders"))
+        .isEqualTo(2);
+    waitFor("it is tried again", () -> metric("odradek.receive.reconnects") >= 2);
+    assertThat(metric("odradek.receive.streams")).isEqualTo(1);
+
+    // It appears: both are open, and wanted.
+    FakeReplica two = new FakeReplica(r2);
+    serve(r2, two);
+    two.accepted();
+    waitFor("both streams are open", () -> metric("odradek.receive.streams") == 2);
+    assertThat(metric("odradek.receive.streams.wanted")).isEqualTo(2);
+
+    // And nothing is wanted once the app has gone.
+    app.requests.onCompleted();
+    assertThat(app.status()).isEqualTo(Status.OK);
+    waitFor("nothing is wanted", () -> metric("odradek.receive.streams.wanted") == 0);
+    assertThat(metric("odradek.receive.streams")).isZero();
+  }
+
+  private static void waitFor(String what, java.util.function.BooleanSupplier condition)
+      throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+      Thread.sleep(5);
+    }
+    assertThat(condition.getAsBoolean()).as(what).isTrue();
   }
 
   @Test

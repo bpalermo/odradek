@@ -1,0 +1,21 @@
+# The one address a sidecar is configured with (`dispatcher.address`). It is
+# only where a sidecar starts: the replica that answers sends the list of every
+# replica, and the sidecar then connects to each by its pod IP. Only ready
+# replicas are behind it, which is what the readiness probe is for.
+apiVersion: v1
+kind: Service
+metadata:
+  name: odradek-dispatcher
+  labels:
+    app.kubernetes.io/name: odradek-dispatcher
+    app.kubernetes.io/part-of: odradek
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: odradek-dispatcher
+  ports:
+    - name: delivery
+      port: 9465
+      targetPort: delivery
+      protocol: TCP
+      appProtocol: grpc

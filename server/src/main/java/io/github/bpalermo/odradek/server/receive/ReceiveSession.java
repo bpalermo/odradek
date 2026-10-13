@@ -1,6 +1,7 @@
 package io.github.bpalermo.odradek.server.receive;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.util.Durations;
 import com.google.protobuf.util.Timestamps;
 import io.github.bpalermo.odradek.config.v1.Consumer;
 import io.github.bpalermo.odradek.config.v1.OnDecodeError;
@@ -122,15 +123,12 @@ final class ReceiveSession implements AppStream {
    *
    * @param bootstrap {@code dispatcher.address}: where to connect while no replica is known
    * @param version this server's version, for the dispatcher's logs
-   * @param rejectPause how long an undecodable record is kept before it is rejected, so that one
-   *     that no sidecar can decode does not go round as fast as the network allows
    * @param drain how long to wait, at the end, for the dispatcher to close the streams
    * @param backoff makes the backoff of one stream
    */
   record Options(
       String bootstrap,
       String version,
-      Duration rejectPause,
       Duration drain,
       LongSupplier nanoClock,
       Supplier<Backoff> backoff) {}
@@ -226,6 +224,9 @@ final class ReceiveSession implements AppStream {
     boolean rejectLogged;
     long lastRejectLog;
 
+    /** The streams wanted for it, as last reported. */
+    int reportedWanted;
+
     Topic(
         String name,
         RecordDecoder decoder,
@@ -242,9 +243,6 @@ final class ReceiveSession implements AppStream {
 
   /** A record received and decoded, waiting for the app to have credit. */
   private record Pending(Link link, int partition, ConsumedRecord record, boolean undecodable) {}
-
-  /** A record that could not be decoded, waiting to be sent back. */
-  private record Rejection(long due, Link link, int partition, long offset, String reason) {}
 
   private final ServerCallStreamObserver<ConsumeResponse> call;
   private final Map<String, Topic> topics = new LinkedHashMap<>();
@@ -264,7 +262,6 @@ final class ReceiveSession implements AppStream {
   private final Map<Long, Link> linksById = new HashMap<>();
   private final Map<String, ManagedChannel> channels = new HashMap<>();
   private final ArrayDeque<Pending> pending = new ArrayDeque<>();
-  private final ArrayDeque<Rejection> rejections = new ArrayDeque<>();
   private volatile boolean cancelled;
   private long linkCounter;
   private boolean stalled;
@@ -334,6 +331,12 @@ final class ReceiveSession implements AppStream {
     }
     if (entry.hasDeadLetterTopic()) {
       settings.setDeadLetterTopic(entry.getDeadLetterTopic());
+    }
+    if (entry.hasRedeliveryBackoff()) {
+      settings.setRedeliveryBackoffMs((int) Durations.toMillis(entry.getRedeliveryBackoff()));
+    }
+    if (entry.hasRedeliveryBackoffMax()) {
+      settings.setRedeliveryBackoffMaxMs((int) Durations.toMillis(entry.getRedeliveryBackoffMax()));
     }
     return Declare.newBuilder()
         .setCluster(entry.getCluster())
@@ -428,8 +431,24 @@ final class ReceiveSession implements AppStream {
       long now = now();
       timers(now);
       pump(now);
+      reportWanted();
       if (exit != null) {
         return exit;
+      }
+    }
+  }
+
+  /**
+   * Reports how many streams each topic should have: one to each listed replica, and one while no
+   * list is known. Beside the streams that are open, it is what shows a replica that is listed and
+   * not reached.
+   */
+  private void reportWanted() {
+    int wanted = Math.max(1, replicas.addresses().size());
+    for (Topic topic : topics.values()) {
+      if (topic.reportedWanted != wanted) {
+        topic.metrics.wanted(wanted - topic.reportedWanted);
+        topic.reportedWanted = wanted;
       }
     }
   }
@@ -469,9 +488,6 @@ final class ReceiveSession implements AppStream {
         }
       }
     }
-    if (!rejections.isEmpty()) {
-      wait = Math.min(wait, rejections.peekFirst().due() - now);
-    }
     return Math.max(0, wait);
   }
 
@@ -494,18 +510,6 @@ final class ReceiveSession implements AppStream {
           open(topic, entry.getKey(), false);
         }
       }
-    }
-    while (!rejections.isEmpty() && now - rejections.peekFirst().due() >= 0) {
-      Rejection rejection = rejections.pollFirst();
-      rejection
-          .link()
-          .send(
-              DeliverRequest.newBuilder()
-                  .setReject(
-                      Reject.newBuilder()
-                          .setPartition(rejection.partition())
-                          .setOffset(rejection.offset())
-                          .setReason(rejection.reason())));
     }
   }
 
@@ -662,7 +666,9 @@ final class ReceiveSession implements AppStream {
   /**
    * Where a consumer that reads Kafka would end the stream with DATA_LOSS, the record goes back to
    * the dispatcher, which counts a failed attempt, and the stream stays: other pods may decode what
-   * this one cannot, and the dispatcher's limit on attempts is what stops a record nobody can.
+   * this one cannot, and the dispatcher's limit on attempts is what stops a record nobody can. It
+   * goes back at once: how long a failed record waits before it is delivered again is the
+   * dispatcher's to decide ({@code redeliveryBackoff}), in one place and for every kind of failure.
    */
   private void reject(Link link, int partition, long offset, String reason, long now) {
     Topic topic = link.topic;
@@ -682,8 +688,13 @@ final class ReceiveSession implements AppStream {
       topic.rejectLogged = true;
       topic.lastRejectLog = now;
     }
-    rejections.addLast(
-        new Rejection(now + options.rejectPause().toNanos(), link, partition, offset, reason));
+    link.send(
+        DeliverRequest.newBuilder()
+            .setReject(
+                Reject.newBuilder()
+                    .setPartition(partition)
+                    .setOffset(offset)
+                    .setReason(reason == null ? "" : reason)));
   }
 
   /** The app acknowledged: passes on what it held of the range, to the stream it came from. */
@@ -1116,6 +1127,10 @@ final class ReceiveSession implements AppStream {
       }
     }
     linksById.clear();
+    for (Topic topic : topics.values()) {
+      topic.metrics.wanted(-topic.reportedWanted);
+      topic.reportedWanted = 0;
+    }
     decoders.forEach(RecordDecoder::close);
     listener.ended(this, cancelled ? Status.Code.CANCELLED.name() : end.getCode().name());
     if (!cancelled) {

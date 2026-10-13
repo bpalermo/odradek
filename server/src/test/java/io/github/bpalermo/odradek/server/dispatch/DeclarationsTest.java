@@ -68,6 +68,8 @@ class DeclarationsTest {
                 .setOffsetReset(OffsetReset.OFFSET_RESET_EARLIEST)
                 .setMaxAttempts(0)
                 .setOnExhausted(OnExhausted.ON_EXHAUSTED_BLOCK)
+                .setRedeliveryBackoffMs(1000)
+                .setRedeliveryBackoffMaxMs(30_000)
                 .build());
     assertThat(declared.settings().hasStartTimestampMs()).isFalse();
   }
@@ -226,7 +228,7 @@ class DeclarationsTest {
   }
 
   @Test
-  void aDeadLetterTopicThePolicyDoesNotAllowIsRefusedBeforeAnythingIsSaidOfDeadLettering() {
+  void aDeadLetterTopicIsAllowedOrRefusedByThePolicyWithTheRest() throws Refused {
     Declare elsewhere =
         with(
             s ->
@@ -241,14 +243,17 @@ class DeclarationsTest {
                 + " is not allowed to consume topic orders.created in group billing on cluster"
                 + " main with dead-letter topic secret.ledger");
 
-    // An allowed one gets as far as the answer that dead-lettering is not built yet.
+    // An allowed one is accepted, and is in the settings in force.
     Declare allowed =
         with(
             s ->
                 s.setMaxAttempts(3)
                     .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
                     .setDeadLetterTopic("billing.dlq"));
-    assertThat(refused(allowed, BILLING).getCode()).isEqualTo(Status.Code.UNIMPLEMENTED);
+    Declared declared = Declarations.check(allowed, CLUSTERS, POLICY, BILLING);
+    assertThat(declared.deadLetterTopic()).isEqualTo("billing.dlq");
+    assertThat(declared.settings().getOnExhausted())
+        .isEqualTo(OnExhausted.ON_EXHAUSTED_DEAD_LETTER);
   }
 
   @Test
@@ -268,19 +273,83 @@ class DeclarationsTest {
   }
 
   @Test
-  void deadLetteringIsNotImplementedYet() {
+  void deadLetteringIsAcceptedAndBecomesTheCores() throws Refused {
     Declare declare =
         with(
             s ->
                 s.setMaxAttempts(3)
                     .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
                     .setDeadLetterTopic("orders.dlq"));
-    Status status = refused(declare);
-    assertThat(status.getCode()).isEqualTo(Status.Code.UNIMPLEMENTED);
-    assertThat(status.getDescription()).contains("ON_EXHAUSTED_DEAD_LETTER is not implemented");
-    // Not a way to learn which clusters exist.
-    assertThat(refused(declare.toBuilder().setCluster("elsewhere").build()).getCode())
-        .isEqualTo(Status.Code.PERMISSION_DENIED);
+    Declared declared = accepted(declare);
+    assertThat(declared.deadLetterTopic()).isEqualTo("orders.dlq");
+    assertThat(declared.settings().getDeadLetterTopic()).isEqualTo("orders.dlq");
+    DispatchSettings core =
+        declared.toCore(1, 1, 1, Duration.ZERO, Duration.ofSeconds(1), Duration.ofSeconds(30));
+    assertThat(core.onExhausted()).isEqualTo(DispatchSettings.OnExhausted.DEAD_LETTER);
+    assertThat(core.maxAttempts()).isEqualTo(3);
+    assertThat(core.deadLetterRetry()).isEqualTo(Duration.ofSeconds(1));
+    assertThat(core.deadLetterRetryMax()).isEqualTo(Duration.ofSeconds(30));
+    // Another dead-letter topic is another way to consume the topic.
+    assertThat(
+            accepted(
+                    with(
+                        s ->
+                            s.setMaxAttempts(3)
+                                .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                                .setDeadLetterTopic("orders.other")))
+                .agreesWith(declared.settings()))
+        .isFalse();
+    assertThat(accepted(declare().build()).deadLetterTopic()).isNull();
+    // Without a limit nothing is ever exhausted: refused where the mistake is.
+    invalid(
+        with(
+            s ->
+                s.setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                    .setDeadLetterTopic("orders.dlq")),
+        "on_exhausted needs max_attempts");
+  }
+
+  @Test
+  void theWaitBeforeARedeliveryHasDefaultsThatGiveWayToEachOther() throws Refused {
+    Settings defaults = accepted(declare().build()).settings();
+    assertThat(defaults.getRedeliveryBackoffMs()).isEqualTo(1000);
+    assertThat(defaults.getRedeliveryBackoffMaxMs()).isEqualTo(30_000);
+
+    Settings none = accepted(with(s -> s.setRedeliveryBackoffMs(0))).settings();
+    assertThat(none.hasRedeliveryBackoffMs()).isTrue();
+    assertThat(none.getRedeliveryBackoffMs()).isZero();
+    assertThat(none.getRedeliveryBackoffMaxMs()).isEqualTo(30_000);
+
+    // A first wait above the default longest one raises it, and a longest wait below the default
+    // first one lowers that.
+    Settings slow = accepted(with(s -> s.setRedeliveryBackoffMs(60_000))).settings();
+    assertThat(slow.getRedeliveryBackoffMaxMs()).isEqualTo(60_000);
+    Settings quick = accepted(with(s -> s.setRedeliveryBackoffMaxMs(200))).settings();
+    assertThat(quick.getRedeliveryBackoffMs()).isEqualTo(200);
+    assertThat(quick.getRedeliveryBackoffMaxMs()).isEqualTo(200);
+
+    Declared both =
+        accepted(with(s -> s.setRedeliveryBackoffMs(50).setRedeliveryBackoffMaxMs(400)));
+    DispatchSettings core = both.toCore(1, 1, 1, Duration.ZERO, Duration.ZERO, Duration.ZERO);
+    assertThat(core.redeliveryBackoff()).isEqualTo(Duration.ofMillis(50));
+    assertThat(core.redeliveryBackoffMax()).isEqualTo(Duration.ofMillis(400));
+
+    // It is one of the settings a group shares: declared the default way or written out, the same;
+    // otherwise another way to consume the topic.
+    assertThat(
+            accepted(with(s -> s.setRedeliveryBackoffMs(1000).setRedeliveryBackoffMaxMs(30_000)))
+                .agreesWith(defaults))
+        .isTrue();
+    assertThat(both.agreesWith(defaults)).isFalse();
+  }
+
+  @Test
+  void aWaitThatContradictsItselfOrIsLongerThanADayIsRefused() {
+    invalid(
+        with(s -> s.setRedeliveryBackoffMs(500).setRedeliveryBackoffMaxMs(400)),
+        "redelivery_backoff_ms must not exceed redelivery_backoff_max_ms");
+    invalid(with(s -> s.setRedeliveryBackoffMs(86_400_001)), "must not exceed 86400000");
+    invalid(with(s -> s.setRedeliveryBackoffMaxMs(-1)), "must not exceed 86400000");
   }
 
   @Test
@@ -324,7 +393,13 @@ class DeclarationsTest {
   void settingsBecomeTheCoresWithTheDispatchersBounds() throws Refused {
     DispatchSettings core =
         accepted(with(s -> s.setOrdering(Ordering.ORDERING_NONE).setMaxAttempts(4)))
-            .toCore(1000, 50, 4096, Duration.ofSeconds(10));
+            .toCore(
+                1000,
+                50,
+                4096,
+                Duration.ofSeconds(10),
+                Duration.ofSeconds(2),
+                Duration.ofSeconds(8));
     assertThat(core)
         .isEqualTo(
             new DispatchSettings(
@@ -335,12 +410,19 @@ class DeclarationsTest {
                 1000,
                 50,
                 4096,
-                Duration.ofSeconds(10)));
-    assertThat(accepted(declare().build()).toCore(1, 1, 1, Duration.ZERO).ordering())
+                Duration.ofSeconds(10),
+                Duration.ofSeconds(1),
+                Duration.ofSeconds(30),
+                Duration.ofSeconds(2),
+                Duration.ofSeconds(8)));
+    assertThat(
+            accepted(declare().build())
+                .toCore(1, 1, 1, Duration.ZERO, Duration.ZERO, Duration.ZERO)
+                .ordering())
         .isEqualTo(DispatchSettings.Ordering.KEY);
     assertThat(
             accepted(with(s -> s.setOrdering(Ordering.ORDERING_PARTITION)))
-                .toCore(1, 1, 1, Duration.ZERO)
+                .toCore(1, 1, 1, Duration.ZERO, Duration.ZERO, Duration.ZERO)
                 .ordering())
         .isEqualTo(DispatchSettings.Ordering.PARTITION);
   }
@@ -348,7 +430,9 @@ class DeclarationsTest {
   @Test
   void settingsAreDescribedForTheRefusalOfADifferentDeclaration() throws Refused {
     assertThat(Declarations.describe(accepted(declare().build()).settings()))
-        .isEqualTo("ordering ORDERING_KEY, offset_reset OFFSET_RESET_EARLIEST, no max_attempts");
+        .isEqualTo(
+            "ordering ORDERING_KEY, offset_reset OFFSET_RESET_EARLIEST, no max_attempts,"
+                + " redelivery_backoff_ms 1000 to 30000");
     assertThat(
             Declarations.describe(
                 accepted(
@@ -360,6 +444,21 @@ class DeclarationsTest {
                     .settings()))
         .isEqualTo(
             "ordering ORDERING_NONE, offset_reset OFFSET_RESET_EARLIEST, start_timestamp_ms 5,"
-                + " max_attempts 3, on_exhausted ON_EXHAUSTED_BLOCK");
+                + " max_attempts 3, on_exhausted ON_EXHAUSTED_BLOCK, redelivery_backoff_ms 1000 to"
+                + " 30000");
+    assertThat(
+            Declarations.describe(
+                accepted(
+                        with(
+                            s ->
+                                s.setMaxAttempts(2)
+                                    .setOnExhausted(OnExhausted.ON_EXHAUSTED_DEAD_LETTER)
+                                    .setDeadLetterTopic("orders.dlq")
+                                    .setRedeliveryBackoffMs(0)))
+                    .settings()))
+        .isEqualTo(
+            "ordering ORDERING_KEY, offset_reset OFFSET_RESET_EARLIEST, max_attempts 2,"
+                + " on_exhausted ON_EXHAUSTED_DEAD_LETTER, dead_letter_topic orders.dlq,"
+                + " redelivery_backoff_ms 0 to 30000");
   }
 }

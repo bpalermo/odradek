@@ -10,6 +10,7 @@ import io.github.bpalermo.odradek.delivery.v1.ReplicaList;
 import io.github.bpalermo.odradek.delivery.v1.Settings;
 import io.github.bpalermo.odradek.kafka.v1.Header;
 import io.github.bpalermo.odradek.server.dispatch.Declarations.Declared;
+import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Cause;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Commit;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.DeadLetter;
 import io.github.bpalermo.odradek.server.dispatch.DispatchAction.Deliver;
@@ -78,7 +79,10 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   /** The longest the thread waits for a command when nothing is happening. */
   private static final long MAX_IDLE_WAIT_MS = 10;
 
-  /** At most one line per topic in this time about records that sidecars reject. */
+  /**
+   * At most one line per topic in this time about each of: records that sidecars reject, records
+   * that used all their attempts, and dead letters that could not be written.
+   */
   private static final long REJECT_LOG_NANOS = TimeUnit.SECONDS.toNanos(10);
 
   /** The largest {@code RecordBatch}: a gRPC peer accepts 4 MiB by default. */
@@ -97,6 +101,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       Duration revokeGrace,
       Duration idleGrace,
       Duration commitInterval,
+      Duration deadLetterRetry,
+      Duration deadLetterRetryMax,
+      DeadLetters deadLetters,
       Supplier<Accepted> accepted,
       LongSupplier nanoClock) {}
 
@@ -143,7 +150,8 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   }
 
   /** Something a stream, or the dispatcher, asks of the group's thread. */
-  sealed interface Command permits Join, Credit, Acked, Reject, Leave, Announce, Shutdown {}
+  sealed interface Command
+      permits Join, Credit, Acked, Reject, Leave, Announce, DeadLettered, Shutdown {}
 
   /** A declaration that is well formed and names this group. */
   record Join(Stream stream) implements Command {}
@@ -164,16 +172,42 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   /** The dispatcher's replicas changed: every stream is sent the new list. */
   record Announce(ReplicaList replicas) implements Command {}
 
+  /**
+   * The write of a dead letter was answered: by the brokers, or by a failure, which is then not
+   * null. {@code incarnation} says which run of the topic asked for it.
+   */
+  record DeadLettered(String topic, long incarnation, int partition, long offset, Exception failure)
+      implements Command {}
+
   /** The dispatcher is stopping. */
   record Shutdown() implements Command {}
 
   /** A fetched record as its core carries it. */
-  private static final class Held {
-    final ConsumerRecord<byte[], byte[]> record;
-    boolean sent;
+  private record Held(ConsumerRecord<byte[], byte[]> record) {}
 
-    Held(ConsumerRecord<byte[], byte[]> record) {
-      this.record = record;
+  /** Counts something that happens per record, for one log line every so often. */
+  private static final class Throttled {
+    long count;
+    long lastLog;
+
+    Throttled(long now) {
+      lastLog = now - REJECT_LOG_NANOS;
+    }
+
+    /** Counts one; whether it is time for a line, which says {@link #count} and resets it. */
+    boolean due(long now) {
+      count++;
+      if (now - lastLog < REJECT_LOG_NANOS) {
+        return false;
+      }
+      lastLog = now;
+      return true;
+    }
+
+    long taken() {
+      long counted = count;
+      count = 0;
+      return counted;
     }
   }
 
@@ -196,9 +230,18 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     /** Partitions of it that the consumer has may not be the core's yet. */
     boolean adopt = true;
 
+    /**
+     * Which run of the topic this is: it changes when the topic starts again with other settings,
+     * so that the answer to a dead letter the earlier run asked for is told apart.
+     */
+    long incarnation;
+
     int reportedInFlight;
-    long rejects;
-    long lastRejectLog;
+    int reportedAtWindow;
+    long reportedWindowPauses;
+    final Throttled rejects;
+    final Throttled exhausted;
+    final Throttled deadLetterFailures;
 
     Topic(Declared declared) {
       name = declared.topic();
@@ -215,10 +258,16 @@ final class DispatchGroup implements ConsumerRebalanceListener {
               MAX_BATCH_RECORDS,
               MAX_BATCH_BYTES);
       start(declared);
-      lastRejectLog = options.nanoClock().getAsLong() - REJECT_LOG_NANOS;
+      long now = options.nanoClock().getAsLong();
+      rejects = new Throttled(now);
+      exhausted = new Throttled(now);
+      deadLetterFailures = new Throttled(now);
     }
 
-    /** Starts consuming as {@code declared} says, with nothing known of any partition. */
+    /**
+     * Starts consuming as {@code declared} says, with nothing known of any partition. What the core
+     * before it counted must have been reported.
+     */
     void start(Declared declared) {
       settings = declared.settings();
       core =
@@ -227,8 +276,12 @@ final class DispatchGroup implements ConsumerRebalanceListener {
                   options.window(),
                   options.maxBufferedRecords(),
                   options.maxBufferedBytes(),
-                  options.revokeGrace()));
+                  options.revokeGrace(),
+                  options.deadLetterRetry(),
+                  options.deadLetterRetryMax()));
       adopt = true;
+      incarnation = ++incarnations;
+      reportedWindowPauses = 0;
     }
   }
 
@@ -266,6 +319,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
 
   /** The partitions being handed over that their cores have not released yet. */
   private final Set<TopicPartition> releasing = new HashSet<>();
+
+  /** Counts the runs of this group's topics. */
+  private long incarnations;
 
   private Consumer<byte[], byte[]> consumer;
   private boolean subscriptionChanged;
@@ -398,7 +454,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         lastCommitNanos = now;
         commitAsync();
       }
-      reportInFlight();
+      topics.values().forEach(this::report);
       busy |= !records.isEmpty();
       wait = busy ? 0 : Math.min(Math.max(1, wait * 2), MAX_IDLE_WAIT_MS);
     }
@@ -462,6 +518,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
           }
         }
       }
+      case DeadLettered answer -> deadLettered(answer);
       case Shutdown shutdown -> stopping = true;
     }
   }
@@ -493,6 +550,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
           Declarations.describe(topic.settings));
     } else if (!declared.agreesWith(topic.settings)) {
       if (!topic.receivers.isEmpty()) {
+        metrics.declarationRefused(Status.Code.FAILED_PRECONDITION.name());
         end(
             stream,
             Status.FAILED_PRECONDITION.withDescription(
@@ -519,6 +577,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
           Declarations.describe(declared.settings()));
       handOver(partitionsOf(topic));
       forgetBlocked(topic);
+      report(topic);
       topic.start(declared);
     }
     if (topic.settings.getMaxProcessingMs() != declared.settings().getMaxProcessingMs()) {
@@ -573,24 +632,21 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     if (topic == null) {
       return;
     }
-    topic.rejects++;
-    long now = now();
-    if (now - topic.lastRejectLog >= REJECT_LOG_NANOS) {
+    if (topic.rejects.due(now())) {
       LOG.warn(
           "{} record(s) of topic {} rejected by sidecars of group {}; the last, {}/{} by {}: {}",
-          topic.rejects,
+          topic.rejects.taken(),
           topic.name,
           key.group(),
           reject.partition(),
           reject.offset(),
           reject.stream().sidecar,
           reject.reason());
-      topic.rejects = 0;
-      topic.lastRejectLog = now;
     }
     on(
         topic,
-        new DispatchEvent.Rejected<>(reject.stream().id, reject.partition(), reject.offset()));
+        new DispatchEvent.Rejected<>(
+            reject.stream().id, reject.partition(), reject.offset(), reject.reason()));
   }
 
   private void send(Stream stream, DeliverResponse response) {
@@ -632,8 +688,13 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     for (DispatchAction<Held> action : actions) {
       switch (action) {
         case Deliver<Held> deliver -> {
-          topic.metrics.sent(deliver.payload().sent);
-          deliver.payload().sent = true;
+          topic.metrics.sent(
+              switch (deliver.cause()) {
+                case NONE -> null;
+                case DEADLINE -> ServerMetrics.Redelivery.DEADLINE;
+                case REJECTED -> ServerMetrics.Redelivery.REJECTED;
+                case RECEIVER_LEFT -> ServerMetrics.Redelivery.RECEIVER_GONE;
+              });
           topic.batches.deliver(deliver);
         }
         case Drop<Held> drop -> topic.batches.released(drop);
@@ -655,9 +716,13 @@ final class DispatchGroup implements ConsumerRebalanceListener {
           if (topic.blocked.add(blocked.partition())) {
             topic.metrics.blocked(1);
           }
+          topic.metrics.exhausted(false);
           LOG.warn(
               "{}-{} of group {} is blocked: the record at offset {} used all its {} attempts."
-                  + " Nothing after it is delivered until the partition changes owner",
+                  + " Nothing after it is delivered, and nothing is committed past it, until the"
+                  + " partition changes owner (another replica takes it, or this one restarts),"
+                  + " which starts the attempts again, or a sidecar that still holds the record"
+                  + " acknowledges it",
               topic.name,
               blocked.partition(),
               key.group(),
@@ -674,19 +739,103 @@ final class DispatchGroup implements ConsumerRebalanceListener {
               unblocked.partition(),
               key.group());
         }
-        case PartitionReleased<Held> released ->
-            releasing.remove(new TopicPartition(topic.name, released.partition()));
-        case DeadLetter<Held> deadLetter ->
-            // Declarations asking for it are refused, so no core is set up to.
-            throw new IllegalStateException("dead-lettering is not implemented: " + deadLetter);
+        case PartitionReleased<Held> released -> {
+          if (releasing.remove(new TopicPartition(topic.name, released.partition()))) {
+            topic.metrics.handedOver(released.inTime(), released.resent());
+            if (!released.inTime()) {
+              LOG.warn(
+                  "{}-{} of group {} is given up with records still unanswered after {}: its next"
+                      + " owner delivers them again while a sidecar may still be working on them",
+                  topic.name,
+                  released.partition(),
+                  key.group(),
+                  options.revokeGrace());
+            }
+          }
+        }
+        case DeadLetter<Held> letter -> deadLetter(topic, letter);
       }
     }
     topic.batches.flush();
   }
 
+  /** Asks for an exhausted record to be written to the topic's dead-letter topic. */
+  private void deadLetter(Topic topic, DeadLetter<Held> letter) {
+    ConsumerRecord<byte[], byte[]> record = letter.payload().record();
+    String target = topic.settings.getDeadLetterTopic();
+    if (letter.retries() == 0) {
+      topic.metrics.exhausted(true);
+      if (topic.exhausted.due(now())) {
+        LOG.warn(
+            "{} record(s) of topic {} used all their {} attempts in group {} and are written to"
+                + " dead-letter topic {}; the last, {}/{}, after {}",
+            topic.exhausted.taken(),
+            topic.name,
+            topic.settings.getMaxAttempts(),
+            key.group(),
+            target,
+            record.partition(),
+            record.offset(),
+            letter.cause() == Cause.REJECTED
+                ? "a rejection: " + letter.detail()
+                : "a missed processing deadline");
+      }
+    }
+    String name = topic.name;
+    long incarnation = topic.incarnation;
+    int partition = letter.partition();
+    long offset = letter.offset();
+    options
+        .deadLetters()
+        .write(
+            key.cluster(),
+            DeadLetters.record(
+                target,
+                key.cluster(),
+                key.group(),
+                record,
+                letter.attempts(),
+                letter.cause(),
+                letter.detail()),
+            failure -> submit(new DeadLettered(name, incarnation, partition, offset, failure)));
+  }
+
+  /** The write of a dead letter was answered: only now does the record count as done. */
+  private void deadLettered(DeadLettered answer) {
+    Topic topic = topics.get(answer.topic());
+    boolean ok = answer.failure() == null;
+    (topic == null
+            ? metrics.dispatchTopic(key.cluster(), key.group(), answer.topic())
+            : topic.metrics)
+        .deadLetter(ok);
+    if (topic == null || topic.incarnation != answer.incarnation()) {
+      // Asked for by a run of the topic that is over: whoever has the partition now starts from
+      // what is committed, which is at or below this record.
+      return;
+    }
+    if (ok) {
+      on(topic, new DispatchEvent.DeadLetterWritten<>(answer.partition(), answer.offset()));
+      return;
+    }
+    if (topic.deadLetterFailures.due(now())) {
+      LOG.warn(
+          "{} write(s) to dead-letter topic {} failed for topic {} of group {}; the last, of"
+              + " {}/{}: {}. Each is made again, and nothing is committed past its record until"
+              + " it is written",
+          topic.deadLetterFailures.taken(),
+          topic.settings.getDeadLetterTopic(),
+          topic.name,
+          key.group(),
+          answer.partition(),
+          answer.offset(),
+          answer.failure().toString());
+    }
+    on(topic, new DispatchEvent.DeadLetterFailed<>(answer.partition(), answer.offset()));
+  }
+
   /** A record as a sidecar receives it: the bytes stored in Kafka, untouched. */
   private static Record toRecord(Held held, int attempt) {
-    ConsumerRecord<byte[], byte[]> record = held.record;
+    ConsumerRecord<byte[], byte[]> record = held.record();
     Record.Builder out =
         Record.newBuilder()
             .setOffset(record.offset())
@@ -739,14 +888,32 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     }
   }
 
-  private void reportInFlight() {
-    for (Topic topic : topics.values()) {
-      int inFlight = topic.core.inFlight();
-      if (inFlight != topic.reportedInFlight) {
-        topic.metrics.inFlight(inFlight - topic.reportedInFlight);
-        topic.reportedInFlight = inFlight;
-      }
+  /** Reports what the topic's core counts: records in flight, partitions at the window. */
+  private void report(Topic topic) {
+    int inFlight = topic.core.inFlight();
+    if (inFlight != topic.reportedInFlight) {
+      topic.metrics.inFlight(inFlight - topic.reportedInFlight);
+      topic.reportedInFlight = inFlight;
     }
+    int atWindow = topic.core.atWindow();
+    if (atWindow != topic.reportedAtWindow) {
+      topic.metrics.atWindow(atWindow - topic.reportedAtWindow);
+      topic.reportedAtWindow = atWindow;
+    }
+    long pauses = topic.core.windowPauses();
+    if (pauses != topic.reportedWindowPauses) {
+      topic.metrics.windowPauses(pauses - topic.reportedWindowPauses);
+      topic.reportedWindowPauses = pauses;
+    }
+  }
+
+  /** The topic is no longer dispatched: its gauges go back to nothing. */
+  private void unreport(Topic topic) {
+    report(topic);
+    topic.metrics.inFlight(-topic.reportedInFlight);
+    topic.metrics.atWindow(-topic.reportedAtWindow);
+    topic.reportedInFlight = 0;
+    topic.reportedAtWindow = 0;
   }
 
   private void forgetBlocked(Topic topic) {
@@ -783,7 +950,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       // rebalance, which the new subscription asks for; until then they are fetched by nobody.
       handOver(partitionsOf(topic));
       forgetBlocked(topic);
-      topic.metrics.inFlight(-topic.reportedInFlight);
+      unreport(topic);
       topics.remove(topic.name);
       subscriptionChanged = true;
       pausesChanged = true;
@@ -966,12 +1133,16 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   @Override
   public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
     if (!partitions.isEmpty()) {
+      metrics.rebalanced(key.cluster(), key.group(), "assigned");
       adopt(partitions);
     }
   }
 
   @Override
   public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+    if (!partitions.isEmpty()) {
+      metrics.rebalanced(key.cluster(), key.group(), "revoked");
+    }
     // Runs inside poll(): nothing is fetched while the cores wait for what is in flight.
     handOver(partitions);
     pausesChanged = true;
@@ -979,6 +1150,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
 
   @Override
   public void onPartitionsLost(Collection<TopicPartition> partitions) {
+    if (!partitions.isEmpty()) {
+      metrics.rebalanced(key.cluster(), key.group(), "lost");
+    }
     Map<Topic, List<Integer>> byTopic = byTopic(partitions);
     byTopic.forEach((topic, numbers) -> on(topic, new PartitionsLost<>(numbers)));
     partitions.forEach(this::forget);
@@ -1164,7 +1338,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         end(stream, status);
       }
       forgetBlocked(topic);
-      topic.metrics.inFlight(-topic.reportedInFlight);
+      unreport(topic);
     }
     topics.clear();
     if (consumer != null) {

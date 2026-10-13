@@ -1,0 +1,98 @@
+# The dispatcher's configuration: clusters, and a policy saying who may consume
+# what. It lists no topic: a dispatcher consumes what the sidecars that connect
+# to it declare (docs/design.md, section 4, Dispatcher).
+#
+# Every replica reads this one file, so nothing in it may differ between
+# replicas: `dispatch.advertisedAddress` stays unset, and each replica is given
+# its own address in ODRADEK_ADVERTISED_HOST (deployment.yaml).
+#
+# `dispatch` is not reloaded while the server runs. A change to it takes effect
+# when the pods are replaced: `kubectl rollout restart` after applying it, or a
+# kustomize configMapGenerator, whose hash suffix does that by itself.
+#
+# ExampleManifestsTest (//server:main_test) loads this configuration with the
+# server's own loader.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: odradek-dispatcher
+  labels:
+    app.kubernetes.io/name: odradek-dispatcher
+    app.kubernetes.io/part-of: odradek
+data:
+  odradek.yaml: |
+    clusters:
+      orders:
+        # The pod is not ready until this cluster has answered.
+        required: true
+        properties:
+          bootstrap.servers: orders-kafka.kafka.svc:9093
+        consumerProperties:
+          # How long the brokers wait before they give up on a replica that
+          # was killed: until then its partitions are consumed by nobody, and
+          # it stays on the list of replicas that sidecars are sent. 45 s is
+          # Kafka's default; lower moves partitions sooner, and also when a
+          # replica only paused. A replica that stops in good order is not
+          # waited for at all.
+          session.timeout.ms: 45000
+        tls:
+          # The pod's X.509-SVID, from the Workload API socket named by
+          # SPIFFE_ENDPOINT_SOCKET (deployment.yaml).
+          spiffe: {}
+          acceptedSpiffeIds:
+            - spiffe://example.org/ns/kafka/sa/orders-broker
+          # Without SPIRE: certificate files from a Secret, mounted as in the
+          # commented volume of deployment.yaml.
+          # files:
+          #   dir: /etc/odradek/tls/orders
+
+    consume:
+      # How long a replica that gives partitions up (a rebalance, or its own
+      # shutdown) waits for the acknowledgements of what it has sent. It
+      # should cover the slowest honest handler: what is still unacknowledged
+      # when it ends is delivered again while a pod may still be working on
+      # it. terminationGracePeriodSeconds in deployment.yaml follows from it.
+      revokeDeadline: 10s
+      commitInterval: 5s
+
+    dispatch:
+      port: 9465
+      coordination:
+        # The consumer group through which the replicas find each other. This
+        # dispatcher's alone; on a cluster with ACLs, only the dispatcher's
+        # principal may have Read on it. Changing it needs every replica
+        # replaced together, not a rolling update.
+        groupId: odradek-dispatcher
+      # How long a topic is still consumed after the last sidecar that declared
+      # it has gone, so that a rollout of the application does not make the
+      # dispatcher leave its group and join it again.
+      idleGrace: 300s
+      # The largest span of offsets between a partition's committed offset and
+      # the newest record delivered from it.
+      partitionWindow: 1000
+      # Mutual TLS on the delivery port. Without it the port is plaintext and
+      # whoever reaches it reads every topic the dispatcher can: for tests.
+      tls:
+        spiffe: {}
+        # files:
+        #   dir: /etc/odradek/tls/delivery
+      # Who may consume what. A declaration that no rule allows is refused,
+      # and that ends the application's Consume stream: roll a policy that
+      # allows more out to every replica before the application that needs it.
+      policy:
+        - spiffeIds:
+            - spiffe://example.org/ns/billing/sa/billing
+          cluster: orders
+          topics: ["orders.*"]
+          groups: [billing]
+          # The dispatcher writes dead letters with its own credentials, so the
+          # topics it may write them to for this application are listed too.
+          deadLetterTopics: ["billing.dlq.*"]
+
+    telemetry:
+      # OTLP/gRPC. Every replica reports under the same attributes: have the
+      # collector add the pod's name (its k8sattributes processor), or the
+      # replicas' series cannot be told apart.
+      endpoint: http://otel-collector.observability.svc:4317
+      resourceAttributes:
+        service.name: odradek-dispatcher

@@ -167,7 +167,7 @@ The first draft gave the dispatcher a `dispatch` entry per topic. Every new topi
 - **Assignment messages.** The application protocol speaks of assigned and revoked partitions. A receiving sidecar has none in Kafka's sense. The plan is to announce a partition when its first record arrives and never to revoke; the client cores must be checked against batches whose offsets have gaps.
 - **Hot keys.** Whether `key` ordering should allow several records of one key in flight to the same sidecar, in order, to recover throughput.
 - **The processing deadline as a group-wide setting.** It comes from the application, so a new version that changes it would be refused until every old pod is gone. It probably should not take part in the conflict check.
-- **A blocked partition.** What resumes it, and that attempt counts are lost when a replica restarts, are not settled.
+- **A blocked partition.** Settled in step 7 by saying what is, in the design (Redelivery, limits and dead letters). A blocked partition is resumed by a change of owner (another replica takes it, or its own restarts), which gives the record its attempts again, or by a late acknowledgement of the record. Attempt counts are in the memory of the replica that owns the partition and are lost whenever it changes owner, so the limit bounds what one owner tries, not the record's whole life. Nothing persists them, and no admin API resumes a partition or skips a record; whether to build either stays open.
 - **Identities without SPIFFE IDs.** The policy names SPIFFE IDs and trust domains; certificates from another PKI match no rule.
 
 ## Plan
