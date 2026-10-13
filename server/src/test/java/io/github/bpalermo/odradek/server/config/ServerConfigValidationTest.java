@@ -17,6 +17,7 @@ import io.github.bpalermo.odradek.config.v1.Dispatch;
 import io.github.bpalermo.odradek.config.v1.Dispatcher;
 import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.Listener;
+import io.github.bpalermo.odradek.config.v1.ListenerTls;
 import io.github.bpalermo.odradek.config.v1.OnDecodeError;
 import io.github.bpalermo.odradek.config.v1.OnExhausted;
 import io.github.bpalermo.odradek.config.v1.Ordering;
@@ -556,9 +557,97 @@ class ServerConfigValidationTest {
         .addGroups("billing");
   }
 
-  /** A valid config whose dispatch section has this one rule. */
+  private static ListenerTls.Builder listenerTls() {
+    return ListenerTls.newBuilder()
+        .setFiles(FileSource.newBuilder().setDir("/etc/odradek/delivery"));
+  }
+
+  /** A valid config whose dispatch section has this one rule, and the TLS a rule needs. */
   private static ServerConfig withRule(PolicyRule.Builder rule) {
-    return valid().setDispatch(Dispatch.newBuilder().addPolicy(rule)).build();
+    return valid().setDispatch(Dispatch.newBuilder().setTls(listenerTls()).addPolicy(rule)).build();
+  }
+
+  @Test
+  void policyNeedsTlsOnTheDeliveryPort() throws ValidationException {
+    // Without TLS nobody has an identity: a rule could match no one, or would be ignored.
+    assertViolates(
+        valid().setDispatch(Dispatch.newBuilder().addPolicy(rule())).build(),
+        "dispatch.policy_requires_tls");
+    assertThat(ruleIds(withRule(rule()))).isEmpty();
+  }
+
+  @Test
+  void dispatchWithNeitherTlsNorPolicyIsThePlaintextOfTests() throws ValidationException {
+    assertThat(ruleIds(valid().setDispatch(Dispatch.newBuilder().setPort(0)).build())).isEmpty();
+  }
+
+  @Test
+  void dispatchWithTlsAndNoPolicyIsValid() throws ValidationException {
+    // It refuses every declaration, which is a state a rollout passes through, not an error.
+    assertThat(ruleIds(valid().setDispatch(Dispatch.newBuilder().setTls(listenerTls())).build()))
+        .isEmpty();
+  }
+
+  @Test
+  void listenerTlsNeedsASource() throws ValidationException {
+    assertViolates(
+        valid().setDispatch(Dispatch.newBuilder().setTls(ListenerTls.getDefaultInstance())).build(),
+        "required");
+    assertThat(
+            ruleIds(
+                valid()
+                    .setDispatch(
+                        Dispatch.newBuilder()
+                            .setTls(
+                                ListenerTls.newBuilder()
+                                    .setSpiffe(SpiffeSource.getDefaultInstance())))
+                    .build()))
+        .isEmpty();
+  }
+
+  @Test
+  void listenerTlsDirMustBeAbsolute() throws ValidationException {
+    assertViolates(
+        valid()
+            .setDispatch(
+                Dispatch.newBuilder()
+                    .setTls(
+                        ListenerTls.newBuilder().setFiles(FileSource.newBuilder().setDir("tls"))))
+            .build(),
+        "string.prefix");
+  }
+
+  private static ServerConfig receivingWithTls(Tls.Builder tls) {
+    return valid()
+        .setDispatcher(
+            Dispatcher.newBuilder().setAddress("odradek-dispatcher.kafka.svc:9465").setTls(tls))
+        .putConsumers("payments", dispatched().build())
+        .build();
+  }
+
+  @Test
+  void dispatcherTlsNeedsTheDispatchersIdentityWhateverTheSource() throws ValidationException {
+    Tls.Builder files = Tls.newBuilder().setFiles(FileSource.newBuilder().setDir("/etc/tls"));
+    // A broker may be verified by host name; a dispatcher is connected to by IP address.
+    assertViolates(receivingWithTls(files), "dispatcher.tls_peer_identity");
+    assertThat(
+            ruleIds(
+                receivingWithTls(
+                    files.clone().addAcceptedSpiffeIds("spiffe://example.org/ns/kafka/sa/d"))))
+        .isEmpty();
+    assertThat(ruleIds(receivingWithTls(files.clone().setAcceptedTrustDomain("example.org"))))
+        .isEmpty();
+
+    Tls.Builder spiffe = Tls.newBuilder().setSpiffe(SpiffeSource.getDefaultInstance());
+    assertThat(ruleIds(receivingWithTls(spiffe)))
+        .containsExactlyInAnyOrder("dispatcher.tls_peer_identity", "tls.spiffe_peer_policy");
+    assertThat(ruleIds(receivingWithTls(spiffe.clone().setAcceptedTrustDomain("example.org"))))
+        .isEmpty();
+  }
+
+  @Test
+  void dispatcherWithoutTlsIsThePlaintextOfTests() throws ValidationException {
+    assertThat(ruleIds(receiving(dispatched()))).isEmpty();
   }
 
   private static io.github.bpalermo.odradek.config.v1.Consumer.Builder dispatched() {
@@ -584,6 +673,7 @@ class ServerConfigValidationTest {
             .setDispatch(
                 Dispatch.newBuilder()
                     .setPort(9465)
+                    .setTls(listenerTls())
                     .setAdvertisedAddress("10.0.0.7:9465")
                     .setIdleGrace(seconds(300))
                     .setPartitionWindow(1000)

@@ -49,6 +49,8 @@ public final class FileCredentialSource implements CredentialSource {
   /**
    * Loads the first set.
    *
+   * @param cluster whose credentials these are, for the log: {@code cluster orders}, or the name of
+   *     the configuration section of the delivery port
    * @throws CredentialException if the files cannot be read or are not usable
    */
   public FileCredentialSource(String cluster, Path certFile, Path keyFile, Path caFile, Clock clock)
@@ -68,7 +70,7 @@ public final class FileCredentialSource implements CredentialSource {
     this.seen = content;
     reloads.incrementAndGet();
     LOG.info(
-        "cluster {}: TLS credentials loaded from {}, certificate expires {}",
+        "{}: TLS credentials loaded from {}, certificate expires {}",
         cluster,
         certFile.getParent(),
         current.notAfter());
@@ -99,7 +101,7 @@ public final class FileCredentialSource implements CredentialSource {
       if (seen != null) {
         seen = null;
         failures.incrementAndGet();
-        LOG.warn("cluster {}: cannot read TLS credentials: {}", cluster, e.toString());
+        LOG.warn("{}: cannot read TLS credentials: {}", cluster, e.toString());
       }
       return;
     }
@@ -112,17 +114,14 @@ public final class FileCredentialSource implements CredentialSource {
     } catch (CredentialException e) {
       failures.incrementAndGet();
       LOG.warn(
-          "cluster {}: new TLS credentials rejected, keeping the certificate that expires {}: {}",
+          "{}: new TLS credentials rejected, keeping the certificate that expires {}: {}",
           cluster,
           current.notAfter(),
           e.getMessage());
       return;
     }
     reloads.incrementAndGet();
-    LOG.info(
-        "cluster {}: TLS credentials reloaded, certificate expires {}",
-        cluster,
-        current.notAfter());
+    LOG.info("{}: TLS credentials reloaded, certificate expires {}", cluster, current.notAfter());
   }
 
   private Content read() throws IOException {

@@ -108,7 +108,7 @@ final class DispatcherHarness {
     if (!packaged()) {
       tls = TlsSources.create(config);
       service = new DispatchService(config, tls, ServerMetrics.noop());
-      delivery = DeliveryServer.start(config.getDispatch(), service);
+      delivery = DeliveryServer.start(config.getDispatch(), service, tls);
       port = delivery.port();
       return;
     }

@@ -205,9 +205,26 @@ grep -q "every producer must reference entries in clusters" violations.log ||
   fail "violations: the CEL rule on producers was not evaluated"
 grep -q "acks must be all" violations.log || fail "violations: the CEL rule on acks was not evaluated"
 
-# A dispatcher (ADR 6) with neither producers nor consumers: it serves the delivery port, says
-# that its policy is not enforced yet, and does not open the socket of an app that is not there.
+# A dispatcher (ADR 6) with neither producers nor consumers and no TLS: it serves the delivery
+# port, says that the port is open to whoever reaches it, and does not open the socket of an app
+# that is not there. (With TLS it is the end-to-end suite's: that needs certificates.)
 config dispatch <<'EOF'
+clusters:
+  main:
+    properties:
+      bootstrap.servers: localhost:9092
+dispatch:
+  port: 0
+EOF
+runs dispatch "delivery service on port [0-9]*, advertised as .*, PLAINTEXT" \
+  "delivery service stopped"
+grep -q "THE DELIVERY PORT IS PLAINTEXT AND UNAUTHENTICATED" dispatch.log ||
+  fail "dispatch: no warning about the plaintext port"
+[ ! -e dispatch.sock ] || fail "dispatch: opened the app's socket"
+
+# A policy on a port without TLS would be a policy nobody can match, or one that is ignored:
+# such a dispatcher does not start.
+config dispatch-policy-plaintext <<'EOF'
 clusters:
   main:
     properties:
@@ -220,13 +237,32 @@ dispatch:
       topics: ["orders.*"]
       groups: [billing]
 EOF
-runs dispatch "delivery service on port [0-9]*, advertised as " "delivery service stopped"
-grep -q "POLICY IS NOT ENFORCED" dispatch.log || fail "dispatch: no warning about the policy"
-[ ! -e dispatch.sock ] || fail "dispatch: opened the app's socket"
+rejected dispatch-policy-plaintext "a policy needs tls"
+
+# Credentials that are not there are a failure to start, not a plaintext port.
+config dispatch-tls-missing <<'EOF'
+clusters:
+  main:
+    properties:
+      bootstrap.servers: localhost:9092
+dispatch:
+  port: 0
+  tls:
+    files:
+      dir: /nonexistent/odradek-delivery
+EOF
+status=0
+timeout 30 "${server}" --config dispatch-tls-missing.yaml >dispatch-tls-missing.log 2>&1 || status=$?
+[ "${status}" -eq 1 ] || fail "dispatch-tls-missing: expected exit status 1, got ${status}"
+grep -q "TLS credentials unavailable: dispatch.tls: " dispatch-tls-missing.log ||
+  fail "dispatch-tls-missing: the log does not name dispatch.tls"
+if grep -q "delivery service on port" dispatch-tls-missing.log; then
+  fail "dispatch-tls-missing: it listened all the same"
+fi
 
 # A server that receives what it consumes from a dispatcher (ADR 6) has no cluster of its own,
 # and starts, and is ready, with no dispatcher to be found: it connects when an app subscribes.
-# It says that the connection is not secured yet.
+# Without TLS it says that the connection is not secured.
 config dispatched-consumer <<'EOF'
 dispatcher:
   address: odradek-dispatcher.kafka.svc:9465
@@ -238,8 +274,23 @@ consumers:
     ordering: ORDERING_PARTITION
 EOF
 serves dispatched-consumer
-grep -q "CONNECTION TO THE DISPATCHER AT odradek-dispatcher.kafka.svc:9465 IS NOT AUTHENTICATED" \
+grep -q "CONNECTION TO THE DISPATCHER AT odradek-dispatcher.kafka.svc:9465 IS PLAINTEXT" \
   dispatched-consumer.log || fail "dispatched-consumer: no warning about the connection"
+
+# A dispatcher is recognized by its SPIFFE ID or not at all: there is no host name to fall back on.
+config dispatcher-tls-anyone <<'EOF'
+dispatcher:
+  address: odradek-dispatcher.kafka.svc:9465
+  tls:
+    files:
+      dir: /etc/odradek/delivery
+consumers:
+  orders:
+    source: CONSUMER_SOURCE_DISPATCHER
+    cluster: main
+    groupId: billing
+EOF
+rejected dispatcher-tls-anyone "tls needs accepted_spiffe_ids or accepted_trust_domain"
 
 # Its rules run in the image like the others.
 config dispatch-violations <<'EOF'
@@ -263,6 +314,7 @@ EOF
 rejected dispatch-violations "every rule of dispatch.policy must reference an entry in clusters"
 for message in \
   "a rule needs spiffe_ids or trust_domain" \
+  "a policy needs tls" \
   "dispatcher must be set when a consumer's source is CONSUMER_SOURCE_DISPATCHER" \
   "dead_letter_topic must be set when on_exhausted is ON_EXHAUSTED_DEAD_LETTER" \
   "dispatch.advertised_address: " \

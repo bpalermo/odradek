@@ -5,7 +5,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.google.protobuf.util.Durations;
 import io.github.bpalermo.odradek.config.v1.Cluster;
+import io.github.bpalermo.odradek.config.v1.Dispatch;
+import io.github.bpalermo.odradek.config.v1.Dispatcher;
 import io.github.bpalermo.odradek.config.v1.FileSource;
+import io.github.bpalermo.odradek.config.v1.ListenerTls;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.config.v1.Tls;
 import io.github.bpalermo.odradek.server.admin.Readiness;
@@ -171,6 +174,49 @@ class TelemetryTest {
       readiness.started(tls);
       assertThat(metric("odradek.ready"))
           .hasLongGaugeSatisfying(gauge -> gauge.hasPointsSatisfying(point -> point.hasValue(1)));
+    }
+  }
+
+  @Test
+  void theCredentialsOfTheDeliveryPortAreObservedUnderTheirSection() throws Exception {
+    TestPki pki = new TestPki(dir, "ca");
+    TestPki.write(
+        dir.resolve("tls"), pki.issue("server", "uri:spiffe://example.org/app"), pki.caPem());
+    FileSource files = FileSource.newBuilder().setDir(dir.resolve("tls").toString()).build();
+    ServerConfig config =
+        ServerConfig.newBuilder()
+            .setDispatch(Dispatch.newBuilder().setTls(ListenerTls.newBuilder().setFiles(files)))
+            .setDispatcher(
+                Dispatcher.newBuilder()
+                    .setAddress("dispatcher:9465")
+                    .setTls(Tls.newBuilder().setFiles(files).setAcceptedTrustDomain("example.org")))
+            .build();
+    Readiness readiness = new Readiness();
+    try (TlsSources tls = TlsSources.create(config)) {
+      metrics.observe(tls, readiness, Clock.systemUTC());
+      long notAfter = tls.listener().current().notAfter().getEpochSecond();
+      Attributes listener = Attributes.of(ServerMetrics.DELIVERY, "dispatch.tls");
+      Attributes dispatcher = Attributes.of(ServerMetrics.DELIVERY, "dispatcher.tls");
+
+      assertThat(metric("odradek.tls.certificate.not_after"))
+          .hasLongGaugeSatisfying(
+              gauge ->
+                  gauge.hasPointsSatisfying(
+                      point -> point.hasValue(notAfter).hasAttributes(listener),
+                      point -> point.hasValue(notAfter).hasAttributes(dispatcher)));
+      assertThat(metric("odradek.tls.credential.reloads"))
+          .hasLongSumSatisfying(
+              sum ->
+                  sum.hasPointsSatisfying(
+                      point -> point.hasValue(1).hasAttributes(listener),
+                      point -> point.hasValue(1).hasAttributes(dispatcher)));
+
+      // Ready with them, and not once either has expired.
+      readiness.started(tls);
+      assertThat(readiness.problems(Clock.systemUTC().instant())).isEmpty();
+      assertThat(readiness.problems(Clock.systemUTC().instant().plus(Duration.ofDays(3))))
+          .hasSize(2)
+          .allMatch(problem -> problem.contains("the certificate expired at"));
     }
   }
 

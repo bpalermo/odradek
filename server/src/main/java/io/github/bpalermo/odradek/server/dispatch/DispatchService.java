@@ -18,10 +18,20 @@ import io.github.bpalermo.odradek.server.dispatch.Declarations.Refused;
 import io.github.bpalermo.odradek.server.dispatch.DispatchGroup.Key;
 import io.github.bpalermo.odradek.server.dispatch.DispatchGroup.Stream;
 import io.github.bpalermo.odradek.server.telemetry.ServerMetrics;
+import io.github.bpalermo.odradek.server.tls.PeerPolicy;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
+import io.grpc.Context;
+import io.grpc.Contexts;
+import io.grpc.Grpc;
+import io.grpc.Metadata;
+import io.grpc.ServerCall;
+import io.grpc.ServerCallHandler;
+import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
@@ -29,6 +39,8 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSession;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -43,13 +55,62 @@ import org.slf4j.LoggerFactory;
  * and consumer group, creating that group, and with it a Kafka consumer, when this is the first
  * declaration for it. Nothing here touches Kafka or a core: a gRPC thread validates and queues.
  *
- * <p><b>The policy is not enforced yet.</b> Without TLS on the delivery port a sidecar has no
- * identity to check, so every well-formed declaration that names a cluster the dispatcher has is
- * accepted. Until that changes (step 5 of the ADR's plan) a dispatcher must not be reachable by
+ * <p>With {@code dispatch.tls}, a declaration is authorized against {@code dispatch.policy} by the
+ * SPIFFE ID of the sidecar's client certificate, which {@link #identities()} takes from the
+ * connection. <b>Without it the delivery port is plaintext and nobody has an identity</b>: the
+ * policy is empty (the configuration is rejected otherwise) and every well-formed declaration that
+ * names a cluster the dispatcher has is accepted. Such a dispatcher must not be reachable by
  * anything that is not trusted with every topic its Kafka credentials can read.
  */
 public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceImplBase {
   private static final Logger LOG = LoggerFactory.getLogger(DispatchService.class);
+
+  /**
+   * Who opened a stream, as far as its connection says.
+   *
+   * @param spiffeId the SPIFFE ID of the client certificate, or null when there is none to go by
+   * @param problem why there is none, for the refusal
+   */
+  record Peer(String spiffeId, String problem) {}
+
+  /** The peer of the call being started; unset when nothing looked at the connection. */
+  static final Context.Key<Peer> PEER = Context.key("odradek-delivery-peer");
+
+  private static final Peer PLAINTEXT = new Peer(null, "the connection has no TLS");
+
+  /**
+   * What the delivery listener puts in front of this service: it reads the client certificate the
+   * TLS handshake verified and leaves its SPIFFE ID where {@link #deliver} finds it.
+   */
+  public static ServerInterceptor identities() {
+    return new ServerInterceptor() {
+      @Override
+      public <RequestT, ResponseT> ServerCall.Listener<RequestT> interceptCall(
+          ServerCall<RequestT, ResponseT> call,
+          Metadata headers,
+          ServerCallHandler<RequestT, ResponseT> next) {
+        Peer peer = peer(call.getAttributes().get(Grpc.TRANSPORT_ATTR_SSL_SESSION));
+        return Contexts.interceptCall(Context.current().withValue(PEER, peer), call, headers, next);
+      }
+    };
+  }
+
+  /** The identity a TLS session proves; {@code session} is null on a plaintext connection. */
+  static Peer peer(SSLSession session) {
+    if (session == null) {
+      return PLAINTEXT;
+    }
+    try {
+      if (session.getPeerCertificates()[0] instanceof X509Certificate leaf) {
+        return new Peer(PeerPolicy.spiffeId(leaf), null);
+      }
+      return new Peer(null, "the client certificate is not an X.509 certificate");
+    } catch (SSLPeerUnverifiedException e) {
+      return new Peer(null, "the connection has no client certificate");
+    } catch (CertificateException e) {
+      return new Peer(null, e.getMessage());
+    }
+  }
 
   /** The port when the configuration does not name one. */
   public static final int DEFAULT_PORT = 9465;
@@ -88,6 +149,10 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
   private final Duration idleGrace;
   private final Duration revokeGrace;
   private final Duration commitInterval;
+
+  /** What sidecars are allowed; null when the delivery port has no TLS, and so no identities. */
+  private final Policy policy;
+
   private final AtomicLong streamCounter = new AtomicLong();
   private final AtomicLong groupCounter = new AtomicLong();
 
@@ -127,6 +192,11 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
     this.factory = factory;
     this.nanoClock = nanoClock;
     Dispatch dispatch = config.getDispatch();
+    if (!dispatch.hasTls() && dispatch.getPolicyCount() > 0) {
+      // The configuration's own validation says the same; a policy must never be ignored.
+      throw new IllegalArgumentException("dispatch.policy needs dispatch.tls");
+    }
+    this.policy = dispatch.hasTls() ? Policy.of(dispatch.getPolicyList()) : null;
     this.window =
         dispatch.hasPartitionWindow() ? dispatch.getPartitionWindow() : DEFAULT_PARTITION_WINDOW;
     this.idleGrace =
@@ -164,7 +234,17 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
 
   @Override
   public StreamObserver<DeliverRequest> deliver(StreamObserver<DeliverResponse> responses) {
-    return new Handshake((ServerCallStreamObserver<DeliverResponse>) responses);
+    return new Handshake((ServerCallStreamObserver<DeliverResponse>) responses, PEER.get());
+  }
+
+  /** Whether declarations are authorized against the policy: the delivery port has TLS. */
+  public boolean enforcesPolicy() {
+    return policy != null;
+  }
+
+  /** Whether the policy, being enforced, has no rule: every declaration is then refused. */
+  public boolean refusesEverything() {
+    return policy != null && policy.isEmpty();
   }
 
   /**
@@ -298,8 +378,12 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
     /** Nothing more is expected from the sidecar, or wanted. */
     private boolean done;
 
-    Handshake(ServerCallStreamObserver<DeliverResponse> call) {
+    /** Who the connection says the sidecar is; null when nothing looked. */
+    private final Peer peer;
+
+    Handshake(ServerCallStreamObserver<DeliverResponse> call, Peer peer) {
       this.call = call;
+      this.peer = peer;
       call.setOnCancelHandler(this::cancelled);
     }
 
@@ -309,6 +393,14 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
         return;
       }
       if (stream == null) {
+        // Before anything is said about the message: who cannot be told apart is told nothing.
+        if (policy != null && (peer == null || peer.spiffeId() == null)) {
+          refuse(
+              Status.UNAUTHENTICATED.withDescription(
+                  "no SPIFFE ID to authorize: "
+                      + (peer == null ? PLAINTEXT.problem() : peer.problem())));
+          return;
+        }
         if (!request.hasDeclare()) {
           refuse(Status.INVALID_ARGUMENT.withDescription("the first message must be Declare"));
           return;
@@ -341,7 +433,12 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
     private void declare(DeliverRequest request) {
       Declared declared;
       try {
-        declared = Declarations.check(request.getDeclare(), config.getClustersMap().keySet());
+        declared =
+            Declarations.check(
+                request.getDeclare(),
+                config.getClustersMap().keySet(),
+                policy,
+                policy == null ? null : peer.spiffeId());
       } catch (Refused e) {
         refuse(e.status());
         return;
@@ -351,7 +448,9 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
               "s" + streamCounter.incrementAndGet(),
               call,
               declared,
-              request.getDeclare().getSidecar().getVersion());
+              // What the group logs the stream with: who was let in is worth a line.
+              request.getDeclare().getSidecar().getVersion()
+                  + (policy == null ? "" : " as " + peer.spiffeId()));
       DispatchGroup joined = join(opened);
       if (joined == null) {
         refuse(Status.UNAVAILABLE.withDescription("the dispatcher is starting or stopping"));
@@ -391,7 +490,11 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
     /** Ends a stream that never reached a group. */
     private void refuse(Status status) {
       done = true;
-      LOG.info("declaration refused: {} {}", status.getCode(), status.getDescription());
+      LOG.info(
+          "declaration of {} refused: {} {}",
+          peer == null || peer.spiffeId() == null ? "an unidentified sidecar" : peer.spiffeId(),
+          status.getCode(),
+          status.getDescription());
       call.onError(status.asRuntimeException());
     }
 

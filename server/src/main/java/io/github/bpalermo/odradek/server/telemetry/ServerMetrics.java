@@ -10,6 +10,7 @@ import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.LongUpDownCounter;
 import io.opentelemetry.api.metrics.Meter;
 import java.time.Clock;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -28,6 +29,12 @@ public final class ServerMetrics {
   static final AttributeKey<Boolean> REQUIRED = AttributeKey.booleanKey("required");
   static final AttributeKey<String> EVENT = AttributeKey.stringKey("event");
   static final AttributeKey<String> REASON = AttributeKey.stringKey("reason");
+
+  /**
+   * On the TLS metrics, in place of {@code cluster}: the credentials are those of the delivery
+   * port, and the value is the configuration section that names them.
+   */
+  static final AttributeKey<String> DELIVERY = AttributeKey.stringKey("delivery");
 
   private static final String OK = "ok";
   private static final String ERROR = "error";
@@ -321,21 +328,27 @@ public final class ServerMetrics {
    *
    * <p>Alert on {@code odradek.tls.certificate.not_after} minus now, not on reload events: a
    * certificate close to expiry is the fact that matters, whatever the reason.
+   *
+   * <p>One series per set of credentials: those of a cluster under {@code cluster}, those of the
+   * delivery port under {@code delivery}.
    */
   public void observe(TlsSources tls, Readiness readiness, Clock clock) {
-    Map<String, CredentialSource> sources = tls.sources();
+    Map<Attributes, CredentialSource> sources = new LinkedHashMap<>();
+    tls.sources()
+        .forEach((cluster, source) -> sources.put(Attributes.of(CLUSTER, cluster), source));
+    tls.deliverySources()
+        .forEach((section, source) -> sources.put(Attributes.of(DELIVERY, section), source));
     meter
         .gaugeBuilder("odradek.tls.certificate.not_after")
         .ofLongs()
-        .setDescription("When the client certificate in use expires, as seconds since the epoch.")
+        .setDescription("When the certificate in use expires, as seconds since the epoch.")
         .setUnit("s")
         .buildWithCallback(
             measurement ->
                 sources.forEach(
-                    (cluster, source) ->
+                    (attributes, source) ->
                         measurement.record(
-                            source.current().notAfter().getEpochSecond(),
-                            Attributes.of(CLUSTER, cluster))));
+                            source.current().notAfter().getEpochSecond(), attributes)));
     meter
         .counterBuilder("odradek.tls.credential.reloads")
         .setDescription("Times new credentials replaced the ones in use, the first load included.")
@@ -343,8 +356,7 @@ public final class ServerMetrics {
         .buildWithCallback(
             measurement ->
                 sources.forEach(
-                    (cluster, source) ->
-                        measurement.record(source.reloads(), Attributes.of(CLUSTER, cluster))));
+                    (attributes, source) -> measurement.record(source.reloads(), attributes)));
     meter
         .counterBuilder("odradek.tls.credential.reload.failures")
         .setDescription(
@@ -353,8 +365,7 @@ public final class ServerMetrics {
         .buildWithCallback(
             measurement ->
                 sources.forEach(
-                    (cluster, source) ->
-                        measurement.record(source.failures(), Attributes.of(CLUSTER, cluster))));
+                    (attributes, source) -> measurement.record(source.failures(), attributes)));
     meter
         .gaugeBuilder("odradek.ready")
         .ofLongs()

@@ -1201,6 +1201,29 @@ class ReceiveServiceTest {
   }
 
   @Test
+  void theReasonOfALostStreamIsOneLineAndNamesWhatHappenedUnderneath() {
+    // What gRPC makes of a TLS handshake the sidecar refused.
+    Status handshake =
+        Status.UNAVAILABLE
+            .withDescription("io exception\nChannel Pipeline: [SslHandler#0, ClientTlsHandler#0]")
+            .withCause(
+                new RuntimeException(
+                    "decoding",
+                    new javax.net.ssl.SSLHandshakeException(
+                        "the peer's SPIFFE ID spiffe://example.org/other is not accepted")));
+    assertThat(ReceiveSession.reason(handshake))
+        .isEqualTo(
+            "io exception: SSLHandshakeException: the peer's SPIFFE ID spiffe://example.org/other"
+                + " is not accepted");
+    // What a dispatcher said, and nothing at all.
+    assertThat(ReceiveSession.reason(Status.UNAVAILABLE.withDescription("stopping")))
+        .isEqualTo("stopping");
+    assertThat(ReceiveSession.reason(Status.UNAVAILABLE)).isEmpty();
+    assertThat(ReceiveSession.reason(Status.UNAVAILABLE.withCause(new java.io.IOException())))
+        .isEqualTo("IOException");
+  }
+
+  @Test
   void aStreamBrokenForGoodAfterItWasAcceptedEndsTheAppsStream() throws Exception {
     FakeReplica replica = single();
     start(config());
@@ -1311,9 +1334,10 @@ class ReceiveServiceTest {
   }
 
   @Test
-  void aServerWithoutADispatcherRefusesSuchAStream() {
+  void aServerWithoutADispatcherRefusesSuchAStream() throws Exception {
     ReceiveService none =
-        ReceiveService.create(ServerConfig.getDefaultInstance(), ServerMetrics.noop());
+        ReceiveService.create(
+            ServerConfig.getDefaultInstance(), TlsSources.none(), ServerMetrics.noop());
     assertThat(ReceiveService.receives(ServerConfig.getDefaultInstance())).isFalse();
     assertThat(ReceiveService.receives(config().build())).isTrue();
     org.assertj.core.api.Assertions.assertThatThrownBy(() -> none.open(null))

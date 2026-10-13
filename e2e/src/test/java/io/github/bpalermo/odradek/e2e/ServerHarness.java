@@ -108,7 +108,7 @@ final class ServerHarness {
       ProduceService produce =
           new ProduceService(
               config, ProduceRoutes.create(config, producers, codecs), ServerMetrics.noop());
-      receive = ReceiveService.create(config, ServerMetrics.noop());
+      receive = ReceiveService.create(config, tls, ServerMetrics.noop());
       consume =
           new ConsumeService(
               config, codecs, tls, produce.serverEpoch(), ServerMetrics.noop(), receive);

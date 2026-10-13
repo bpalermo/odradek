@@ -78,7 +78,7 @@ flowchart LR
 
 - The server runs as a native sidecar: an `initContainer` with `restartPolicy: Always`.
 - **Startup**: health service `""` is the `startupProbe` and the `readinessProbe`. Its port is up before anything that can take time, and it answers `NOT_SERVING` while the server starts. In order, the server:
-  1. loads its first credentials (with a SPIFFE source, it waits for the first SVID);
+  1. loads its first credentials, those of its clusters and those of the delivery port (with a SPIFFE source, it waits for the first SVID);
   2. asks every cluster with `required: true` for its metadata (an Admin client's `describeCluster`, built from the cluster's shared `properties` and its `tls`), one cluster at a time in name order, retrying until each answers;
   3. listens on the Unix socket and, in a dispatcher, on the delivery port;
   4. answers `SERVING`. The app container starts after that.
@@ -86,7 +86,7 @@ flowchart LR
 - **Waiting for a required cluster**: the socket does not exist until every required cluster has answered, so an app never talks to a server that has not reached the clusters it must have. While waiting, the reason for `NOT_SERVING` names the cluster (`starting: waiting for cluster orders`). An attempt times out after 10 seconds and the next follows a second later. The reason for a failure is logged when it differs from the previous one, and the wait itself every 30 seconds. The server neither gives up nor exits: the `startupProbe`'s `failureThreshold` is what bounds the wait, and kubelet restarts the container when it is exceeded. Clusters that are not required are not contacted at startup.
 - **The dispatcher is not waited for.** A server that receives topics from a dispatcher connects to it when an app subscribes, not before, and is ready whether or not it can be reached: an app that only produces must be able to start. While the dispatcher is away the app's Consume stream is open and receives nothing.
 - **Startup only**: a required cluster that becomes unreachable later does not change readiness. Producing and consuming report their own errors, and taking the pod out of service for a broker blip would turn a partial failure into a full one.
-- **Readiness afterwards**: `""` goes back to `NOT_SERVING` when a cluster's client certificate has expired, which means whatever renews it has stopped (files not replaced, or the Workload API unreachable for an SVID's lifetime), and when shutdown begins.
+- **Readiness afterwards**: `""` goes back to `NOT_SERVING` when a certificate in use has expired (a cluster's client certificate, the certificate of a dispatcher's delivery port, or the one a server presents to its dispatcher), which means whatever renews it has stopped (files not replaced, or the Workload API unreachable for an SVID's lifetime), and when shutdown begins.
 - **App readiness**: the client library reports ready only while it holds a session whose handshake has completed.
 - **Shutdown**: the server receives SIGTERM after the app container exits. It stops accepting streams, completes in-flight produce results, `flush()`es, commits acked offsets, leaves its groups and exits. `terminationGracePeriodSeconds` must cover app drain plus `delivery.timeout.ms`.
 - **Shutdown of a server that receives from a dispatcher**: for each Consume stream it grants the dispatcher nothing more, passes on the acknowledgements the app has sent, half-closes its `Deliver` streams and ends the app's stream with `UNAVAILABLE`. The half-close is a clean leave: the dispatcher delivers again, under the same attempt numbers, what the app held. It waits up to 5 seconds for the dispatcher to close the streams.
@@ -117,9 +117,9 @@ Metrics are pushed over OTLP/gRPC to the collector named by `telemetry.endpoint`
 | `odradek.receive.records` | counter | `cluster`, `group`, `topic` | Records received from a dispatcher. A record received again is counted again |
 | `odradek.receive.rejects` | counter | `cluster`, `group`, `topic` | Records returned to the dispatcher because the topic's codec could not decode them |
 | `odradek.receive.reconnects` | counter | `cluster`, `group`, `topic` | `Deliver` streams opened again after one was lost, or refused for the time being |
-| `odradek.tls.certificate.not_after` | gauge, seconds since the epoch | `cluster` | When the client certificate in use expires |
-| `odradek.tls.credential.reloads` | counter | `cluster` | Times new credentials replaced the ones in use, the first load included |
-| `odradek.tls.credential.reload.failures` | counter | `cluster` | Times new credentials were rejected or could not be fetched |
+| `odradek.tls.certificate.not_after` | gauge, seconds since the epoch | `cluster` or `delivery` | When the certificate in use expires |
+| `odradek.tls.credential.reloads` | counter | `cluster` or `delivery` | Times new credentials replaced the ones in use, the first load included |
+| `odradek.tls.credential.reload.failures` | counter | `cluster` or `delivery` | Times new credentials were rejected or could not be fetched |
 | `odradek.ready` | gauge | | 1 when the health service answers `SERVING`, 0 otherwise |
 
 The Kafka clients' own metrics are exported too, from an allow-list: Kafka has hundreds, and the per-node and per-topic ones multiply. Each is read from the client on every collection, so its value and its window are Kafka's (an `avg` or a `max` covers Kafka's sample window, 30 s by default, and is absent while there are no samples).
@@ -154,6 +154,7 @@ The Kafka clients' own metrics are exported too, from an allow-list: Kafka has h
 - The metrics reach the SDK through a Kafka `MetricsReporter` that the server adds to `metric.reporters`, after any reporter the cluster's properties name (Kafka's JMX reporter when they name none). Without `telemetry.endpoint` the reporter is not installed.
 
 - A server that receives a topic from a dispatcher reports `odradek.consume.records`, `odradek.consume.decode.errors` (records delivered undecoded), `odradek.consume.streams` and `odradek.consume.stream.ends` for it as for any other, and the `odradek.receive.*` metrics besides. It has no Kafka consumer, so no `odradek.kafka.consumer.*` and no `odradek.consume.rebalances`: lag is the dispatcher's to report. In `odradek.receive.*`, `cluster` is the dispatcher's name for the cluster.
+- The `odradek.tls.*` metrics have one series per set of credentials. Those of a cluster carry `cluster`. Those of the delivery port carry `delivery` instead, with the configuration section as its value: `dispatch.tls` on a dispatcher, `dispatcher.tls` on a server that receives from one.
 
 Not built yet: latency histograms, configuration reload metrics, and the rest of the dispatcher's and of the receiving side's (window pauses, attempts, dead letters, declarations refused, records waiting for the app's credit).
 
@@ -180,7 +181,7 @@ Not built yet: latency histograms, configuration reload metrics, and the rest of
 - The file is YAML (or JSON) in the protobuf JSON mapping: field names in lowerCamelCase, durations as `"30s"`, timestamps as RFC 3339. YAML is converted to JSON and parsed with the protobuf JSON parser in strict mode, so an unknown or misspelled field is an error rather than silently ignored.
 - Constraints are declared in the schema with [protovalidate](https://github.com/bufbuild/protovalidate) and evaluated by `protovalidate-java`:
   - Field rules: name patterns for clusters and topics, absolute paths, port range, positive durations, `spiffe://` prefixes, mandatory fields marked `required`.
-  - Cross-field CEL rules: every producer entry, every consumer entry that reads Kafka itself and every rule of the dispatcher's policy references an existing cluster; a producer lists each cluster once and has at least one that is not best effort; `bootstrap.servers` is set; a `spiffe` source has a peer policy; the default processing deadline does not exceed the maximum; the settings of a dispatched consumer are consistent (see Dispatcher).
+  - Cross-field CEL rules: every producer entry, every consumer entry that reads Kafka itself and every rule of the dispatcher's policy references an existing cluster; a producer lists each cluster once and has at least one that is not best effort; `bootstrap.servers` is set; a `spiffe` source has a peer policy; the default processing deadline does not exceed the maximum; the settings of a dispatched consumer are consistent; a dispatcher's policy comes with TLS on its delivery port, and the TLS to a dispatcher says who the dispatcher is (see Dispatcher).
   - The enforced Kafka settings (below) are CEL rules on `Cluster`.
 - Validation reports every violation with its field path and rule id. Each rule id has a test.
 - Checks that need the outside world (referenced files exist and parse, brokers reachable) run after schema validation, in code.
@@ -268,9 +269,9 @@ The server owns the settings the guarantees rest on. They may be omitted from `p
 
 ### Dispatcher
 
-[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. Steps 1 to 4 of its plan exist: the schema, the `odradek.delivery.v1` protocol, the dispatch core, the dispatcher itself, and the sidecar's side. An app whose topics have the dispatcher as their `source` consumes them on the same `Consume` stream as before, and its sidecar has no Kafka consumer for them.
+[ADR 6](adr/0006-standalone-dispatcher-for-consumption.md) adds a second way to consume: a standalone deployment of the server, the dispatcher, is the consumer group and delivers records to the sidecars. Steps 1 to 5 of its plan exist: the schema, the `odradek.delivery.v1` protocol, the dispatch core, the dispatcher itself, the sidecar's side, and mutual TLS with the policy on the delivery port. An app whose topics have the dispatcher as their `source` consumes them on the same `Consume` stream as before, and its sidecar has no Kafka consumer for them.
 
-> **A dispatcher is not for use outside tests yet.** Its delivery port is plaintext and its policy is not enforced: every well-formed declaration that names one of its clusters is accepted, so whoever can reach the port can read every topic the dispatcher's Kafka credentials can. Seen from the sidecar, records and acknowledgements travel unencrypted and nothing proves that what answers at `dispatcher.address` is the dispatcher. Both log a warning saying so every time they start. Mutual TLS and the policy are step 5. It also runs as **one replica only**: a replica tells sidecars about itself alone, so with two of them a sidecar would see the partitions of one. Membership is step 6. Dead-lettering is step 7.
+> **A dispatcher runs as one replica only so far**: a replica tells sidecars about itself alone, so with two of them a sidecar would see the partitions of one. Membership is step 6. Dead-lettering is step 7. And **without `dispatch.tls` it is for tests**: see Security of the delivery port.
 
 A server that acts as a dispatcher has a `dispatch` section:
 
@@ -280,11 +281,19 @@ A server that acts as a dispatcher has a `dispatch` section:
 | `advertisedAddress` | `host:port` at which sidecars reach this replica | The pod's interface address and `port` |
 | `idleGrace` | How long a topic is still consumed after the last sidecar that declared it has gone | 5m |
 | `partitionWindow` | Largest span, in offsets, between a partition's commit position and its newest delivered record | 1000 |
-| `policy` | Rules saying who may consume what; a declaration that no rule allows is refused. **Validated and not enforced yet** | No rule: everything is refused |
+| `tls` | Mutual TLS on the delivery port: a credential source, `spiffe` or `files`, as for a cluster (section 9) | Unset: plaintext, for tests |
+| `policy` | Rules saying who may consume what; a declaration that no rule allows is refused. Needs `tls` | With `tls`, no rule: everything is refused |
 
-A rule of `policy` names the sidecars it applies to (`spiffeIds`, `trustDomain`, at least one of the two), one `cluster` of `clusters`, and patterns for the `topics`, the `groups` and, optionally, the `deadLetterTopics` it allows. A pattern is an exact name, or a prefix followed by one `*`; `*` alone matches every name.
+A rule of `policy` names the sidecars it applies to (`spiffeIds`, `trustDomain`, at least one of the two), one `cluster` of `clusters`, and patterns for the `topics`, the `groups` and, optionally, the `deadLetterTopics` it allows. A pattern is an exact name, or a prefix followed by one `*`; `*` alone matches every name. A declaration is allowed when one rule allows all of it; two rules that each allow a part do not add up.
 
-A server that receives from a dispatcher has a `dispatcher` section with the `address` (`host:port`) of the dispatcher's Service, and on each `consumers` entry concerned:
+A server that receives from a dispatcher has a `dispatcher` section:
+
+| Field | Meaning | Default |
+|---|---|---|
+| `address` | `host:port` of the dispatcher's Service | Required |
+| `tls` | Mutual TLS to the dispatcher: a credential source, and `acceptedSpiffeIds` or `acceptedTrustDomain`, which say who the dispatcher is. One of the two is required, whatever the source | Unset: plaintext, for tests |
+
+And on each `consumers` entry concerned:
 
 | Field | Meaning | Default |
 |---|---|---|
@@ -306,6 +315,8 @@ clusters:
     properties:
       bootstrap.servers: orders-kafka:9093
 dispatch:
+  tls:
+    spiffe: {}                 # its own SVID, and the bundles sidecars are verified against
   policy:
     - spiffeIds: ["spiffe://example.org/ns/billing/sa/billing"]
       cluster: orders
@@ -318,6 +329,9 @@ dispatch:
 # The sidecar of an application pod
 dispatcher:
   address: odradek-dispatcher.kafka.svc:9465
+  tls:
+    spiffe: {}                 # the pod's SVID: the identity the policy goes by
+    acceptedSpiffeIds: ["spiffe://example.org/ns/kafka/sa/odradek-dispatcher"]
 consumers:
   orders.created:
     source: CONSUMER_SOURCE_DISPATCHER
@@ -337,7 +351,8 @@ A server with a `dispatch` section serves `DeliveryService` on `dispatch.port` (
   | Status | When |
   |---|---|
   | `INVALID_ARGUMENT` | The first message is not `Declare`; a name or the processing deadline is missing; a setting has a value the dispatcher does not know; the dead-letter topic and `on_exhausted` contradict each other |
-  | `PERMISSION_DENIED` | The cluster is not one of the dispatcher's. From step 5, also whatever the policy does not allow, in the same words |
+  | `UNAUTHENTICATED` | The delivery port has TLS and the sidecar's certificate carries no SPIFFE ID to authorize. Said before anything else, whatever the first message is |
+  | `PERMISSION_DENIED` | The policy has no rule that allows this identity this topic in this group on this cluster, with the dead-letter topic it names; or the cluster is not one of the dispatcher's. One message for every reason (see Security of the delivery port) |
   | `UNIMPLEMENTED` | `ON_EXHAUSTED_DEAD_LETTER`, until step 7. `ON_EXHAUSTED_BLOCK` works |
   | `FAILED_PRECONDITION` | The group already consumes the topic with other settings, declared by a sidecar that is still connected. The message gives the settings in force and those declared |
   | `UNAVAILABLE` | The dispatcher is starting or stopping, or its consumer for the group failed |
@@ -364,14 +379,56 @@ A server with a `dispatch` section serves `DeliveryService` on `dispatch.port` (
 - An error that Kafka reports for one topic of a group (a topic the dispatcher may not read, for example) ends every stream of the group with `UNAVAILABLE`. The sidecars reconnect, and the group fails again while the topic is declared.
 - A sidecar's credit bounds what is written to its stream, not what it reads: a sidecar that grants credit and stops reading holds that many records in the dispatcher's memory until its connection is closed.
 
+#### Security of the delivery port
+
+`Deliver` streams run over mutual TLS when both ends configure it: `dispatch.tls` on the dispatcher, `dispatcher.tls` on the server that receives. The credentials come from the sources of section 9, `files` or `spiffe`, loaded and kept current by the same code as a cluster's (`server/tls`: `TlsSources`, `ReloadingSslContext`, `PeerTrust`).
+
+**The handshake.** TLS 1.3 only, with the JDK's TLS, because both ends are this server. Identities are SPIFFE IDs: the one URI subject alternative name of a certificate. No host name is ever checked, since a sidecar connects to replicas by IP address.
+
+| End | Presents | Accepts |
+|---|---|---|
+| Dispatcher | The certificate of `dispatch.tls` | Any client certificate that verifies. With a `spiffe` source: one that carries a SPIFFE ID and chains to the bundle of the trust domain that ID names, federated bundles included, so that an authority federated with vouches only for its own identities. With `files`: one that chains to the CA bundle. A connection without a client certificate is closed |
+| Sidecar | The certificate of `dispatcher.tls` | A certificate that verifies the same way and whose SPIFFE ID is in `acceptedSpiffeIds` or in `acceptedTrustDomain`. Every replica must present one: the check is made on the connection to the Service's address and on each connection to a replica |
+
+- The dispatcher's handshake does not consult the policy. A sidecar the policy has no rule for completes the handshake and is refused when it declares, with a status and a message; a handshake can only fail, and the sidecar could not tell why.
+- **A handshake that fails is not an answer.** Whichever end refuses, and for whatever reason (no certificate, an authority that is not trusted, an identity that is not accepted, one end speaking plaintext), gRPC reports `UNAVAILABLE` on the sidecar: the dispatcher was not reached. The sidecar opens the stream again with its usual backoff and the app's stream stays open, as while a dispatcher is away; the reason is in the sidecar's log, at each attempt. This is deliberate. During a rotation a handshake can fail for a moment (one end has the new authority and the other does not yet), and whoever can answer at the dispatcher's address without being the dispatcher must not be able to end an app's stream. `UNAUTHENTICATED` and `PERMISSION_DENIED`, which do end it, are only ever said by a dispatcher whose identity the sidecar has verified.
+
+**Authorization.** The dispatcher authorizes each declaration by the SPIFFE ID of the connection it arrives on, against `dispatch.policy` (`Policy`).
+
+- A certificate without a SPIFFE ID (possible only with a `files` source) names nobody: `UNAUTHENTICATED`.
+- Whatever no rule allows is `PERMISSION_DENIED`, with one message whatever the reason: `<SPIFFE ID> is not allowed to consume topic <t> in group <g> on cluster <c>`, and `with dead-letter topic <d>` when the declaration names one. It is made of who asked and what was asked, so it tells a sidecar nothing of the clusters the dispatcher has, of the rules of other identities, or of which part of its own rule failed. The dispatcher logs each refusal.
+- A malformed declaration is `INVALID_ARGUMENT` before the policy is consulted: that answer is the same for everyone.
+- The dead-letter topic is checked with the rest, before the answer that dead-lettering is not built (step 7).
+- **A declaration is authorized when it is made.** A stream that was accepted stays until it ends: a policy change needs a restart of the dispatcher anyway (`dispatch` is not hot-reloadable), which ends every stream, and a certificate that expires or is revoked while its connection is open is not looked at again, as TLS does not re-validate a live connection.
+
+**Rotation.** grpc-netty takes one Netty `SslContext` for the life of a listener or channel, and Netty's contexts are immutable. `ReloadingSslContext` is a context that only points at another: each time grpc-netty asks it for an engine, which is once per connection, it answers from a context built from the `CredentialSource`'s snapshot of that moment, built once per snapshot. So:
+
+- a rotated certificate or trust bundle is used from the next handshake on, on both ends;
+- the listener is not restarted and no channel is rebuilt;
+- a connection that is open keeps the session it negotiated, and its streams go on;
+- a context per snapshot is also a TLS session cache per snapshot, so a connection made after a rotation cannot resume a session from before it: the certificate a peer is seen with is one it presented in that handshake.
+
+A sidecar makes its connections when an app subscribes, so a pod presents its newest certificate to the dispatcher on each new Consume stream and on each reconnection, not before.
+
+**Readiness and metrics.** The credentials of the delivery port are loaded with the clusters', before the server listens: a dispatcher whose `dispatch.tls` cannot be loaded does not start, and neither does a sidecar whose `dispatcher.tls` cannot. Once started, an expired certificate of either makes the health service answer `NOT_SERVING` (`dispatch.tls: the certificate expired at …`), as a cluster's does. The three `odradek.tls.*` metrics report them under the attribute `delivery`, whose value is the section: `dispatch.tls` or `dispatcher.tls`.
+
+**Plaintext.** Each end is plaintext when its `tls` is unset, and says so in a warning every time it starts. It exists for tests and for a machine nobody else can reach.
+
+- A dispatcher without `dispatch.tls` accepts every well-formed declaration that names one of its clusters: whoever reaches the port reads every topic the dispatcher's Kafka credentials can.
+- **`dispatch.policy` without `dispatch.tls` is rejected when the configuration is loaded** (`dispatch.policy_requires_tls`), and the server exits with status 2. Nobody has an identity on a plaintext port, so such a policy would either match no one or be ignored. Refusing to start was chosen over refusing every declaration: the mistake shows where it was made, in the dispatcher's rollout, and not as `PERMISSION_DENIED` in every application's logs; and a configuration that reads as protected is never served unprotected.
+- With `dispatch.tls` and no rule, the dispatcher starts, warns, and refuses every declaration.
+- The two ends must agree. A sidecar with `dispatcher.tls` does not talk to a plaintext dispatcher, nor a plaintext sidecar to a dispatcher with TLS: both are handshakes that fail.
+
+**Not covered.** Certificates without SPIFFE IDs match no rule (ADR 6, Open). Nothing bounds how long a connection, and so an identity, lives: a pod whose identity was withdrawn keeps its open streams until they end. The policy is not hot-reloadable.
+
 #### What a receiving sidecar does
 
 A `Subscribe` whose topics have the dispatcher as their `source` is served by `server/receive` (`ReceiveService`, `ReceiveSession`) instead of a Kafka consumer. `Subscribed` is sent at once, with the cluster and group of the consumer entry and the processing deadline resolved as for any stream. The app cannot tell the difference, except by what follows.
 
 - **Streams.** One `Deliver` stream per topic and dispatcher replica, opened when the app subscribes and closed when its stream ends. Each declares the entry's `cluster`, `groupId` and topic, its `ordering`, `offsetReset`, `startTimestamp`, `maxAttempts`, `onExhausted` and `deadLetterTopic` (what the entry leaves unset is left to the dispatcher's defaults), the app's processing deadline, and the server's version.
-- **Finding the replicas.** The first stream of each topic goes to `dispatcher.address`. `Accepted` carries the list of replicas and the address of the one that answered (`Accepted.address`): if that address is on the list, the stream is the stream to that replica, and one is opened to each of the others; if it is not, or is missing, every listed replica gets a stream of its own and the first one is closed. A `ReplicaList` that arrives later, on any stream, replaces the list when its generation is higher: streams are opened to replicas that are new and closed to those no longer listed. A list whose generation is not higher is ignored. Replica addresses are connected to as given.
-- **Lost streams.** A stream that ends with `UNAVAILABLE`, or with anything else that is not a refusal for good, is opened again at the same replica while that replica is listed, after a delay that doubles from 100 ms to 5 s, each delay drawn at random from the upper half of its step (the backoff of the client libraries). When no stream is left, open or being opened, the list and its generation are forgotten and the server starts again from `dispatcher.address`. Meanwhile the app's stream stays open and receives nothing.
-- **Refusals for good.** `FAILED_PRECONDITION` (the group consumes the topic with other settings), `PERMISSION_DENIED`, `UNAUTHENTICATED`, `INVALID_ARGUMENT` and `UNIMPLEMENTED` would be met again by a new stream. The app's stream ends with the same status and a message that names the dispatcher's address, the topic, the group and the cluster, followed by what the dispatcher said. The client libraries treat all five as fatal.
+- **Finding the replicas.** The first stream of each topic goes to `dispatcher.address`. `Accepted` carries the list of replicas and the address of the one that answered (`Accepted.address`): if that address is on the list, the stream is the stream to that replica, and one is opened to each of the others; if it is not, or is missing, every listed replica gets a stream of its own and the first one is closed. A `ReplicaList` that arrives later, on any stream, replaces the list when its generation is higher: streams are opened to replicas that are new and closed to those no longer listed. A list whose generation is not higher is ignored. Replica addresses are connected to as given, with the same `dispatcher.tls` as the first connection: every connection is made in one place (`ReceiveService.connect`).
+- **Lost streams.** A stream that ends with `UNAVAILABLE`, which includes every TLS handshake that failed (see Security of the delivery port), or with anything else that is not a refusal for good, is opened again at the same replica while that replica is listed, after a delay that doubles from 100 ms to 5 s, each delay drawn at random from the upper half of its step (the backoff of the client libraries). When no stream is left, open or being opened, the list and its generation are forgotten and the server starts again from `dispatcher.address`. Meanwhile the app's stream stays open and receives nothing.
+- **Refusals for good.** `FAILED_PRECONDITION` (the group consumes the topic with other settings), `PERMISSION_DENIED`, `UNAUTHENTICATED`, `INVALID_ARGUMENT` and `UNIMPLEMENTED` would be met again by a new stream. The app's stream ends with the same status and a message that names the dispatcher's address, the topic, the group and the cluster, followed by what the dispatcher said. The client libraries treat all five as fatal. All five are answers of a dispatcher that was reached, and, with TLS, verified: gRPC itself reports a connection that could not be made or secured as `UNAVAILABLE`, never as one of these.
 - **Decoding.** Records arrive as stored in Kafka and are decoded with the topic's codec, as on the consume path. A record that cannot be decoded follows the entry's `onDecodeError`: with `DELIVER_UNDECODED` it is delivered as stored with `decode_error` set, and acknowledged by the app like any other; with `FAIL`, where a consumer that reads Kafka ends the stream with `DATA_LOSS`, it is rejected to the dispatcher, which counts a failed attempt, and the stream stays. The rejection is sent one second after the record arrived, so that a record nobody can decode, on a topic with no `maxAttempts`, goes round once a second per sidecar and not as fast as the network allows. Rejections are logged at most once per topic every 10 seconds.
 - **No Kafka client.** The server commits nothing and holds no consumer for these topics. A server whose consumers are all received, and which produces nothing, needs no entry under `clusters`.
 
@@ -405,7 +462,7 @@ A `Subscribe` whose topics have the dispatcher as their `source` is served by `s
 
 - With several streams, a stream that was busy and went quiet keeps what its window had outstanding, up to its share of half the app's budget, until it is opened again.
 - A record waiting in the server for the app's credit is not visible in a metric yet.
-- The connection is plaintext, and one connection per address and Consume stream: streams of different Consume streams do not share one.
+- There is one connection per address and Consume stream: streams of different Consume streams do not share one, and each makes its own TLS handshake.
 
 #### Dispatch core
 
@@ -746,7 +803,8 @@ Each cluster's `tls` block selects one source.
 - `spiffe` is the server's own client of the Workload API, on the gRPC stack it already has, rather than `java-spiffe`: one streaming call, no second gRPC or Netty on the class path, and nothing new for the native image. The socket is `workloadApiSocket`, or the `SPIFFE_ENDPOINT_SOCKET` environment variable. Clusters naming the same socket share one stream and so one SVID. The first SVID of an update is used.
 - When the stream ends (the agent restarts), it is opened again with a pause that grows from half a second to thirty. The current SVID stays in use meanwhile, for as long as it is valid.
 - Federated bundles cover brokers in another trust domain. A broker is verified against the bundle of the trust domain its SPIFFE ID names and no other, so an authority federated with can only vouch for its own identities.
-- Metrics (section 2): `odradek.tls.certificate.not_after`, `odradek.tls.credential.reloads` and `odradek.tls.credential.reload.failures`, per cluster. Alert on time-to-expiry, not on rotation events. Reloads and rejections are also logged, and an expired certificate makes the health service answer `NOT_SERVING`.
+- The delivery port of a dispatcher (`dispatch.tls`) and the connections to one (`dispatcher.tls`) take their credentials from the same two sources, held by the same code and reloaded the same way; there it is gRPC's listener and channels that are never rebuilt. A source named for both a cluster and the delivery port is shared when it is the same Workload API socket. See Security of the delivery port (section 4).
+- Metrics (section 2): `odradek.tls.certificate.not_after`, `odradek.tls.credential.reloads` and `odradek.tls.credential.reload.failures`, per cluster and per end of the delivery port. Alert on time-to-expiry, not on rotation events. Reloads and rejections are also logged, and an expired certificate makes the health service answer `NOT_SERVING`.
 
 ### Peer verification
 
@@ -814,6 +872,7 @@ New, with no in-process equivalent: topics produced to several clusters. Their l
 | Fault | Kill the server mid-produce and mid-revoke; hang the app; drop the stream; stop a broker | End-to-end harness; assert no false acks and no committed-but-unprocessed offsets |
 | Dispatcher | The dispatch core against scripted and random events; declarations and batching; the Delivery service against Kafka's mock consumer; and, against a real broker with scripted sidecars (gRPC clients written in the test): more sidecars than partitions, per-key order, a sidecar killed mid-batch, a missed deadline, a blocked partition, a second topic declared while the first is consumed, the idle grace, a restart | Unit tests; `DispatchE2eTest` in the three end-to-end targets, the native image included |
 | Receiving from a dispatcher | The credit split, the mapping to partitions and epochs with acknowledgements over gaps, the replica list and the backoff, each on its own; the bridge against scripted replicas (in-process gRPC servers written in the test): several replicas, a list that changes, lost streams, refusals, both decode-error modes, an app that stops acknowledging, the three ways a stream ends; conformance scenarios for the client cores with gapped and repeated offsets; and, against a real broker with a real dispatcher and real sidecars, through the app's API: more sidecars than partitions, per-key order across sidecars, a sidecar killed mid-batch, a late acknowledgement, the dispatcher restarted, a sidecar started before the dispatcher, a declaration refused for good, both decode-error modes, mixed sources, two topics on one stream, an app that produces and consumes | Unit tests; `conformance/scenarios`; `ReceiveE2eTest` in the three end-to-end targets, the native image included |
+| Security of the delivery port | Policy matching, rule by rule, and what a refusal says; the TLS context one handshake at a time, in memory: both ends, rotation of a certificate and of an authority, an engine made before a rotation, identities accepted and not, federated trust domains, no host name check; the listener over real connections with a mock consumer: the status a sidecar sees for each refusal and for each handshake that fails; and, against a real broker with a real dispatcher and real sidecars: an allowed sidecar consumes, a topic that is not its own ends the app's stream with `PERMISSION_DENIED`, a certificate without SPIFFE ID with `UNAUTHENTICATED`, no certificate, plaintext, an untrusted authority and an unexpected dispatcher identity get nothing, credentials rotated on both sides under an open stream | Unit tests (`PolicyTest`, `ReloadingSslContextTest`, `DeliveryTlsTest`); `DeliveryTlsE2eTest` in the three end-to-end targets, the native image included |
 | Reload | ConfigMap-style `..data` symlink swap; invalid configuration keeps the last good one; producer swap under load keeps order and produces no duplicates; consumer rebuild commits before closing; credential rotation against a fake Workload API | Component and end-to-end harness |
 | Multi-cluster | Two brokers: a topic produced to both under load; one cluster failing as required and as best effort; a consumer moved with `startTimestamp` loses nothing; removing a cluster from a topic by reload | End-to-end harness |
 | Soak | Rolling restarts of app and server under load in a cluster | With the deployment work |
