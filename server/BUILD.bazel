@@ -68,7 +68,10 @@ genrule(
 # per-architecture classifier jar; pick the one for the target CPU.
 java_library(
     name = "netty_epoll_native",
-    visibility = ["//e2e:__pkg__"],
+    visibility = [
+        "//e2e:__pkg__",
+        "//e2e-client:__pkg__",
+    ],
     exports = ["@maven//:io_netty_netty_transport_native_unix_common"] + select({
         "@platforms//cpu:aarch64": ["@maven//:io_netty_netty_transport_native_epoll_linux_aarch_64"],
         "//conditions:default": ["@maven//:io_netty_netty_transport_native_epoll_linux_x86_64"],

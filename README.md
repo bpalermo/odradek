@@ -18,6 +18,7 @@ The same server can also run on its own as a dispatcher ([ADR 6](docs/adr/0006-s
 | `client/python/` | Python client library for applications (asyncio): a port of the protocol core, the generated API and the wheel (ADR 3) |
 | `conformance/` | Scenarios every client core must pass |
 | `e2e/` | End-to-end suites against real brokers: the server and the Java client (`src/`), the Python client (`python/`) |
+| `e2e-client/` | The test application of the in-cluster end-to-end run, on the Java client: a producer or a consumer, with fault knobs, that keeps its own account of every record and serves it on `GET /results` ([README](e2e-client/README.md)) |
 | `deploy/kubernetes/` | Example manifests, plain YAML with a `kustomization.yaml` each: a dispatcher (`dispatcher/`) and an application pod with the server as its sidecar (`application/`). `kubectl kustomize deploy/kubernetes/dispatcher` renders them; a unit test loads the configurations they embed |
 | `extension/java/` | Interfaces for extension jars: `RecordTransform`, the byte-to-byte codec step (encryption and similar) |
 | `bazel/` | Shared build code: formatter, linters, JUnit 6 macro, gRPC codegen shims |
@@ -46,6 +47,7 @@ Bazel is pinned in `.bazelversion` (use [Bazelisk](https://github.com/bazelbuild
 | Build the image (linux/amd64 + linux/arm64) | `bazel build //server:image_index` (`make image`) |
 | Load the image into the local Docker daemon | `bazel run //server:image_load` (as `localhost/odradek:e2e`; `make image-load`) |
 | Push the image (CI) | `bazel run //server:image_push` to `quay.io/odradek/odradek`, tags `dev` and `dev-<commit>`; its digest is in `bazel-bin/server/image_index_digest` |
+| Build, load and push the e2e-client image | `bazel build //e2e-client:image_index`; `bazel run //e2e-client:image_load` (as `localhost/odradek-e2e-client:e2e`); `bazel run //e2e-client:image_push` (CI) to `quay.io/odradek/e2e-client`, tags `dev` and `dev-<commit>` |
 | Verify a published image's signatures | `bazel run //bazel/cosign:verify_image -- quay.io/odradek/odradek@sha256:<digest>` (exit 0 verified, 1 failed, 2 could not check) |
 | Run cosign | `bazel run //bazel/cosign -- <args>` |
 | Build the native image (linux, this machine's CPU) | `bazel build //server:server_native` (`make native`); needs `gcc` and `zlib1g-dev`, about 4 GB of memory and 1 to 2 minutes; excluded from `//...` |
@@ -81,6 +83,7 @@ git tag v1.2.3 origin/main && git push origin v1.2.3
 | What | Where | Status |
 | --- | --- | --- |
 | Server image, JVM and native | `quay.io/odradek/odradek:X.Y.Z` and `:X.Y.Z-native`, signed | Same jobs as every commit on `main` |
+| e2e-client image (JVM) | `quay.io/odradek/e2e-client:X.Y.Z`, signed | Same job as every commit on `main` |
 | Java client and extension API | Maven Central | Off until the repository variable `PUBLISH_MAVEN` is `true`; never run |
 | Clojure client | Clojars | Off until `PUBLISH_CLOJARS` is `true`; never run |
 | Python client | PyPI | Off until `PUBLISH_PYPI` is `true`; never run |

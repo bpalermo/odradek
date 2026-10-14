@@ -1,0 +1,79 @@
+load("@rules_java//java:defs.bzl", "java_binary", "java_library")
+load("//bazel:registry.bzl", "IMAGE_REGISTRY", "image_repository")
+load("//bazel/image:defs.bzl", "java_image")
+load("//bazel/java:defs.bzl", "JAVACOPTS")
+load("//bazel/java:junit.bzl", "java_junit_test")
+
+package(default_visibility = ["//visibility:private"])
+
+# The test application of the in-cluster end-to-end run: a producer or a
+# consumer on the Java client, which keeps its own account of every record and
+# serves it on GET /results. See README.md.
+java_library(
+    name = "lib",
+    srcs = glob(["src/main/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    # The end-to-end suite runs both modes against a real server.
+    visibility = ["//e2e:__pkg__"],
+    deps = ["//client/java:client"],
+)
+
+# logback.xml, in a jar of its own so that it reaches the binary and not the
+# end-to-end suite, whose class path has the server's.
+java_library(
+    name = "logging",
+    resource_strip_prefix = "e2e-client/src/main/resources",
+    resources = ["src/main/resources/logback.xml"],
+)
+
+# Netty's epoll transport loads a native library, which Java 25 warns about
+# unless native access is granted.
+JVM_FLAGS = ["--enable-native-access=ALL-UNNAMED"]
+
+java_binary(
+    name = "e2e-client",
+    jvm_flags = JVM_FLAGS,
+    main_class = "io.github.bpalermo.odradek.e2eclient.Main",
+    runtime_deps = [
+        ":lib",
+        ":logging",
+        # The epoll transport's native code, needed for the Unix socket, is a
+        # jar per architecture: the server's select() picks the target CPU's.
+        "//server:netty_epoll_native",
+        "@maven//:ch_qos_logback_logback_classic",
+    ],
+)
+
+# quay.io/odradek/e2e-client, linux/amd64 and linux/arm64, on the same base and
+# by the same macro as the server's JVM image. Published by publish.yml.
+java_image(
+    name = "image",
+    base = "@distroless_java25",
+    deploy_jar = ":e2e-client_deploy.jar",
+    jar_path = "/app/e2e-client.jar",
+    jvm_flags = JVM_FLAGS,
+    load_tag = "localhost/odradek-e2e-client:e2e",
+    registry = IMAGE_REGISTRY,
+    repository = image_repository("e2e-client"),
+)
+
+java_junit_test(
+    name = "test",
+    size = "small",
+    srcs = glob(["src/test/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    test_classes = [
+        "io.github.bpalermo.odradek.e2eclient.ConsumerLedgerTest",
+        "io.github.bpalermo.odradek.e2eclient.FaultsTest",
+        "io.github.bpalermo.odradek.e2eclient.JsonTest",
+        "io.github.bpalermo.odradek.e2eclient.ProducerLedgerTest",
+        "io.github.bpalermo.odradek.e2eclient.RecordValueTest",
+        "io.github.bpalermo.odradek.e2eclient.ResultsServerTest",
+        "io.github.bpalermo.odradek.e2eclient.SettingsTest",
+    ],
+    deps = [
+        ":lib",
+        "@maven//:org_assertj_assertj_core",
+        "@maven//:org_junit_jupiter_junit_jupiter_api",
+    ],
+)

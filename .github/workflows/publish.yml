@@ -31,26 +31,45 @@ concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
-# WHERE the image goes is one setting, bazel/registry.bzl. Bazel loads it and
+# WHERE the images go is one setting, bazel/registry.bzl. Bazel loads it and
 # this workflow reads it; the registry is not spelled out here.
 #
 # Credentials are a Quay robot account, secrets QUAY_USERNAME / QUAY_TOKEN. The
-# robot can write the repository and cannot create it: it exists already.
+# robot can write the repositories and cannot create them: they exist already.
 #
 # Third-party actions are pinned to commit SHAs. This job holds the registry
 # credential and `id-token: write`, so an action swapped underneath a mutable
 # tag could push and sign an image with this repository's own identity.
 jobs:
+  # The JVM images, one leg each, both made by java_image (//bazel/image:defs.bzl):
+  # the server, quay.io/odradek/odradek, and the test application of the
+  # in-cluster end-to-end run, quay.io/odradek/e2e-client. Both are pushed under
+  # the same tags and signed the same way; a release publishes both under its
+  # version.
   publish:
+    name: publish (${{ matrix.image }})
     # workflow_dispatch can target any branch. Without this guard a manual run
     # from a feature branch would publish under the same mutable tags.
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     environment: release
     runs-on: ubuntu-latest
+    strategy:
+      # One image that fails to publish does not cancel the other.
+      fail-fast: false
+      matrix:
+        include:
+          - image: odradek
+            package: server
+          - image: e2e-client
+            package: e2e-client
     env:
       # `inputs` is empty for a push to main, which publishes `dev`.
       IMAGE_TAG: ${{ inputs.tag || 'dev' }}
       RELEASE_VERSION: ${{ inputs.version }}
+      # The Bazel package whose java_image targets (image_index, image_push and
+      # the image_tag flag) this leg builds, and the repository they push to.
+      PACKAGE: ${{ matrix.package }}
+      IMAGE_NAME: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -79,10 +98,12 @@ jobs:
           fi
           echo "publishing ${GITHUB_SHA}, which is main's tip"
 
+      # The server's leg keeps the disk cache it always had; another leg has
+      # one of its own.
       - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}
+          disk-cache: ${{ matrix.image == 'odradek' && github.workflow || format('{0}-{1}', github.workflow, matrix.image) }}
           repository-cache: true
           cache-save: ${{ github.ref == 'refs/heads/main' }}
 
@@ -98,7 +119,7 @@ jobs:
           fi
           {
             echo "IMAGE_REGISTRY_HOST=${registry}"
-            echo "ODRADEK_IMAGE=${registry}/${namespace}/odradek"
+            echo "IMAGE=${registry}/${namespace}/${IMAGE_NAME}"
           } >> "${GITHUB_ENV}"
 
       # Everything is built before any credential exists on the runner. The
@@ -110,8 +131,8 @@ jobs:
       - name: Build the image and the tools
         run: |
           bazel build --config=ci --output_groups=+digest \
-            "--//server:image_tag=${IMAGE_TAG}" \
-            //server:image_index //server:image_push \
+            "--//${PACKAGE}:image_tag=${IMAGE_TAG}" \
+            "//${PACKAGE}:image_index" "//${PACKAGE}:image_push" \
             //bazel/cosign //bazel/cosign:verify_image
 
       # One login covers the push and cosign: both read the Docker config this
@@ -123,7 +144,7 @@ jobs:
           password: ${{ secrets.QUAY_TOKEN }}
 
       - name: Push the multi-arch image
-        run: bazel run --config=ci "--//server:image_tag=${IMAGE_TAG}" //server:image_push
+        run: bazel run --config=ci "--//${PACKAGE}:image_tag=${IMAGE_TAG}" "//${PACKAGE}:image_push"
 
       # The digest comes from the build rather than from the registry:
       # re-resolving a mutable tag reintroduces a time-of-check window. The
@@ -133,8 +154,8 @@ jobs:
         id: digest
         run: |
           set -euo pipefail
-          index_file="$(bazel cquery --config=ci "--//server:image_tag=${IMAGE_TAG}" \
-            //server:image_index --output=files 2>/dev/null \
+          index_file="$(bazel cquery --config=ci "--//${PACKAGE}:image_tag=${IMAGE_TAG}" \
+            "//${PACKAGE}:image_index" --output=files 2>/dev/null \
             | grep -E '_index\.json$' | head -1)"
           digest_file="${index_file%_index.json}_digest"
           if [ -z "${index_file}" ] || [ ! -s "${digest_file}" ]; then
@@ -146,8 +167,8 @@ jobs:
             sha256:*) ;;
             *) echo "::error::unexpected digest ${digest}" >&2; exit 1 ;;
           esac
-          echo "image=${ODRADEK_IMAGE}@${digest}" >> "${GITHUB_OUTPUT}"
-          echo "pushed ${ODRADEK_IMAGE}@${digest}"
+          echo "image=${IMAGE}@${digest}" >> "${GITHUB_OUTPUT}"
+          echo "pushed ${IMAGE}@${digest}"
 
       # --recursive signs the index and every child manifest, so pulling the
       # amd64 or arm64 manifest by its own digest also gets something signed.

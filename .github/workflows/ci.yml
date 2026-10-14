@@ -75,6 +75,7 @@ jobs:
         run: |
           bazel build --config=ci \
             //server:image_index //server:image_push \
+            //e2e-client:image_index //e2e-client:image_push \
             //bazel/cosign //bazel/cosign:verify_image
 
       # The image must do what the binary does: read a configuration from the
@@ -99,6 +100,28 @@ jobs:
           docker logs odradek 2>&1 | tee image-run.log
           grep -q "listening on /var/run/kafka/kafka.sock" image-run.log
           grep -q "stopped" image-run.log
+
+      # The e2e-client image (quay.io/odradek/e2e-client) starts, serves its
+      # results and writes its final line when stopped. No sidecar is needed
+      # for that: the client retries a socket that is not there.
+      - name: Load the e2e-client image, start it and stop it
+        run: |
+          set -euo pipefail
+          bazel run --config=ci //e2e-client:image_load
+          docker run --rm localhost/odradek-e2e-client:e2e --help | grep -q -- "--fail-hold"
+          docker run -d --name e2e-client -p 18080:8080 localhost/odradek-e2e-client:e2e \
+            --mode consumer --topic smoke --stop-timeout 5s
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:18080/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://localhost:18080/results | tee results.json
+          grep -q '"mode":"consumer"' results.json
+          docker stop --timeout 20 e2e-client
+          docker logs e2e-client 2>/dev/null | tee e2e-client-run.log
+          grep -q '"event":"final"' e2e-client-run.log
 
   # End to end against real Kafka in KRaft mode (no ZooKeeper). Two
   # independent single-node clusters, so the multi-cluster cases run in the
