@@ -393,7 +393,9 @@ message Telemetry {
   // How often metrics are pushed. Default: 30s. At least 1s.
   google.protobuf.Duration export_interval = 2 [(buf.validate.field).duration.gte = {seconds: 1}];
   // Resource attributes added to every metric, next to service.name, which
-  // is "odradek" unless set here (e.g. k8s.pod.name, deployment.environment).
+  // is "odradek" unless set here (e.g. deployment.environment). The
+  // environment variable OTEL_RESOURCE_ATTRIBUTES adds more and wins on a key
+  // both set: it is where a pod names itself, since this file is shared.
   map<string, string> resource_attributes = 3 [(buf.validate.field).map.keys.string.min_len = 1];
 }
 

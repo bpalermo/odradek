@@ -94,9 +94,9 @@ data:
           deadLetterTopics: ["billing.dlq.*"]
 
     telemetry:
-      # OTLP/gRPC. Every replica reports under the same attributes: have the
-      # collector add the pod's name (its k8sattributes processor), or the
-      # replicas' series cannot be told apart.
+      # OTLP/gRPC. Every replica reads this file, so the pod's name comes
+      # from OTEL_RESOURCE_ATTRIBUTES in the Deployment: without it the
+      # replicas' series could not be told apart.
       endpoint: http://otel-collector.observability.svc:4317
       resourceAttributes:
         service.name: odradek-dispatcher

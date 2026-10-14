@@ -2,6 +2,7 @@ package io.github.bpalermo.odradek.server.telemetry;
 
 import static io.opentelemetry.sdk.testing.assertj.OpenTelemetryAssertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
 
 import com.google.protobuf.util.Durations;
 import io.github.bpalermo.odradek.config.v1.Cluster;
@@ -242,6 +243,60 @@ class TelemetryTest {
     } finally {
       collector.close();
     }
+  }
+
+  @Test
+  void theEnvironmentAddsResourceAttributesAndWinsOverTheConfiguration() throws Exception {
+    FakeCollector collector = FakeCollector.start();
+    ServerConfig.Builder config = ServerConfig.newBuilder();
+    config
+        .getTelemetryBuilder()
+        .setEndpoint(collector.endpoint())
+        .setExportInterval(Durations.fromMillis(1000))
+        .putResourceAttributes("service.name", "orders-odradek")
+        .putResourceAttributes("k8s.pod.name", "from-the-configmap");
+    try (Telemetry telemetry =
+        Telemetry.create(config.build(), "k8s.pod.name=orders-7d9f, k8s.namespace.name=billing")) {
+      telemetry.metrics().produced("orders.created", null);
+      collector.await(
+          Duration.ofSeconds(20),
+          "odradek.produce.records",
+          "orders.created",
+          "service.name",
+          "orders-odradek",
+          "k8s.pod.name",
+          "orders-7d9f");
+      assertThat(collector.received("billing")).isTrue();
+      assertThat(collector.received("from-the-configmap")).isFalse();
+    } finally {
+      collector.close();
+    }
+  }
+
+  @Test
+  void resourceAttributesAreParsedAsTheSdksDo() {
+    assertThat(Telemetry.resourceAttributes(null)).isEmpty();
+    assertThat(Telemetry.resourceAttributes("  ")).isEmpty();
+    assertThat(Telemetry.resourceAttributes(" a = 1 ,, b=x%2Cy%3Dz+w ,c=,"))
+        .containsExactly(entry("a", "1"), entry("b", "x,y=z+w"), entry("c", ""));
+  }
+
+  @Test
+  void aMalformedEnvironmentIsRefusedWhole() {
+    assertThatThrownBy(() -> Telemetry.resourceAttributes("a=1,b"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("OTEL_RESOURCE_ATTRIBUTES")
+        .hasMessageContaining("\"b\"");
+    assertThatThrownBy(() -> Telemetry.resourceAttributes("=1"))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> Telemetry.resourceAttributes("a=%zz"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("the value of a");
+    ServerConfig.Builder config = ServerConfig.newBuilder();
+    config.getTelemetryBuilder().setEndpoint("http://localhost:4317");
+    assertThatThrownBy(() -> Telemetry.create(config.build(), "pod"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("OTEL_RESOURCE_ATTRIBUTES");
   }
 
   @Test
