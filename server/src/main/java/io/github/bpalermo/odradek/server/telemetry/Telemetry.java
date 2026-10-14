@@ -16,7 +16,11 @@ import io.opentelemetry.sdk.resources.Resource;
 import java.io.Closeable;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,6 +32,13 @@ import org.slf4j.LoggerFactory;
  */
 public final class Telemetry implements Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(Telemetry.class);
+
+  /**
+   * The environment variable whose resource attributes are added to the configuration's, as the
+   * OpenTelemetry SDKs read it: {@code key=value} pairs separated by commas, values
+   * percent-encoded.
+   */
+  public static final String RESOURCE_ATTRIBUTES_VARIABLE = "OTEL_RESOURCE_ATTRIBUTES";
 
   /** How often metrics are pushed when the configuration does not say. */
   public static final Duration DEFAULT_INTERVAL = Duration.ofSeconds(30);
@@ -52,13 +63,23 @@ public final class Telemetry implements Closeable {
    * Starts exporting if the configuration names an endpoint.
    *
    * @throws IllegalArgumentException if the endpoint is not {@code http://host:port} or {@code
-   *     https://host:port}
+   *     https://host:port}, or {@value #RESOURCE_ATTRIBUTES_VARIABLE} is malformed
    */
   public static Telemetry create(ServerConfig config) {
+    return create(config, System.getenv(RESOURCE_ATTRIBUTES_VARIABLE));
+  }
+
+  /**
+   * As above, with the value of {@value #RESOURCE_ATTRIBUTES_VARIABLE} given; {@code null} when it
+   * is not set.
+   */
+  static Telemetry create(ServerConfig config, String environmentAttributes) {
     var telemetry = config.getTelemetry();
     if (!telemetry.hasEndpoint() || telemetry.getEndpoint().isEmpty()) {
       return new Telemetry(ServerMetrics.noop(), null, null, null);
     }
+    // Before anything is started, so that a malformed variable leaves nothing to close.
+    Map<String, String> fromEnvironment = resourceAttributes(environmentAttributes);
     URI endpoint;
     try {
       endpoint = new URI(telemetry.getEndpoint());
@@ -100,6 +121,9 @@ public final class Telemetry implements Closeable {
     telemetry
         .getResourceAttributesMap()
         .forEach((k, v) -> attributes.put(AttributeKey.stringKey(k), v));
+    // The environment is the pod's own (its name, from the downward API), where the configuration
+    // is shared by every replica: on a key that both set, the environment wins.
+    fromEnvironment.forEach((k, v) -> attributes.put(AttributeKey.stringKey(k), v));
     Duration interval =
         telemetry.hasExportInterval()
             ? Duration.ofSeconds(
@@ -116,6 +140,45 @@ public final class Telemetry implements Closeable {
             .build();
     LOG.info("metrics are pushed to {} every {}", telemetry.getEndpoint(), interval);
     return new Telemetry(new ServerMetrics(provider.get("odradek")), provider, channel, group);
+  }
+
+  /**
+   * Parses the value of {@value #RESOURCE_ATTRIBUTES_VARIABLE}. Unset or blank is no attributes;
+   * blank entries are skipped.
+   *
+   * @throws IllegalArgumentException if an entry has no {@code =}, an empty key, or a value that is
+   *     not valid percent-encoding. The whole variable is refused rather than read in part: a pod
+   *     that reported under half its attributes would be told apart from its siblings by the wrong
+   *     ones.
+   */
+  static Map<String, String> resourceAttributes(String value) {
+    Map<String, String> attributes = new LinkedHashMap<>();
+    if (value == null || value.isBlank()) {
+      return attributes;
+    }
+    for (String entry : value.split(",", -1)) {
+      if (entry.isBlank()) {
+        continue;
+      }
+      int equals = entry.indexOf('=');
+      String key = equals < 0 ? "" : entry.substring(0, equals).strip();
+      if (key.isEmpty()) {
+        throw new IllegalArgumentException(
+            RESOURCE_ATTRIBUTES_VARIABLE
+                + " must be key=value pairs separated by commas, not \""
+                + entry.strip()
+                + "\"");
+      }
+      String encoded = entry.substring(equals + 1).strip();
+      try {
+        // Percent-encoding, not form encoding: a '+' is a plus sign.
+        attributes.put(key, URLDecoder.decode(encoded.replace("+", "%2B"), StandardCharsets.UTF_8));
+      } catch (IllegalArgumentException e) {
+        throw new IllegalArgumentException(
+            RESOURCE_ATTRIBUTES_VARIABLE + ": the value of " + key + " is not percent-encoded", e);
+      }
+    }
+    return attributes;
   }
 
   public ServerMetrics metrics() {

@@ -99,7 +99,7 @@ flowchart LR
 
 ### Metrics
 
-Metrics are pushed over OTLP/gRPC to the collector named by `telemetry.endpoint`, every `telemetry.exportInterval` (default 30 s) and once more at shutdown. Without an endpoint nothing is exported. The server uses the OpenTelemetry SDK, with the exporter running on the gRPC and Netty the server already has. Every metric carries the resource attribute `service.name` (`odradek`) and whatever `telemetry.resourceAttributes` adds.
+Metrics are pushed over OTLP/gRPC to the collector named by `telemetry.endpoint`, every `telemetry.exportInterval` (default 30 s) and once more at shutdown. Without an endpoint nothing is exported. The server uses the OpenTelemetry SDK, with the exporter running on the gRPC and Netty the server already has. Every metric carries the resource attribute `service.name` (`odradek`), whatever `telemetry.resourceAttributes` adds, and whatever the environment variable `OTEL_RESOURCE_ATTRIBUTES` adds, read as the OpenTelemetry SDKs read it (`key=value` pairs separated by commas, values percent-encoded). On a key that both set, the variable wins: it is the pod's own, where the configuration is shared. A malformed variable is refused whole and the server does not start (exit status 2), rather than reporting under part of its attributes. Without `telemetry.endpoint` the variable is not read.
 
 | Metric | Kind | Attributes | Meaning |
 |---|---|---|---|
@@ -162,7 +162,7 @@ The Kafka clients' own metrics are exported too, from an allow-list: Kafka has h
 
 - A dispatcher's consumers report the same `odradek.kafka.consumer.*` metrics, lag included: there the lag of a group is one series per partition, reported by the replica that owns it.
 - A dispatcher's dead-letter producers report the `odradek.kafka.producer.*` metrics under their cluster, from the first record it dead-letters there.
-- The replicas of a dispatcher report under the same attributes, and so do the pods of an application. Nothing in the server names the pod (a ConfigMap is shared, so `telemetry.resourceAttributes` cannot): the collector has to add it, or the series of two replicas are one series in whatever stores them. For the up-down counters that is wrong, not merely coarse.
+- The replicas of a dispatcher read the same configuration, and so do the pods of an application, so `telemetry.resourceAttributes` cannot tell them apart. Each pod names itself through `OTEL_RESOURCE_ATTRIBUTES` (in Kubernetes, `k8s.pod.name=$(POD_NAME)` with `POD_NAME` from the downward API, as the example manifests do), or the collector adds the pod (its `k8sattributes` processor). Without either, the series of two replicas are one series in whatever stores them; for the up-down counters that is wrong, not merely coarse.
 - So does a dispatcher's membership of its coordination group, under that group's name: `rebalances` counts the changes of the dispatcher's replicas as this replica saw them, and `last_poll.age` says whether its membership is being kept up. It has no lag and no partitions.
 - The client id is not an attribute: a consumer's changes with every stream. The consumers of one group on one cluster are therefore one series. A counter, `assigned_partitions`, `connections` and `buffer.available` are their sum; every other gauge is the largest among them (the worst consumer).
 - A consumer's gauges stop being reported when its stream ends, and a partition's lag when the partition is revoked. A counter keeps what closed consumers counted, so it only goes up while the server runs.
@@ -725,7 +725,7 @@ A `Subscribe` whose topics have the dispatcher as their `source` is served by `s
 | `odradek.tls.certificate.not_after`, `odradek.ready` | As for any server (section 9) | Time to expiry |
 
 - With no application pod running, nobody declares anything, the dispatcher consumes nothing and reports no lag for the group. Lag for an autoscaler that scales from zero comes from Kafka.
-- The replicas report under the same attributes: add the pod at the collector (see Metrics).
+- The replicas read the same configuration: each names itself through `OTEL_RESOURCE_ATTRIBUTES` (see Metrics).
 
 **Dead-letter topics.**
 

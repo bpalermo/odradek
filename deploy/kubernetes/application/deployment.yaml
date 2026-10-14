@@ -45,6 +45,15 @@ spec:
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///spiffe-workload-api/spire-agent.sock
+            # Names this pod in its metrics, which the configuration cannot:
+            # every pod reads the same one. $(POD_NAME) is expanded by
+            # Kubernetes, so it is defined first.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: k8s.pod.name=$(POD_NAME)
           ports:
             - name: health
               containerPort: 9464
