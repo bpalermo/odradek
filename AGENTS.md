@@ -38,6 +38,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 | `conformance/scenarios/` | YAML scenarios that every core must pass |
 | `extension/java/` | `RecordTransform`, the interface codec extension jars implement |
 | `e2e/` | Suites against real brokers, for the server and each client |
+| `e2e-client/` | The test application of the in-cluster end-to-end run: one Java program, producer or consumer mode, that keeps its own account of every record and serves it on `GET /results`. Its image is `quay.io/odradek/e2e-client`, published with the server's |
 | `deploy/kubernetes/` | Example manifests: a dispatcher, and an application pod that consumes through it. Not built or published; `ExampleManifestsTest` loads the configurations they embed |
 | `bazel/` | Build rules and macros shared across packages |
 

@@ -1,8 +1,8 @@
 name: release
 
 # A version tag releases everything under one number (ADR 4): the server image
-# (JVM and native), and, where a registry has been set up, the Java artifacts
-# and the Clojure and Python clients.
+# (JVM and native) and the e2e-client image, and, where a registry has been set
+# up, the Java artifacts and the Clojure and Python clients.
 #
 #   git tag v1.2.3 <main's tip> && git push origin v1.2.3
 #
