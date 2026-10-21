@@ -159,6 +159,42 @@ class KafkaClientsTest {
   }
 
   @Test
+  void aSlowHandlerTakesFewerRecordsAPollSoABatchFitsInThePollInterval() {
+    Map<String, Object> properties = new java.util.HashMap<>();
+
+    // No handler delay: Kafka's default, as on the latency lanes.
+    KafkaClients.boundPollRecords(properties, java.time.Duration.ZERO);
+    assertThat(properties).doesNotContainKey("max.poll.records");
+
+    // 1 s a record against the default 300 s: at most 150 records, half the interval.
+    KafkaClients.boundPollRecords(properties, java.time.Duration.ofSeconds(1));
+    assertThat(properties).containsEntry("max.poll.records", "150");
+
+    // What already fits is left alone.
+    Map<String, Object> small = new java.util.HashMap<>(Map.of("max.poll.records", "10"));
+    KafkaClients.boundPollRecords(small, java.time.Duration.ofSeconds(1));
+    assertThat(small).containsEntry("max.poll.records", "10");
+
+    // A longer interval from the properties file is honoured.
+    Map<String, Object> longer = new java.util.HashMap<>(Map.of("max.poll.interval.ms", "600000"));
+    KafkaClients.boundPollRecords(longer, java.time.Duration.ofSeconds(1));
+    assertThat(longer).containsEntry("max.poll.records", "300");
+    // And the client sees it.
+    Map<String, Object> consumer =
+        KafkaClients.consumer(settings().kafka(), "c", Map.of("max.poll.interval.ms", "600000"));
+    KafkaClients.boundPollRecords(consumer, java.time.Duration.ofSeconds(1));
+    assertThat(KafkaClients.effective(consumer, false)).containsEntry("max.poll.records", "300");
+
+    // A record that alone takes more than half the interval cannot be handled in the group.
+    assertThatThrownBy(
+            () ->
+                KafkaClients.boundPollRecords(
+                    new java.util.HashMap<>(), java.time.Duration.ofSeconds(200)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("raise max.poll.interval.ms");
+  }
+
+  @Test
   void aFailedSendIsUnknownWhenItMayHaveBeenWritten() {
     assertThat(KafkaTransport.outcome(new TimeoutException("expired")).kind())
         .isEqualTo(Transport.Outcome.Kind.UNKNOWN);

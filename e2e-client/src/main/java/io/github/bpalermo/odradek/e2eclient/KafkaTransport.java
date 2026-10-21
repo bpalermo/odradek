@@ -93,6 +93,9 @@ public final class KafkaTransport implements Transport {
     String clientId = "e2e-client-" + settings.origin();
     Map<String, Object> producer = KafkaClients.producer(kafka, clientId, overrides);
     Map<String, Object> consumer = KafkaClients.consumer(kafka, clientId, overrides);
+    if (settings.mode().consumes()) {
+      KafkaClients.boundPollRecords(consumer, settings.handlerDelay().plus(settings.failHold()));
+    }
     ServerConfig config = KafkaClients.tlsConfig(kafka, overrides);
     TlsSources tls = config == null ? TlsSources.none() : TlsSources.create(config);
     tls.apply(KafkaClients.CLUSTER, producer);

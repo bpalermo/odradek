@@ -10,6 +10,7 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -115,6 +116,51 @@ public final class KafkaClients {
         CooperativeStickyAssignor.class.getName());
     properties.putIfAbsent(ConsumerConfig.CLIENT_ID_CONFIG, clientId);
     return properties;
+  }
+
+  /**
+   * Keeps a batch's handling within {@code max.poll.interval.ms}. The server's consumers poll
+   * whatever the app does; this one handles records on its poll thread, so a slow handler (up to
+   * {@code perRecord} a record: {@code --handler-delay} plus {@code --fail-hold}) must not hold a
+   * whole batch past the interval, or Kafka drops the consumer from the group mid-batch. {@code
+   * max.poll.records} is lowered, when needed, so that a batch takes at most half the interval.
+   * Without a handler delay nothing changes, so the latency lanes keep Kafka's defaults.
+   *
+   * @throws IllegalArgumentException if even one record a poll can take longer than that
+   */
+  static void boundPollRecords(Map<String, Object> properties, Duration perRecord) {
+    long perRecordMs = perRecord.toMillis();
+    if (perRecordMs <= 0) {
+      return;
+    }
+    long intervalMs = longValue(properties, ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG);
+    long records = longValue(properties, ConsumerConfig.MAX_POLL_RECORDS_CONFIG);
+    long fit = intervalMs / 2 / perRecordMs;
+    if (fit < 1) {
+      throw new IllegalArgumentException(
+          "--handler-delay plus --fail-hold ("
+              + perRecordMs
+              + " ms a record) is more than half of max.poll.interval.ms ("
+              + intervalMs
+              + " ms): the consumer would leave its group while handling one record; raise"
+              + " max.poll.interval.ms in --kafka-properties");
+    }
+    if (records > fit) {
+      properties.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, String.valueOf(fit));
+    }
+  }
+
+  /** A consumer setting as set, or the Kafka client's default. */
+  private static long longValue(Map<String, Object> properties, String name) {
+    Object value = properties.get(name);
+    if (value == null) {
+      value = ConsumerConfig.configDef().defaultValues().get(name);
+    }
+    try {
+      return Long.parseLong(String.valueOf(value).trim());
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException(name + " must be an integer, not " + value, e);
+    }
   }
 
   /**

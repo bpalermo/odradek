@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.data.HistogramPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
@@ -65,6 +66,20 @@ class OtlpMetricsTest {
     assertThat(point.getMin()).isZero();
     assertThat(point.getSum()).isEqualTo(2.0);
     metrics.close();
+  }
+
+  @Test
+  void otelServiceNameWinsOverTheResourceAttributesWhichWinOverTheDefault() {
+    AttributeKey<String> name = AttributeKey.stringKey("service.name");
+    Map<String, String> attributes =
+        OtlpMetrics.resourceAttributes("service.name=from-attributes,k8s.pod.name=lane-a-0");
+
+    assertThat(OtlpMetrics.resource(null, Map.of()).get(name)).isEqualTo("odradek-e2e-client");
+    assertThat(OtlpMetrics.resource(null, attributes).get(name)).isEqualTo("from-attributes");
+    assertThat(OtlpMetrics.resource(" ", attributes).get(name)).isEqualTo("from-attributes");
+    Attributes both = OtlpMetrics.resource("from-variable", attributes);
+    assertThat(both.get(name)).isEqualTo("from-variable");
+    assertThat(both.get(AttributeKey.stringKey("k8s.pod.name"))).isEqualTo("lane-a-0");
   }
 
   @Test

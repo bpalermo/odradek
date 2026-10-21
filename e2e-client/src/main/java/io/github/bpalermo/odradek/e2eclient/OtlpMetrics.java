@@ -179,21 +179,33 @@ public final class OtlpMetrics implements Metrics {
     }
     ManagedChannel channel = builder.build();
 
-    AttributesBuilder resource =
-        Attributes.builder()
-            .put(
-                AttributeKey.stringKey("service.name"),
-                env.getOrDefault(SERVICE_NAME, "odradek-e2e-client"));
-    fromEnvironment.forEach((k, v) -> resource.put(AttributeKey.stringKey(k), v));
+    Attributes resource = resource(env.get(SERVICE_NAME), fromEnvironment);
     @SuppressWarnings("deprecation") // setChannel is how the exporter is given our own channel.
     OtlpGrpcMetricExporter exporter = OtlpGrpcMetricExporter.builder().setChannel(channel).build();
     SdkMeterProvider provider =
         SdkMeterProvider.builder()
-            .setResource(Resource.getDefault().merge(Resource.create(resource.build())))
+            .setResource(Resource.getDefault().merge(Resource.create(resource)))
             .registerMetricReader(
                 PeriodicMetricReader.builder(exporter).setInterval(interval).build())
             .build();
     return new OtlpMetrics(provider, channel, group, lane, transport);
+  }
+
+  /**
+   * The resource's attributes, as the SDKs make them: {@code service.name} is {@code
+   * odradek-e2e-client}, unless {@code OTEL_RESOURCE_ATTRIBUTES} sets it, unless {@code
+   * OTEL_SERVICE_NAME} does, which wins.
+   *
+   * @param serviceName the value of {@code OTEL_SERVICE_NAME}; null or blank when unset
+   */
+  static Attributes resource(String serviceName, Map<String, String> fromEnvironment) {
+    AttributesBuilder resource =
+        Attributes.builder().put(AttributeKey.stringKey("service.name"), "odradek-e2e-client");
+    fromEnvironment.forEach((k, v) -> resource.put(AttributeKey.stringKey(k), v));
+    if (serviceName != null && !serviceName.isBlank()) {
+      resource.put(AttributeKey.stringKey("service.name"), serviceName.strip());
+    }
+    return resource.build();
   }
 
   /** Records into a provider the caller made, for tests. */
