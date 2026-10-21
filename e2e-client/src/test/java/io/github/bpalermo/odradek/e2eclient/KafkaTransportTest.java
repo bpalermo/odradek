@@ -17,11 +17,10 @@ import org.junit.jupiter.api.Test;
 class KafkaTransportTest {
   private static final String TOPIC = "t";
   private static final TopicPartition PARTITION = new TopicPartition(TOPIC, 0);
+  private static final TopicPartition OTHER = new TopicPartition(TOPIC, 1);
 
-  @Test
-  void aSlowHandlerCommitsWithinABatchOnceTheIntervalHasPassed() throws Exception {
-    Settings settings =
-        Settings.parse(
+  private static Settings.Kafka kafka(String commitInterval) {
+    return Settings.parse(
             List.of(
                 "--mode",
                 "consumer",
@@ -32,20 +31,59 @@ class KafkaTransportTest {
                 "--bootstrap-servers",
                 "unused:9092",
                 "--commit-interval",
-                "100ms"),
-            Map.of());
-    MockConsumer<byte[], byte[]> consumer = new MockConsumer<>("earliest");
-    // One poll hands over a batch of ten records.
-    consumer.schedulePollTask(
-        () -> {
-          consumer.rebalance(List.of(PARTITION));
-          consumer.updateBeginningOffsets(Map.of(PARTITION, 0L));
-          for (long offset = 0; offset < 10; offset++) {
-            consumer.addRecord(new ConsumerRecord<>(TOPIC, 0, offset, new byte[0], new byte[0]));
-          }
-        });
+                commitInterval),
+            Map.of())
+        .kafka();
+  }
+
+  /** A mock consumer that remembers its last synchronous commit, and may fail to close. */
+  private static final class Recording extends MockConsumer<byte[], byte[]> {
+    final boolean failClose;
+    volatile Map<TopicPartition, OffsetAndMetadata> lastCommitSync = Map.of();
+
+    Recording(boolean failClose) {
+      super("earliest");
+      this.failClose = failClose;
+    }
+
+    @Override
+    public synchronized void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+      lastCommitSync = Map.copyOf(offsets);
+      super.commitSync(offsets);
+    }
+
+    @Override
+    public synchronized void close() {
+      super.close();
+      if (failClose) {
+        throw new IllegalStateException("close failed");
+      }
+    }
+
+    /** Assigns the partitions on the first poll, from these offsets, with records from there. */
+    void fetches(Map<TopicPartition, Long> firstOffsets, int records) {
+      schedulePollTask(
+          () -> {
+            rebalance(List.copyOf(firstOffsets.keySet()));
+            updateBeginningOffsets(firstOffsets);
+            firstOffsets.forEach(
+                (partition, first) -> {
+                  for (long offset = first; offset < first + records; offset++) {
+                    addRecord(
+                        new ConsumerRecord<>(
+                            TOPIC, partition.partition(), offset, new byte[0], new byte[0]));
+                  }
+                });
+          });
+    }
+  }
+
+  @Test
+  void aSlowHandlerCommitsWithinABatchOnceTheIntervalHasPassed() throws Exception {
+    Recording consumer = new Recording(false);
+    consumer.fetches(Map.of(PARTITION, 0L), 10);
     CompletableFuture<OffsetAndMetadata> committedAtLast = new CompletableFuture<>();
-    Transport transport = KafkaTransport.withConsumer(settings.kafka(), consumer);
+    Transport transport = KafkaTransport.withConsumer(kafka("100ms"), consumer);
 
     Transport.Subscription subscription =
         transport.subscribe(
@@ -69,5 +107,74 @@ class KafkaTransportTest {
       subscription.close();
     }
     assertThat(consumer.closed()).isTrue();
+  }
+
+  @Test
+  void aFailureOnTheFirstRecordOfAPartitionCommitsItsOffsetSoItIsReadAgain() throws Exception {
+    Recording consumer = new Recording(false);
+    // Neither partition was ever committed; one batch brings records of both.
+    consumer.fetches(Map.of(PARTITION, 5L, OTHER, 7L), 2);
+    CompletableFuture<Throwable> failed = new CompletableFuture<>();
+    Exception failure = new Exception("failing on purpose");
+    Transport transport = KafkaTransport.withConsumer(kafka("1h"), consumer);
+
+    Transport.Subscription subscription =
+        transport.subscribe(
+            TOPIC,
+            Duration.ZERO,
+            0,
+            record -> {
+              throw failure;
+            },
+            failed::complete);
+    try {
+      assertThat(failed.get(10, TimeUnit.SECONDS)).isSameAs(failure);
+    } finally {
+      subscription.close();
+    }
+    // Pinned where the next consumer must resume, whatever its auto.offset.reset: at the failed
+    // record, and at the first record of the partition whose records were never handled.
+    assertThat(consumer.lastCommitSync)
+        .isEqualTo(Map.of(PARTITION, new OffsetAndMetadata(5), OTHER, new OffsetAndMetadata(7)));
+  }
+
+  @Test
+  void aConsumerThatFailsToCloseStillReportsWhyItStopped() throws Exception {
+    Recording consumer = new Recording(true);
+    consumer.fetches(Map.of(PARTITION, 0L), 1);
+    CompletableFuture<Throwable> failed = new CompletableFuture<>();
+    Exception failure = new Exception("failing on purpose");
+    Transport transport = KafkaTransport.withConsumer(kafka("1h"), consumer);
+
+    Transport.Subscription subscription =
+        transport.subscribe(
+            TOPIC,
+            Duration.ZERO,
+            0,
+            record -> {
+              throw failure;
+            },
+            failed::complete);
+    try {
+      // The handler's failure, not the one of the cleanup after it.
+      assertThat(failed.get(10, TimeUnit.SECONDS)).isSameAs(failure);
+    } finally {
+      subscription.close();
+    }
+  }
+
+  @Test
+  void aCloseFailureWithNoFailureBeforeItIsReported() throws Exception {
+    Recording consumer = new Recording(true);
+    CompletableFuture<Throwable> failed = new CompletableFuture<>();
+    Transport transport = KafkaTransport.withConsumer(kafka("1h"), consumer);
+
+    Transport.Subscription subscription =
+        transport.subscribe(TOPIC, Duration.ZERO, 0, _ -> {}, failed::complete);
+    subscription.close();
+
+    assertThat(failed.get(10, TimeUnit.SECONDS))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessage("close failed");
   }
 }

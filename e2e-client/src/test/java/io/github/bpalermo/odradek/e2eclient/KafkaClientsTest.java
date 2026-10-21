@@ -13,9 +13,16 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import org.apache.kafka.clients.producer.BufferExhaustedException;
+import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.errors.InvalidProducerEpochException;
+import org.apache.kafka.common.errors.InvalidTopicException;
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
+import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.errors.RecordTooLargeException;
+import org.apache.kafka.common.errors.SerializationException;
 import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -161,7 +168,24 @@ class KafkaClientsTest {
         .isEqualTo(
             new Transport.Outcome(
                 Transport.Outcome.Kind.FAILED, "BufferExhaustedException", "full"));
-    assertThat(KafkaTransport.outcome(new RecordTooLargeException("big")).kind())
-        .isEqualTo(Transport.Outcome.Kind.FAILED);
+    // As the server's ProduceErrors: only definite rejections fail.
+    for (Exception rejected :
+        List.of(
+            new RecordTooLargeException("big"),
+            new InvalidTopicException("bad"),
+            new SerializationException("bytes"),
+            new UnknownTopicOrPartitionException("gone"),
+            new TopicAuthorizationException("denied"),
+            new ProducerFencedException("fenced"),
+            new InvalidProducerEpochException("epoch"))) {
+      assertThat(KafkaTransport.outcome(rejected).kind())
+          .as(rejected.getClass().getSimpleName())
+          .isEqualTo(Transport.Outcome.Kind.FAILED);
+    }
+    // Anything else may have been written: a batch aborted by a closing producer, for one.
+    assertThat(KafkaTransport.outcome(new KafkaException("producer closed")).kind())
+        .isEqualTo(Transport.Outcome.Kind.UNKNOWN);
+    assertThat(KafkaTransport.outcome(new IllegalStateException("odd")).kind())
+        .isEqualTo(Transport.Outcome.Kind.UNKNOWN);
   }
 }

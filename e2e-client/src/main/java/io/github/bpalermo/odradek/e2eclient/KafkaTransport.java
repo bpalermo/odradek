@@ -17,6 +17,7 @@ import java.util.function.Function;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.BufferExhaustedException;
@@ -24,8 +25,13 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.errors.RetriableException;
-import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.AuthorizationException;
+import org.apache.kafka.common.errors.InvalidProducerEpochException;
+import org.apache.kafka.common.errors.InvalidTopicException;
+import org.apache.kafka.common.errors.ProducerFencedException;
+import org.apache.kafka.common.errors.RecordTooLargeException;
+import org.apache.kafka.common.errors.SerializationException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.slf4j.Logger;
@@ -146,16 +152,24 @@ public final class KafkaTransport implements Transport {
   }
 
   /**
-   * A failed send: unknown when it timed out or could have been retried (the record may have been
-   * written), failed otherwise. A full buffer means the record was never taken.
+   * A failed send, classified as the server classifies its own (ProduceErrors): failed only for
+   * what certainly means "not written", unknown for everything else, timeouts and the batches a
+   * closing producer aborts included. A full buffer means the client never took the record.
    */
   static Outcome outcome(Exception error) {
     Outcome.Kind kind =
-        error instanceof BufferExhaustedException
-            ? Outcome.Kind.FAILED
-            : error instanceof TimeoutException || error instanceof RetriableException
-                ? Outcome.Kind.UNKNOWN
-                : Outcome.Kind.FAILED;
+        switch (error) {
+          case BufferExhaustedException _,
+              RecordTooLargeException _,
+              InvalidTopicException _,
+              SerializationException _,
+              UnknownTopicOrPartitionException _,
+              AuthorizationException _,
+              ProducerFencedException _,
+              InvalidProducerEpochException _ ->
+              Outcome.Kind.FAILED;
+          default -> Outcome.Kind.UNKNOWN;
+        };
     return new Outcome(kind, error.getClass().getSimpleName(), String.valueOf(error.getMessage()));
   }
 
@@ -211,14 +225,21 @@ public final class KafkaTransport implements Transport {
         failure = loop();
       } catch (RuntimeException e) {
         failure = e;
-      } finally {
-        if (consumer != null) {
-          try {
-            commitSync(handled.keySet());
-          } catch (RuntimeException e) {
-            LOG.warn("committing before closing the consumer of {} failed", topic, e);
-          }
+      }
+      if (consumer != null) {
+        try {
+          commitSync(handled.keySet());
+        } catch (RuntimeException e) {
+          LOG.warn("committing before closing the consumer of {} failed", topic, e);
+        }
+        try {
           consumer.close();
+        } catch (RuntimeException e) {
+          // The run must hear of the end all the same, or it never starts another consumer.
+          LOG.warn("closing the consumer of {} failed", topic, e);
+          if (failure == null) {
+            failure = e;
+          }
         }
       }
       if (failure != null) {
@@ -230,7 +251,14 @@ public final class KafkaTransport implements Transport {
     private Throwable loop() {
       lastCommit = System.nanoTime();
       while (!closing) {
-        for (ConsumerRecord<byte[], byte[]> record : consumer.poll(POLL)) {
+        ConsumerRecords<byte[], byte[]> records = consumer.poll(POLL);
+        // Each fetched partition's resume point, before anything of it is handled: a failure on
+        // its first record then commits that record's offset, and the next consumer reads it
+        // again, whatever its auto.offset.reset would pick for a partition never committed.
+        for (TopicPartition partition : records.partitions()) {
+          handled.putIfAbsent(partition, records.records(partition).getFirst().offset());
+        }
+        for (ConsumerRecord<byte[], byte[]> record : records) {
           if (closing) {
             // What was fetched and not handled is not committed: the next owner reads it.
             return null;
