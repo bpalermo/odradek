@@ -6,6 +6,7 @@ import io.github.bpalermo.odradek.server.receive.Holdings.Announcement;
 import io.github.bpalermo.odradek.server.receive.Holdings.Partition;
 import io.github.bpalermo.odradek.server.receive.Holdings.Range;
 import io.github.bpalermo.odradek.server.receive.Holdings.Relay;
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
@@ -46,6 +47,22 @@ class HoldingsTest {
     assertThat(holdings.arriving("orders", 0, STREAM).epoch()).isEqualTo(1);
     assertThat(holdings.arriving("orders", 1, STREAM).epoch()).isEqualTo(2);
     assertThat(holdings.arriving("refunds", 0, OTHER).epoch()).isEqualTo(3);
+  }
+
+  @Test
+  void anAcknowledgementSaysWhenEachRecordItReleasesWasHanded() {
+    long epoch = holdings.arriving("orders", 0, STREAM).epoch();
+    holdings.handed("orders", 0, 1, 100);
+    holdings.handed("orders", 0, 2, 150);
+    holdings.handed("orders", 0, 3, 200);
+    // Handed again: held once, from then.
+    holdings.handed("orders", 0, 1, 300);
+    List<Long> handed = new ArrayList<>();
+    assertThat(holdings.ack("orders", 0, epoch, 1, 2, handed::add))
+        .isEqualTo(new Relay(STREAM, List.of(new Range(1, 2))));
+    assertThat(handed).containsExactly(300L, 150L);
+    assertThat(holdings.ack("orders", 0, epoch, 1, 2, handed::add)).isNull();
+    assertThat(handed).hasSize(2);
   }
 
   @Test

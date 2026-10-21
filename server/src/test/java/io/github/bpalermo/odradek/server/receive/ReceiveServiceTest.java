@@ -50,6 +50,7 @@ import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.stub.StreamObserver;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.HistogramPointData;
 import io.opentelemetry.sdk.metrics.data.LongPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
@@ -392,6 +393,22 @@ class ReceiveServiceTest {
     return total;
   }
 
+  /** The single point of a histogram for one topic, which must have one. */
+  private HistogramPointData histogram(String name, String topic) {
+    List<HistogramPointData> points = new ArrayList<>();
+    for (MetricData data : reader.collectAllMetrics()) {
+      if (data.getName().equals(name)) {
+        for (HistogramPointData point : data.getHistogramData().getPoints()) {
+          if (topic.equals(point.getAttributes().get(AttributeKey.stringKey("topic")))) {
+            points.add(point);
+          }
+        }
+      }
+    }
+    assertThat(points).as("%s of %s", name, topic).hasSize(1);
+    return points.getFirst();
+  }
+
   private void start(ServerConfig.Builder builder) throws Exception {
     ServerConfig config = builder.build();
     codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
@@ -677,6 +694,52 @@ class ReceiveServiceTest {
     app.credits(1);
     assertThat(first.credits()).isEqualTo(1);
     assertThat(second.credits()).isEqualTo(1);
+  }
+
+  @Test
+  void theHandOffToTheAppAndTheAppsAcknowledgementAreTimed() throws Exception {
+    FakeReplica replica = single();
+    start(config());
+    App app = app();
+    app.subscribe(60_000, "orders", "refunds");
+    assertThat(app.next().hasSubscribed()).isTrue();
+    Stream first = replica.stream();
+    Stream second = replica.stream();
+    first.declare();
+    second.declare();
+
+    app.credits(1);
+    assertThat(first.credits()).isEqualTo(1);
+    assertThat(second.credits()).isEqualTo(1);
+    first.records(0, 0, "a");
+    long orders = app.assigned().getAssignmentEpoch();
+    assertThat(values(app.batch())).containsExactly("a");
+    // Beyond the app's credit: it waits for the next.
+    second.records(0, 0, "b");
+    app.nothing();
+    app.credits(1);
+    long refunds = app.assigned().getAssignmentEpoch();
+    assertThat(values(app.batch())).containsExactly("b");
+    app.ack("orders", 0, orders, 0, 0);
+    assertThat(range(first.ack())).isEqualTo(List.of(0, 0L, 0L));
+    app.ack("refunds", 0, refunds, 0, 0);
+    assertThat(range(second.ack())).isEqualTo(List.of(0, 0L, 0L));
+
+    HistogramPointData handedOrders = histogram("odradek.receive.handoff.duration", "orders");
+    assertThat(handedOrders.getCount()).isEqualTo(1);
+    HistogramPointData handedRefunds = histogram("odradek.receive.handoff.duration", "refunds");
+    assertThat(handedRefunds.getCount()).isEqualTo(1);
+    assertThat(handedRefunds.getMin()).isGreaterThanOrEqualTo(300);
+    // "a" was held by the app while it had no credit for "b".
+    HistogramPointData ackedOrders = histogram("odradek.receive.ack.duration", "orders");
+    assertThat(ackedOrders.getCount()).isEqualTo(1);
+    assertThat(ackedOrders.getMin()).isGreaterThanOrEqualTo(300);
+    assertThat(histogram("odradek.receive.ack.duration", "refunds").getCount()).isEqualTo(1);
+
+    // An acknowledgement of nothing held is not timed.
+    app.ack("orders", 0, orders, 0, 0);
+    first.nothing();
+    assertThat(histogram("odradek.receive.ack.duration", "orders").getCount()).isEqualTo(1);
   }
 
   // -------------------------------------------------------------------------------------------

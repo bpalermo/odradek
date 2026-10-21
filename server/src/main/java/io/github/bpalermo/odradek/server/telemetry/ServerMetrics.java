@@ -7,11 +7,13 @@ import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.DoubleHistogram;
 import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.LongUpDownCounter;
 import io.opentelemetry.api.metrics.Meter;
 import java.time.Clock;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 
@@ -32,6 +34,7 @@ public final class ServerMetrics {
   static final AttributeKey<String> EVENT = AttributeKey.stringKey("event");
   static final AttributeKey<String> REASON = AttributeKey.stringKey("reason");
   static final AttributeKey<String> ACTION = AttributeKey.stringKey("action");
+  static final AttributeKey<String> TIMESTAMP_TYPE = AttributeKey.stringKey("timestamp_type");
 
   /**
    * On the TLS metrics, in place of {@code cluster}: the credentials are those of the delivery
@@ -41,6 +44,21 @@ public final class ServerMetrics {
 
   private static final String OK = "ok";
   private static final String ERROR = "error";
+
+  /**
+   * The bucket boundaries of every duration histogram, in milliseconds: fine below a millisecond,
+   * where the dispatcher's own steps are, close together around the tens of milliseconds a round
+   * trip and the dispatcher's idle wait take, and coarse up to minutes, where a consumer catching
+   * up lags. Explicit buckets, not exponential ones: they read as a classic Prometheus histogram,
+   * with no setting needed on the way.
+   */
+  static final List<Double> DURATION_BUCKETS_MS =
+      List.of(
+          0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 12.5, 15.0, 20.0, 25.0, 30.0, 40.0,
+          50.0, 75.0, 100.0, 150.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+          60_000.0, 120_000.0, 300_000.0);
+
+  private static final double NANOS_PER_MS = 1_000_000.0;
 
   private final Meter meter;
   private final LongCounter produceRecords;
@@ -68,6 +86,12 @@ public final class ServerMetrics {
   private final LongCounter receiveRecords;
   private final LongCounter receiveRejects;
   private final LongCounter receiveReconnects;
+  private final DoubleHistogram dispatchFetchLag;
+  private final DoubleHistogram dispatchQueueDuration;
+  private final DoubleHistogram dispatchAckDuration;
+  private final DoubleHistogram dispatchLoopWait;
+  private final DoubleHistogram receiveHandoffDuration;
+  private final DoubleHistogram receiveAckDuration;
   private final KafkaClientMetrics kafkaClients;
 
   public ServerMetrics(Meter meter) {
@@ -258,6 +282,53 @@ public final class ServerMetrics {
                 "Deliver streams opened again after one was lost or refused for the time being.")
             .setUnit("{stream}")
             .build();
+    dispatchFetchLag =
+        duration(
+            "odradek.dispatch.fetch.lag",
+            "From the record's timestamp in Kafka (CreateTime or LogAppendTime, as timestamp_type"
+                + " says) to the dispatcher's consumer returning it from a poll. Measured across"
+                + " two clocks, the broker's or producer's and the dispatcher's.");
+    dispatchQueueDuration =
+        duration(
+            "odradek.dispatch.queue.duration",
+            "From a record's fetch to its first delivery to a sidecar, by what it waited for"
+                + " most: credit (no sidecar had any), ordering (an earlier record of its key or"
+                + " partition was unacknowledged), window (dispatch.partitionWindow held its"
+                + " partition back) or none (it went at the first opportunity).");
+    dispatchAckDuration =
+        duration(
+            "odradek.dispatch.ack.duration",
+            "From a record's delivery to a sidecar to that sidecar's answer, by outcome:"
+                + " acknowledged or rejected.");
+    dispatchLoopWait =
+        duration(
+            "odradek.dispatch.loop.wait",
+            "How long each idle wait of a group's thread for a command lasted. It waits up to"
+                + " 10 ms, and fetched records are not seen until it polls again.");
+    receiveHandoffDuration =
+        duration(
+            "odradek.receive.handoff.duration",
+            "From a batch arriving from a dispatcher replica to each of its records being written"
+                + " to the app's stream: decoding, and the wait for the app's credit.");
+    receiveAckDuration =
+        duration(
+            "odradek.receive.ack.duration",
+            "From a record received from a dispatcher being written to the app's stream to the"
+                + " app's acknowledgement of it arriving.");
+  }
+
+  private DoubleHistogram duration(String name, String description) {
+    return meter
+        .histogramBuilder(name)
+        .setDescription(description)
+        .setUnit("ms")
+        .setExplicitBucketBoundariesAdvice(DURATION_BUCKETS_MS)
+        .build();
+  }
+
+  /** Nanoseconds as the milliseconds a histogram records; never negative. */
+  private static double millis(long nanos) {
+    return Math.max(0, nanos) / NANOS_PER_MS;
   }
 
   /** Metrics that go nowhere, for a server without telemetry and for tests. */
@@ -341,6 +412,23 @@ public final class ServerMetrics {
   }
 
   /**
+   * What a record waited for most between its fetch and its first delivery. The names are the
+   * values of {@code reason} on {@code odradek.dispatch.queue.duration}.
+   */
+  public enum QueueWait {
+    NONE("none"),
+    CREDIT("credit"),
+    ORDERING("ordering"),
+    WINDOW("window");
+
+    private final String reason;
+
+    QueueWait(String reason) {
+      this.reason = reason;
+    }
+  }
+
+  /**
    * What a dispatcher reports about one topic of one group. A record sent is on the dispatcher's
    * hot path, so the attributes are built once here.
    */
@@ -353,6 +441,11 @@ public final class ServerMetrics {
     private final Attributes notWritten;
     private final Attributes completed;
     private final Attributes deadline;
+    private final Attributes createTime;
+    private final Attributes logAppendTime;
+    private final Attributes[] queued = new Attributes[QueueWait.values().length];
+    private final Attributes acknowledged;
+    private final Attributes rejected;
 
     private DispatchTopic(String cluster, String group, String topic) {
       attributes = Attributes.of(CLUSTER, cluster, GROUP, group, TOPIC, topic);
@@ -366,6 +459,32 @@ public final class ServerMetrics {
       notWritten = attributes.toBuilder().put(OUTCOME, ERROR).build();
       completed = attributes.toBuilder().put(OUTCOME, "completed").build();
       deadline = attributes.toBuilder().put(OUTCOME, "deadline").build();
+      createTime = attributes.toBuilder().put(TIMESTAMP_TYPE, "create_time").build();
+      logAppendTime = attributes.toBuilder().put(TIMESTAMP_TYPE, "log_append_time").build();
+      for (QueueWait wait : QueueWait.values()) {
+        queued[wait.ordinal()] = attributes.toBuilder().put(REASON, wait.reason).build();
+      }
+      acknowledged = attributes.toBuilder().put(OUTCOME, "acknowledged").build();
+      rejected = attributes.toBuilder().put(OUTCOME, "rejected").build();
+    }
+
+    /**
+     * The consumer returned a record {@code lagMs} after its timestamp: CreateTime, or
+     * LogAppendTime when {@code logAppendTime}. A negative lag, which only clocks that disagree
+     * give, is recorded as 0.
+     */
+    public void fetched(long lagMs, boolean logAppendTime) {
+      dispatchFetchLag.record(Math.max(0, lagMs), logAppendTime ? this.logAppendTime : createTime);
+    }
+
+    /** A record was delivered for the first time, {@code nanos} after it was fetched. */
+    public void queued(long nanos, QueueWait waited) {
+      dispatchQueueDuration.record(millis(nanos), queued[waited.ordinal()]);
+    }
+
+    /** A sidecar answered a record {@code nanos} after it was sent: acknowledged, or rejected. */
+    public void answered(long nanos, boolean ok) {
+      dispatchAckDuration.record(millis(nanos), ok ? acknowledged : rejected);
     }
 
     /** Deliver streams opened (positive) or ended (negative). */
@@ -430,6 +549,25 @@ public final class ServerMetrics {
     return new DispatchTopic(cluster, group, topic);
   }
 
+  /** What a dispatcher reports about the thread of one group on one cluster. */
+  public final class DispatchLoop {
+    private final Attributes attributes;
+
+    private DispatchLoop(String cluster, String group) {
+      attributes = Attributes.of(CLUSTER, cluster, GROUP, group);
+    }
+
+    /** The thread waited {@code nanos} for a command, having nothing to do. */
+    public void waited(long nanos) {
+      dispatchLoopWait.record(millis(nanos), attributes);
+    }
+  }
+
+  /** The metrics of the thread of one dispatcher group. */
+  public DispatchLoop dispatchLoop(String cluster, String group) {
+    return new DispatchLoop(cluster, group);
+  }
+
   /**
    * What a server that receives a topic from a dispatcher reports about it. The cluster is the
    * dispatcher's name for it.
@@ -464,6 +602,16 @@ public final class ServerMetrics {
     /** A stream is opened again after one was lost or refused for the time being. */
     public void reconnected() {
       receiveReconnects.add(1, attributes);
+    }
+
+    /** A record was written to the app's stream {@code nanos} after its batch arrived. */
+    public void handedOff(long nanos) {
+      receiveHandoffDuration.record(millis(nanos), attributes);
+    }
+
+    /** The app acknowledged a record {@code nanos} after it was written to the app's stream. */
+    public void appAcknowledged(long nanos) {
+      receiveAckDuration.record(millis(nanos), attributes);
     }
   }
 

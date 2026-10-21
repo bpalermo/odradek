@@ -986,6 +986,11 @@ class DispatchE2eTest {
           "odradek.dispatch.receivers",
           "odradek.dispatch.records",
           "odradek.dispatch.in_flight",
+          // The time each stage of a record took.
+          "odradek.dispatch.fetch.lag",
+          "odradek.dispatch.queue.duration",
+          "odradek.dispatch.ack.duration",
+          "odradek.dispatch.loop.wait",
           // The groups it consumes for rebalance when it joins them.
           "odradek.consume.rebalances",
           // The producer it made for the dead letter reports like any other.

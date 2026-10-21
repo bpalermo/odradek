@@ -34,6 +34,7 @@ import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.stub.StreamObserver;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.HistogramPointData;
 import io.opentelemetry.sdk.metrics.data.LongPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
@@ -42,6 +43,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -63,6 +65,8 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.RecordTooLargeException;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -148,6 +152,33 @@ class DispatchServiceTest {
       }
     }
     return total;
+  }
+
+  /** The points of a histogram whose attributes include these, given as name and value in turn. */
+  private List<HistogramPointData> histogram(String name, String... attributes) {
+    List<HistogramPointData> points = new ArrayList<>();
+    for (MetricData data : reader.collectAllMetrics()) {
+      if (!data.getName().equals(name)) {
+        continue;
+      }
+      for (HistogramPointData point : data.getHistogramData().getPoints()) {
+        boolean matches = true;
+        for (int i = 0; i < attributes.length; i += 2) {
+          matches &=
+              attributes[i + 1].equals(
+                  point.getAttributes().get(AttributeKey.stringKey(attributes[i])));
+        }
+        if (matches) {
+          points.add(point);
+        }
+      }
+    }
+    return points;
+  }
+
+  /** How many values a histogram recorded under these attributes. */
+  private long recorded(String name, String... attributes) {
+    return histogram(name, attributes).stream().mapToLong(HistogramPointData::getCount).sum();
   }
 
   private Server server;
@@ -674,6 +705,79 @@ class DispatchServiceTest {
     assertThat(tombstone.getOffset()).isEqualTo(1);
     assertThat(tombstone.hasKey()).isFalse();
     assertThat(tombstone.hasValue()).isFalse();
+  }
+
+  @Test
+  void eachStageOfARecordIsTimed() throws Exception {
+    start(config());
+    Sidecar sidecar = declared(declare("orders"));
+    assign(P0);
+    RecordingConsumer kafka = kafka();
+    long written = System.currentTimeMillis() - 5_000;
+    kafka.schedulePollTask(
+        () -> {
+          kafka.addRecord(stamped(0, written, TimestampType.CREATE_TIME));
+          kafka.addRecord(stamped(1, written, TimestampType.LOG_APPEND_TIME));
+          // A record with no timestamp has no lag to tell.
+          kafka.addRecord(new ConsumerRecord<>("orders", 0, 2, null, null));
+        });
+    // Fetched, and waiting for credit.
+    sidecar.nothing();
+    sidecar.credits(10);
+    assertThat(sidecar.records(3)).containsExactly("0/0/1", "0/1/1", "0/2/1");
+    sidecar.ack(0, 0, 0);
+    sidecar.reject(0, 1);
+    assertThat(sidecar.records(1)).containsExactly("0/1/2");
+
+    List<HistogramPointData> created =
+        histogram("odradek.dispatch.fetch.lag", "topic", "orders", "timestamp_type", "create_time");
+    assertThat(created).hasSize(1);
+    assertThat(created.getFirst().getCount()).isEqualTo(1);
+    assertThat(created.getFirst().getMin()).isGreaterThanOrEqualTo(5_000);
+    assertThat(
+            recorded(
+                "odradek.dispatch.fetch.lag",
+                "group",
+                "billing",
+                "timestamp_type",
+                "log_append_time"))
+        .isEqualTo(1);
+    assertThat(recorded("odradek.dispatch.fetch.lag")).isEqualTo(2);
+
+    // Each record once, at its first delivery, and all three waited for the sidecar's credit.
+    List<HistogramPointData> queued =
+        histogram("odradek.dispatch.queue.duration", "topic", "orders", "reason", "credit");
+    assertThat(queued).hasSize(1);
+    assertThat(queued.getFirst().getCount()).isEqualTo(3);
+    assertThat(queued.getFirst().getMin()).isGreaterThanOrEqualTo(100);
+    assertThat(recorded("odradek.dispatch.queue.duration")).isEqualTo(3);
+
+    eventually("both answers are timed", () -> recorded("odradek.dispatch.ack.duration") == 2);
+    assertThat(recorded("odradek.dispatch.ack.duration", "outcome", "acknowledged")).isEqualTo(1);
+    assertThat(recorded("odradek.dispatch.ack.duration", "outcome", "rejected")).isEqualTo(1);
+
+    // The group's thread waited for commands in between, a few milliseconds at a time.
+    List<HistogramPointData> waits =
+        histogram("odradek.dispatch.loop.wait", "cluster", "main", "group", "billing");
+    assertThat(waits).hasSize(1);
+    assertThat(waits.getFirst().getCount()).isPositive();
+  }
+
+  private static ConsumerRecord<byte[], byte[]> stamped(
+      long offset, long timestamp, TimestampType type) {
+    return new ConsumerRecord<>(
+        "orders",
+        0,
+        offset,
+        timestamp,
+        type,
+        1,
+        1,
+        // A key of its own: under key ordering, nothing waits behind another record.
+        new byte[] {(byte) offset},
+        new byte[] {2},
+        new RecordHeaders(),
+        Optional.empty());
   }
 
   @Test

@@ -370,7 +370,8 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
             DEAD_LETTER_RETRY_MAX,
             deadLetters,
             () -> accepted,
-            nanoClock);
+            nanoClock,
+            System::currentTimeMillis);
     return new DispatchGroup(
         key,
         options,
