@@ -188,13 +188,50 @@ class DispatchCoreTest {
     assign(0, 0);
     receiver("a", 10);
     receiver("b", 10);
-    // Equal load: the one that joined first.
+    // Equal load: the one sent a record longest ago, never sent first, then the one that joined
+    // first.
     assertThat(fetch(0, "0", "1", "2"))
         .containsExactly(deliver("a", 0, 0), deliver("b", 0, 1), deliver("a", 0, 2));
     assertThat(fetch(0, "3")).containsExactly(deliver("b", 0, 3));
     ack("a", 0, 0, 2);
+    // a holds nothing and b two: a until they hold as many, then b, sent to longer ago.
     assertThat(fetch(0, "4", "5", "6"))
-        .containsExactly(deliver("a", 0, 4), deliver("a", 0, 5), deliver("a", 0, 6));
+        .containsExactly(deliver("a", 0, 4), deliver("a", 0, 5), deliver("b", 0, 6));
+  }
+
+  @Test
+  void idleReceiversTakeTurns() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    receiver("c", 10);
+    // Each record is acknowledged before the next arrives, so every receiver is idle each time:
+    // the one that joined first must not get them all.
+    List<String> to = new ArrayList<>();
+    for (long offset = 0; offset < 6; offset++) {
+      List<DispatchAction<String>> sent = fetch(0, Long.toString(offset));
+      assertThat(sent).hasSize(1);
+      Deliver<String> d = (Deliver<String>) sent.getFirst();
+      to.add(d.receiver());
+      ack(d.receiver(), 0, offset);
+      credits(d.receiver(), 1);
+    }
+    assertThat(to).containsExactly("a", "b", "c", "a", "b", "c");
+  }
+
+  @Test
+  void aReceiverThatJoinsLateIsIdleTheLongest() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    ack("a", 0, 0);
+    assertThat(fetch(0, "1")).containsExactly(deliver("b", 0, 1));
+    ack("b", 0, 1);
+    receiver("c", 10);
+    assertThat(fetch(0, "2")).containsExactly(deliver("c", 0, 2));
   }
 
   @Test
