@@ -54,6 +54,7 @@
     "org.assertj:assertj-core": -1145412507,
     "org.checkerframework:checker-qual": -819031361,
     "org.codehaus.mojo:animal-sniffer-annotations": 852823480,
+    "org.hdrhistogram:HdrHistogram": 1289873636,
     "org.junit.jupiter:junit-jupiter-api": -1418253236,
     "org.junit.jupiter:junit-jupiter-engine": 549538408,
     "org.junit.platform:junit-platform-console": -957450337,
@@ -155,6 +156,7 @@
     "org.checkerframework:checker-qual": -53559553,
     "org.codehaus.mojo:animal-sniffer-annotations": -1570976252,
     "org.hamcrest:hamcrest-core": 866476646,
+    "org.hdrhistogram:HdrHistogram": 1379183334,
     "org.jetbrains.kotlin:kotlin-stdlib": 572706190,
     "org.jetbrains.kotlin:kotlin-stdlib-common": 11605,
     "org.jetbrains:annotations": 116138949,
@@ -709,6 +711,12 @@
         "jar": "66fdef91e9739348df7a096aa384a5685f4e875584cce89386a7a47251c4d8e9"
       },
       "version": "1.3"
+    },
+    "org.hdrhistogram:HdrHistogram": {
+      "shasums": {
+        "jar": "22d1d4316c4ec13a68b559e98c8256d69071593731da96136640f864fa14fad8"
+      },
+      "version": "2.2.2"
     },
     "org.jetbrains.kotlin:kotlin-stdlib": {
       "shasums": {
@@ -2101,6 +2109,10 @@
       "org.hamcrest.core",
       "org.hamcrest.internal"
     ],
+    "org.hdrhistogram:HdrHistogram": [
+      "org.HdrHistogram",
+      "org.HdrHistogram.packedarray"
+    ],
     "org.jetbrains.kotlin:kotlin-stdlib": [
       "kotlin",
       "kotlin.annotation",
@@ -2456,6 +2468,7 @@
       "org.checkerframework:checker-qual",
       "org.codehaus.mojo:animal-sniffer-annotations",
       "org.hamcrest:hamcrest-core",
+      "org.hdrhistogram:HdrHistogram",
       "org.jetbrains.kotlin:kotlin-stdlib",
       "org.jetbrains.kotlin:kotlin-stdlib-common",
       "org.jetbrains:annotations",

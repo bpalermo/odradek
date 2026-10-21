@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 
 class ConsumerLedgerTest {
   private static final String RUN = "run-1";
+  private static final String ORIGIN = "pod-0-1a2b3c4d";
 
   private final List<Map<String, Object>> anomalies = new ArrayList<>();
   private final ConsumerLedger ledger =
@@ -22,14 +23,14 @@ class ConsumerLedgerTest {
 
   /** Delivers and processes a record, as the handler does when it does not fail it. */
   private ConsumerLedger.Delivery process(String key, long seq, long nowMs) {
-    ConsumerLedger.Delivery delivery = ledger.delivered(RUN, key, seq, nowMs - 5, nowMs);
-    ledger.processed(RUN, key, seq);
+    ConsumerLedger.Delivery delivery = ledger.delivered(RUN, ORIGIN, key, seq, nowMs);
+    ledger.processed(RUN, ORIGIN, key, seq);
     return delivery;
   }
 
   private ConsumerLedger.Delivery fail(String key, long seq) {
-    ConsumerLedger.Delivery delivery = ledger.delivered(RUN, key, seq, 0, 1);
-    ledger.failed(RUN, key, seq);
+    ConsumerLedger.Delivery delivery = ledger.delivered(RUN, ORIGIN, key, seq, 1);
+    ledger.failed(RUN, ORIGIN, key, seq);
     return delivery;
   }
 
@@ -162,12 +163,12 @@ class ConsumerLedgerTest {
 
   @Test
   void duplicatesAreTrackedPerRunAndKey() {
-    ledger.delivered("r1", "a", 1, 0, 1);
-    ledger.processed("r1", "a", 1);
-    ledger.delivered("r2", "a", 1, 0, 1);
-    ledger.processed("r2", "a", 1);
-    ledger.delivered("r1", "b", 1, 0, 1);
-    ledger.processed("r1", "b", 1);
+    ledger.delivered("r1", ORIGIN, "a", 1, 1);
+    ledger.processed("r1", ORIGIN, "a", 1);
+    ledger.delivered("r2", ORIGIN, "a", 1, 1);
+    ledger.processed("r2", ORIGIN, "a", 1);
+    ledger.delivered("r1", ORIGIN, "b", 1, 1);
+    ledger.processed("r1", ORIGIN, "b", 1);
 
     assertThat(results()).containsEntry("duplicates", 0L).containsEntry("clean", true);
     assertThat((List<?>) results().get("keys")).hasSize(3);
@@ -245,7 +246,7 @@ class ConsumerLedgerTest {
 
   @Test
   void aRecordWhoseHandlingNeverFinishedIsAnExpectedRedelivery() {
-    ledger.delivered(RUN, "a", 1, 0, 1);
+    ledger.delivered(RUN, ORIGIN, "a", 1, 1);
     // The consumer went away while the handler had it.
     assertThat(process("a", 1, 2).kind()).isEqualTo(ConsumerLedger.Kind.REDELIVERY_AFTER_FAILURE);
     assertThat(results()).containsEntry("duplicates", 0L).containsEntry("clean", true);
@@ -255,10 +256,10 @@ class ConsumerLedgerTest {
   void withoutBeingTheSoleConsumerGapsAreCountedButNotReportedOrHeldAgainstTheRun() {
     List<Map<String, Object>> reported = new ArrayList<>();
     ConsumerLedger shared = new ConsumerLedger((event, fields) -> reported.add(fields), false);
-    shared.delivered(RUN, "a", 2, 0, 1);
-    shared.processed(RUN, "a", 2);
-    shared.delivered(RUN, "a", 5, 0, 1);
-    shared.processed(RUN, "a", 5);
+    shared.delivered(RUN, ORIGIN, "a", 2, 1);
+    shared.processed(RUN, ORIGIN, "a", 2);
+    shared.delivered(RUN, ORIGIN, "a", 5, 1);
+    shared.processed(RUN, ORIGIN, "a", 5);
 
     assertThat(reported).isEmpty();
     assertThat(shared.results())
@@ -297,15 +298,43 @@ class ConsumerLedgerTest {
   }
 
   @Test
-  void latencyIsMeasuredOnFirstDeliveries() {
-    ledger.delivered(RUN, "a", 1, 1000, 1010);
-    ledger.processed(RUN, "a", 1);
-    ledger.delivered(RUN, "a", 2, 1000, 1030);
-    ledger.processed(RUN, "a", 2);
-    ledger.delivered(RUN, "a", 1, 1000, 9000);
+  void severalOriginsShareARunAndATopicEachWithItsOwnSequences() {
+    // Two pods produce key a of one run, each from seq 1; a restarted pod is a third origin.
+    for (String origin : List.of("pod-0-aaaa", "pod-1-bbbb", "pod-0-cccc")) {
+      for (long seq = 1; seq <= 3; seq++) {
+        ledger.delivered(RUN, origin, "a", seq, 1);
+        ledger.processed(RUN, origin, "a", seq);
+      }
+    }
+    // A record of pod-1 delivered again is a duplicate of pod-1's, and only of pod-1's.
+    assertThat(ledger.delivered(RUN, "pod-1-bbbb", "a", 2, 2).kind())
+        .isEqualTo(ConsumerLedger.Kind.DUPLICATE);
+    // pod-0-cccc's seq 5 skips its 4: a gap of that origin alone.
+    ledger.delivered(RUN, "pod-0-cccc", "a", 5, 3);
+    ledger.processed(RUN, "pod-0-cccc", "a", 5);
 
-    assertThat(results().get("latency"))
-        .isEqualTo(Map.of("count", 2L, "meanMs", 20L, "maxMs", 30L));
+    assertThat(results())
+        .containsEntry("duplicates", 1L)
+        .containsEntry("gaps", 1L)
+        .containsEntry("missing", 1L)
+        .containsEntry("reorders", 0L);
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> keys = (List<Map<String, Object>>) results().get("keys");
+    assertThat(keys)
+        .extracting(k -> k.get("origin") + "/" + k.get("processedRanges"))
+        .containsExactlyInAnyOrder(
+            "pod-0-aaaa/[[1, 3]]", "pod-1-bbbb/[[1, 3]]", "pod-0-cccc/[[1, 3], [5, 5]]");
+    assertThat(anomalies)
+        .extracting(a -> a.get("type") + "@" + a.get("origin"))
+        .containsExactly("duplicate@pod-1-bbbb", "gap@pod-0-cccc");
+  }
+
+  @Test
+  void recordsOfAnOlderProducerHaveAnEmptyOrigin() {
+    ledger.delivered(RUN, "", "a", 1, 1);
+    ledger.processed(RUN, "", "a", 1);
+
+    assertThat(key("a")).containsEntry("origin", "").containsEntry("processed", 1L);
   }
 
   @Test
@@ -325,11 +354,11 @@ class ConsumerLedgerTest {
 
   @Test
   void aSeqOutOfRangeIsRefused() {
-    assertThatThrownBy(() -> ledger.delivered(RUN, "a", 0, 0, 0))
+    assertThatThrownBy(() -> ledger.delivered(RUN, ORIGIN, "a", 0, 0))
         .isInstanceOf(IllegalArgumentException.class);
-    assertThatThrownBy(() -> ledger.delivered(RUN, "a", ConsumerLedger.MAX_SEQ + 1, 0, 0))
+    assertThatThrownBy(() -> ledger.delivered(RUN, ORIGIN, "a", ConsumerLedger.MAX_SEQ + 1, 0))
         .isInstanceOf(IllegalArgumentException.class);
-    assertThatThrownBy(() -> ledger.processed(RUN, "a", 1))
+    assertThatThrownBy(() -> ledger.processed(RUN, ORIGIN, "a", 1))
         .isInstanceOf(IllegalStateException.class);
   }
 

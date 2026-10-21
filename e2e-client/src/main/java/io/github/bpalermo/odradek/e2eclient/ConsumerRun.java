@@ -1,14 +1,8 @@
 package io.github.bpalermo.odradek.e2eclient;
 
-import io.github.bpalermo.odradek.client.Consumer;
 import io.github.bpalermo.odradek.client.ConsumerFailedException;
-import io.github.bpalermo.odradek.client.ConsumerListener;
-import io.github.bpalermo.odradek.client.ConsumerOptions;
-import io.github.bpalermo.odradek.client.OdradekClient;
-import io.github.bpalermo.odradek.client.ReceivedRecord;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -22,7 +16,11 @@ import java.util.concurrent.ExecutionException;
  * acknowledged are delivered again, and this run starts a new consumer after {@code restartDelay}.
  * Through a dispatcher, a failure counts towards {@code maxAttempts} only when the processing
  * deadline passed first, hence {@code failHold}; a record whose consumer merely went away is
- * delivered again without using an attempt.
+ * delivered again without using an attempt. The {@code kafka} transport does the same with a Kafka
+ * consumer: it commits what was handled and leaves the group.
+ *
+ * <p>The handler times each first delivery from its producer's send: on this process's monotonic
+ * clock when this process produced it, and on the two wall clocks for every record.
  */
 public final class ConsumerRun extends Run {
   /** What the handler throws for a record it fails on purpose. */
@@ -38,7 +36,11 @@ public final class ConsumerRun extends Run {
   private final Faults faults;
 
   public ConsumerRun(Settings settings, Events events) {
-    super(settings, events);
+    this(settings, events, new Latency(settings.latencyWindow(), Metrics.none()));
+  }
+
+  public ConsumerRun(Settings settings, Events events, Latency latency) {
+    super(settings, events, latency);
     this.ledger = new ConsumerLedger(events, settings.soleConsumer());
     this.faults = Faults.of(settings);
   }
@@ -53,24 +55,18 @@ public final class ConsumerRun extends Run {
   }
 
   @Override
-  public void run(OdradekClient client) throws InterruptedException {
-    ConsumerOptions options =
-        new ConsumerOptions(
-            List.of(settings.topic()), settings.maxProcessing(), settings.maxUnacked());
+  public void run(Transport transport) throws InterruptedException {
     try {
       while (!stopping()) {
         CompletableFuture<Throwable> failure = new CompletableFuture<>();
         state("running");
-        Consumer consumer =
-            client.consumer(
-                options,
+        Transport.Subscription consumer =
+            transport.subscribe(
+                settings.topic(),
+                settings.maxProcessing(),
+                settings.maxUnacked(),
                 this::handle,
-                new ConsumerListener() {
-                  @Override
-                  public void failed(Throwable cause) {
-                    failure.complete(cause);
-                  }
-                });
+                failure::complete);
         try {
           CompletableFuture.anyOf(failure, stopped()).get();
         } catch (ExecutionException e) {
@@ -100,7 +96,8 @@ public final class ConsumerRun extends Run {
   }
 
   /** The record handler, on the consumer's thread. Returning acknowledges the record. */
-  private void handle(ReceivedRecord record) throws Exception {
+  private void handle(Transport.Delivered record) throws Exception {
+    long startNanos = System.nanoTime();
     long now = System.currentTimeMillis();
     RecordValue value;
     try {
@@ -122,25 +119,33 @@ public final class ConsumerRun extends Run {
       ledger.malformed(where(record, "the record key " + kafkaKey + " is not " + value.key()));
       return;
     }
-    if (!settings.runId().isEmpty() && !settings.runId().equals(value.runId())) {
+    if (!settings.trackedRunId().isEmpty() && !settings.trackedRunId().equals(value.runId())) {
       ledger.foreignRun();
       return;
     }
 
     ConsumerLedger.Delivery delivery =
-        ledger.delivered(value.runId(), value.key(), value.seq(), value.producerTs(), now);
+        ledger.delivered(value.runId(), value.origin(), value.key(), value.seq(), now);
+    if (delivery.kind() == ConsumerLedger.Kind.FIRST) {
+      if (value.origin().equals(settings.origin())) {
+        latency.endToEndSelf(startNanos - value.producerNanos());
+      }
+      latency.endToEndCross(now - value.producerTs());
+    }
     if (faults.shouldFail(value.key(), value.seq(), delivery.failuresSoFar())) {
       // Cut short by a stop: the record is failed all the same, and delivered again.
       pause(settings.failHold());
-      ledger.failed(value.runId(), value.key(), value.seq());
+      ledger.failed(value.runId(), value.origin(), value.key(), value.seq());
       throw new DeliberateFailure(
           "failing " + value.runId() + "/" + value.key() + "/" + value.seq() + " on purpose");
     }
     pause(settings.handlerDelay());
-    ledger.processed(value.runId(), value.key(), value.seq());
+    if (ledger.processed(value.runId(), value.origin(), value.key(), value.seq())) {
+      latency.metrics().processed();
+    }
   }
 
-  private static Map<String, Object> where(ReceivedRecord record, String problem) {
+  private static Map<String, Object> where(Transport.Delivered record, String problem) {
     Map<String, Object> out = new LinkedHashMap<>();
     out.put("topic", record.topic());
     out.put("partition", record.partition());

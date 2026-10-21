@@ -148,6 +148,9 @@ maven.install(
         "io.opentelemetry:opentelemetry-exporter-otlp:1.67.0",
         "io.opentelemetry:opentelemetry-exporter-sender-grpc-managed-channel:1.67.0",
         "io.opentelemetry:opentelemetry-sdk-testing:1.67.0",
+        # Latency histograms of the e2e-client (//e2e-client), at microsecond
+        # resolution over the run and over a rolling window.
+        "org.hdrhistogram:HdrHistogram:2.2.2",
         # Tests: JUnit 6 (Jupiter) via the JUnit Platform console launcher, AssertJ.
         "org.junit.jupiter:junit-jupiter-api:6.1.3",
         "org.junit.jupiter:junit-jupiter-engine:6.1.3",

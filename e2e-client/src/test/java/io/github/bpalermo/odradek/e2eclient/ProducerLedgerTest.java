@@ -10,7 +10,7 @@ import org.junit.jupiter.api.Test;
 class ProducerLedgerTest {
   private final List<Map<String, Object>> anomalies = new ArrayList<>();
   private final ProducerLedger ledger =
-      new ProducerLedger((event, fields) -> anomalies.add(fields), "run-1");
+      new ProducerLedger((event, fields) -> anomalies.add(fields), "run-1", "pod-0-1a2b3c4d");
 
   @SuppressWarnings("unchecked")
   private Map<String, Object> key(String key) {
@@ -22,19 +22,19 @@ class ProducerLedgerTest {
   void acknowledgedRecordsAreClean() {
     ledger.sent("key-0", 1, 100);
     ledger.sent("key-1", 1, 100);
-    ledger.acked("key-0", 1, 110);
-    ledger.acked("key-1", 1, 130);
+    ledger.acked("key-0", 1);
+    ledger.acked("key-1", 1);
     ledger.sent("key-0", 2, 200);
-    ledger.acked("key-0", 2, 200);
+    ledger.acked("key-0", 2);
 
     assertThat(ledger.results())
         .containsEntry("clean", true)
         .containsEntry("sent", 3L)
         .containsEntry("acked", 3L)
-        .containsEntry("outstanding", 0L)
-        .containsEntry("ackLatency", Map.of("meanMs", 13L, "maxMs", 30L));
+        .containsEntry("outstanding", 0L);
     assertThat(key("key-0"))
         .containsEntry("runId", "run-1")
+        .containsEntry("origin", "pod-0-1a2b3c4d")
         .containsEntry("lastSentSeq", 2L)
         .containsEntry("lastAckedSeq", 2L);
     assertThat(anomalies).isEmpty();
@@ -66,7 +66,7 @@ class ProducerLedgerTest {
   @Test
   void anOutcomeIsCountedOnce() {
     ledger.sent("key-0", 1, 0);
-    ledger.acked("key-0", 1, 1);
+    ledger.acked("key-0", 1);
     ledger.failed("key-0", 1, "X", "late");
     ledger.unknown("key-0", 1, "Y", "late");
     ledger.unanswered();
@@ -80,7 +80,7 @@ class ProducerLedgerTest {
   @Test
   void recordsWithNoOutcomeWhenClosedAreUnknown() {
     ledger.sent("key-0", 1, 0);
-    ledger.acked("key-0", 1, 1);
+    ledger.acked("key-0", 1);
     ledger.sent("key-0", 2, 0);
     ledger.sent("key-1", 1, 0);
     ledger.unknown("key-1", 1, "ERROR_CODE_OUTCOME_UNKNOWN", "server restarted");
@@ -100,7 +100,7 @@ class ProducerLedgerTest {
   @Test
   void aRecordTheProducerRefusedIsTakenBack() {
     ledger.sent("key-0", 1, 0);
-    ledger.acked("key-0", 1, 0);
+    ledger.acked("key-0", 1);
     ledger.sent("key-0", 2, 0);
     ledger.notSent("key-0", 2, "BUFFER_FULL");
 

@@ -1,6 +1,5 @@
 package io.github.bpalermo.odradek.e2eclient;
 
-import io.github.bpalermo.odradek.client.OdradekClient;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -12,18 +11,20 @@ import java.util.concurrent.TimeUnit;
 public abstract class Run {
   protected final Settings settings;
   protected final Events events;
+  protected final Latency latency;
   private final CountDownLatch stop = new CountDownLatch(1);
   private final CompletableFuture<Void> stopped = new CompletableFuture<>();
   private final long startedMs = System.currentTimeMillis();
   private volatile String state = "starting";
 
-  protected Run(Settings settings, Events events) {
+  protected Run(Settings settings, Events events, Latency latency) {
     this.settings = settings;
     this.events = events;
+    this.latency = latency;
   }
 
   /** Runs until done or stopped. */
-  public abstract void run(OdradekClient client) throws InterruptedException;
+  public abstract void run(Transport transport) throws InterruptedException;
 
   /** The mode's own part of the results. */
   protected abstract Map<String, Object> body();
@@ -67,16 +68,25 @@ public abstract class Run {
     return state;
   }
 
+  public Latency latency() {
+    return latency;
+  }
+
   /** Everything {@code GET /results} answers. */
   public Map<String, Object> results() {
+    Map<String, Object> config = settings.describe();
     Map<String, Object> out = new LinkedHashMap<>();
-    out.put("mode", settings.describe().get("mode"));
+    out.put("mode", config.get("mode"));
+    out.put("transport", config.get("transport"));
+    out.put("lane", settings.lane());
+    out.put("origin", settings.origin());
     out.put("runId", settings.runId());
     out.put("state", state);
     out.put("startedMs", startedMs);
     out.put("nowMs", System.currentTimeMillis());
-    out.put("config", settings.describe());
+    out.put("config", config);
     out.putAll(body());
+    out.put("latency", latency.results());
     return out;
   }
 }
