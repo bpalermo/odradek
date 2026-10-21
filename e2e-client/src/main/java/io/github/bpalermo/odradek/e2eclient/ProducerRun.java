@@ -1,6 +1,7 @@
 package io.github.bpalermo.odradek.e2eclient;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -47,11 +48,20 @@ public final class ProducerRun extends Run {
       keys[k] = "key-" + k;
       nextSeq[k] = 1;
     }
-    // The schedule steps without a restart, on time elapsed since now.
-    Pacer pacer = new Pacer(settings.rateSchedule());
-    long start = System.nanoTime();
+    // The schedule steps without a restart, on time elapsed since its start: now, or the instant
+    // every process was given, placed on this process's monotonic clock. Before that instant the
+    // first record waits for it; after it, this process joins at the step in force.
+    long begun = System.nanoTime();
+    long start = begun;
+    long joinedAt = 0;
+    if (settings.scheduleStart() != null) {
+      long offset = Duration.between(settings.scheduleStart(), Instant.now()).toNanos();
+      start = begun - offset;
+      joinedAt = Math.max(0, offset);
+    }
+    Pacer pacer = new Pacer(settings.rateSchedule(), joinedAt);
     boolean timed = !settings.duration().isZero();
-    long end = start + settings.duration().toNanos();
+    long end = begun + settings.duration().toNanos();
     state("running");
     try (Transport.Sender sender = transport.sender()) {
       for (long i = 0; !stopping(); i++) {
@@ -59,7 +69,16 @@ public final class ProducerRun extends Run {
           break;
         }
         long due = pacer.due();
-        if (due < 0 || !waitUntil(start + due)) {
+        if (due < 0) {
+          break;
+        }
+        // A record due after --duration ends is never sent, however far off it is: a shared
+        // schedule start can lie past the end. The run then ends at its end, not at the record's.
+        if (timed && start + due - end >= 0) {
+          waitUntil(end);
+          break;
+        }
+        if (!waitUntil(start + due)) {
           break;
         }
         int k = (int) (i % keyCount);

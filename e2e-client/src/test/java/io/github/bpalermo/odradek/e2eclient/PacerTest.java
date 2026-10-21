@@ -14,9 +14,14 @@ class PacerTest {
    * ackMs}: the milliseconds at which records are sent, until {@code limit}.
    */
   private static List<Long> sends(String schedule, long ackMs, int limit) {
-    Pacer pacer = new Pacer(RateSchedule.parse(schedule));
+    return sends(schedule, 0, ackMs, limit);
+  }
+
+  /** As above, for a process that joins the schedule {@code joinedMs} after its start. */
+  private static List<Long> sends(String schedule, long joinedMs, long ackMs, int limit) {
+    Pacer pacer = new Pacer(RateSchedule.parse(schedule), joinedMs * MS);
     List<Long> sent = new ArrayList<>();
-    long now = 0;
+    long now = joinedMs * MS;
     long acked = 0;
     while (sent.size() < limit) {
       long due = pacer.due();
@@ -79,5 +84,22 @@ class PacerTest {
   @Test
   void theScheduleEndsAtTheEndOfItsLastStep() {
     assertThat(sends("2:1s", 0, 100)).containsExactly(0L, 500L);
+  }
+
+  @Test
+  void aProcessThatJoinsLateStartsAtTheStepInForceWithNoCatchingUp() {
+    // 1.5 s in: the second step (20/s) is in force, and nothing of the first is sent.
+    assertThat(sends("10:1s,20:0", 1500, 0, 3)).containsExactly(1500L, 1550L, 1600L);
+  }
+
+  @Test
+  void aProcessThatJoinsMidStepStillStepsOnTime() {
+    // 0.95 s in: one record of the first step (10/s), then the second step from 1 s.
+    assertThat(sends("10:1s,20:0", 950, 0, 3)).containsExactly(950L, 1000L, 1050L);
+  }
+
+  @Test
+  void aProcessThatJoinsAfterTheScheduleEndedSendsNothing() {
+    assertThat(sends("10:1s", 2000, 0, 3)).isEmpty();
   }
 }

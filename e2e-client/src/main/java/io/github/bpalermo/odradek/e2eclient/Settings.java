@@ -2,6 +2,8 @@ package io.github.bpalermo.odradek.e2eclient;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
@@ -36,6 +38,9 @@ import java.util.regex.Pattern;
  * @param exitWhenDone whether a producer exits once it has sent everything, instead of serving its
  *     results until it is stopped
  * @param rateSchedule records per second over all keys, over time
+ * @param scheduleStart when the schedule starts, the same for every process so that they step
+ *     together; a process that starts later joins at the step in force. Null: when the process
+ *     starts
  * @param count records to send in all; 0 for no limit
  * @param duration how long to send; zero for no limit
  * @param keys how many keys ({@code key-0} …) the records are spread over, round robin
@@ -66,6 +71,7 @@ public record Settings(
     int httpPort,
     boolean exitWhenDone,
     RateSchedule rateSchedule,
+    Instant scheduleStart,
     long count,
     Duration duration,
     int keys,
@@ -188,6 +194,12 @@ public record Settings(
               "",
               "producing: rate:duration steps, e.g. 20:10m,50:5m,20:0; a last step of 0 holds for"
                   + " good. Replaces --rate"),
+          new Option(
+              "schedule-start",
+              "",
+              "producing: when the rate schedule starts, an instant such as 2026-10-22T12:00:00Z;"
+                  + " the same for every process, they step together, and one that starts later"
+                  + " joins at the step in force. Empty: when the process starts"),
           new Option("count", "0", "producing: records to send; 0 for no limit"),
           new Option("duration", "0", "producing: how long to send, e.g. 10m; 0 for no limit"),
           new Option("keys", "8", "producing: number of keys, key-0 to key-<K-1>, round robin"),
@@ -329,6 +341,17 @@ public record Settings(
         throw new IllegalArgumentException("--rate-schedule: " + e.getMessage(), e);
       }
     }
+    Instant scheduleStart = null;
+    if (!values.get("schedule-start").isEmpty()) {
+      try {
+        scheduleStart = Instant.parse(values.get("schedule-start"));
+      } catch (DateTimeParseException e) {
+        throw new IllegalArgumentException(
+            "--schedule-start must be an instant such as 2026-10-22T12:00:00Z, not "
+                + values.get("schedule-start"),
+            e);
+      }
+    }
     Duration latencyWindow = duration(values, "latency-window");
     if (latencyWindow.compareTo(Duration.ofSeconds(1)) < 0) {
       throw new IllegalArgumentException("--latency-window must be at least 1s");
@@ -347,6 +370,7 @@ public record Settings(
             (int) integer(values, "http-port", 0, 65_535),
             bool(values, "exit-when-done"),
             schedule,
+            scheduleStart,
             integer(values, "count", 0, Long.MAX_VALUE),
             duration(values, "duration"),
             (int) integer(values, "keys", 1, 1_000_000),
@@ -477,6 +501,9 @@ public record Settings(
       out.put("exitWhenDone", exitWhenDone);
       out.put("rate", rateSchedule.steps().get(0).rate());
       out.put("rateSchedule", rateSchedule.toString());
+      // Empty when the schedule starts with the process. (Not an if: PMD's NonThreadSafeSingleton
+      // fails on a record component compared with null in one.)
+      out.put("scheduleStart", scheduleStart == null ? "" : scheduleStart.toString());
       out.put("count", count);
       out.put("durationMs", duration.toMillis());
       out.put("keys", keys);
