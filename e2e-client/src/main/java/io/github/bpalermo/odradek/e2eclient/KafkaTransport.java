@@ -13,6 +13,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
@@ -22,6 +24,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.BufferExhaustedException;
 import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
@@ -58,25 +61,47 @@ public final class KafkaTransport implements Transport {
   private final Map<String, Object> producerProperties;
   private final Map<String, Object> consumerProperties;
   private final Function<Map<String, Object>, Consumer<byte[], byte[]>> consumers;
+  private final Function<Map<String, Object>, Producer<byte[], byte[]>> producers;
 
   private KafkaTransport(
       Settings.Kafka kafka,
       TlsSources tls,
       Map<String, Object> producerProperties,
       Map<String, Object> consumerProperties,
-      Function<Map<String, Object>, Consumer<byte[], byte[]>> consumers) {
+      Function<Map<String, Object>, Consumer<byte[], byte[]>> consumers,
+      Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
     this.kafka = kafka;
     this.tls = tls;
     this.producerProperties = producerProperties;
     this.consumerProperties = consumerProperties;
     this.consumers = consumers;
+    this.producers = producers;
   }
 
   /**
    * A plaintext transport whose consumer {@code consumer} is, for tests. Its sender is unusable.
    */
   static KafkaTransport withConsumer(Settings.Kafka kafka, Consumer<byte[], byte[]> consumer) {
-    return new KafkaTransport(kafka, TlsSources.none(), Map.of(), Map.of(), _ -> consumer);
+    return new KafkaTransport(
+        kafka, TlsSources.none(), Map.of(), Map.of(), _ -> consumer, KafkaTransport::producer);
+  }
+
+  /**
+   * A plaintext transport whose producer {@code producer} is, for tests. Its consumer is unusable.
+   */
+  static KafkaTransport withProducer(Settings.Kafka kafka, Producer<byte[], byte[]> producer) {
+    return new KafkaTransport(
+        kafka, TlsSources.none(), Map.of(), Map.of(), KafkaTransport::consumer, _ -> producer);
+  }
+
+  private static Producer<byte[], byte[]> producer(Map<String, Object> properties) {
+    return new KafkaProducer<>(
+        new HashMap<>(properties), new ByteArraySerializer(), new ByteArraySerializer());
+  }
+
+  private static Consumer<byte[], byte[]> consumer(Map<String, Object> properties) {
+    return new KafkaConsumer<>(
+        properties, new ByteArrayDeserializer(), new ByteArrayDeserializer());
   }
 
   /**
@@ -101,13 +126,7 @@ public final class KafkaTransport implements Transport {
     tls.apply(KafkaClients.CLUSTER, producer);
     tls.apply(KafkaClients.CLUSTER, consumer);
     return new KafkaTransport(
-        kafka,
-        tls,
-        producer,
-        consumer,
-        properties ->
-            new KafkaConsumer<>(
-                properties, new ByteArrayDeserializer(), new ByteArrayDeserializer()));
+        kafka, tls, producer, consumer, KafkaTransport::consumer, KafkaTransport::producer);
   }
 
   @Override
@@ -125,24 +144,38 @@ public final class KafkaTransport implements Transport {
 
   @Override
   public Sender sender() {
-    KafkaProducer<byte[], byte[]> producer =
-        new KafkaProducer<>(
-            new HashMap<>(producerProperties),
-            new ByteArraySerializer(),
-            new ByteArraySerializer());
+    Producer<byte[], byte[]> producer = producers.apply(producerProperties);
     return new Sender() {
       @Override
       public CompletableFuture<Outcome> send(String topic, String key, byte[] value)
           throws NotSentException {
         CompletableFuture<Outcome> result = new CompletableFuture<>();
+        // A full buffer is not a send that failed but one the client refused, as the Odradek
+        // transport's BUFFER_FULL: the record is not counted and its sequence number is used
+        // again. KafkaProducer reports it to the callback within send(), after max.block.ms.
+        AtomicReference<BufferExhaustedException> refused = new AtomicReference<>();
+        AtomicBoolean sending = new AtomicBoolean(true);
         try {
           producer.send(
               new ProducerRecord<>(topic, key.getBytes(StandardCharsets.UTF_8), value),
-              (metadata, error) -> result.complete(error == null ? Outcome.ACKED : outcome(error)));
+              (metadata, error) -> {
+                if (error instanceof BufferExhaustedException full && sending.get()) {
+                  refused.set(full);
+                } else {
+                  result.complete(error == null ? Outcome.ACKED : outcome(error));
+                }
+              });
         } catch (IllegalStateException e) {
           throw new NotSentException("CLIENT_CLOSED", e);
+        } catch (BufferExhaustedException e) {
+          throw new NotSentException("BUFFER_FULL", e);
         } catch (KafkaException e) {
           result.complete(outcome(e));
+        } finally {
+          sending.set(false);
+        }
+        if (refused.get() != null) {
+          throw new NotSentException("BUFFER_FULL", refused.get());
         }
         return result;
       }
@@ -157,7 +190,8 @@ public final class KafkaTransport implements Transport {
   /**
    * A failed send, classified as the server classifies its own (ProduceErrors): failed only for
    * what certainly means "not written", unknown for everything else, timeouts and the batches a
-   * closing producer aborts included. A full buffer means the client never took the record.
+   * closing producer aborts included. A full buffer means the client never took the record; the
+   * sender reports one met within send() as not sent, so it lands here only if it ever came later.
    */
   static Outcome outcome(Exception error) {
     Outcome.Kind kind =

@@ -1,17 +1,25 @@
 package io.github.bpalermo.odradek.e2eclient;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.BufferExhaustedException;
+import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.MockProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.junit.jupiter.api.Test;
 
 class KafkaTransportTest {
@@ -176,5 +184,50 @@ class KafkaTransportTest {
     assertThat(failed.get(10, TimeUnit.SECONDS))
         .isInstanceOf(IllegalStateException.class)
         .hasMessage("close failed");
+  }
+
+  /**
+   * A producer whose buffer stays full, which reports it as KafkaProducer does: to the callback,
+   * within send(), once max.block.ms has passed. Or, with {@code late}, only after send() returned.
+   */
+  private static final class FullBuffer extends MockProducer<byte[], byte[]> {
+    final boolean late;
+    volatile Callback pending;
+
+    FullBuffer(boolean late) {
+      super(false, null, new ByteArraySerializer(), new ByteArraySerializer());
+      this.late = late;
+    }
+
+    @Override
+    public synchronized Future<RecordMetadata> send(
+        ProducerRecord<byte[], byte[]> record, Callback callback) {
+      BufferExhaustedException full = new BufferExhaustedException("buffer full");
+      if (late) {
+        pending = callback;
+      } else {
+        callback.onCompletion(null, full);
+      }
+      return CompletableFuture.failedFuture(full);
+    }
+  }
+
+  @Test
+  void aFullBufferIsNotSentLikeTheOdradekTransportsBufferFull() {
+    Transport.Sender sender =
+        KafkaTransport.withProducer(kafka("1h"), new FullBuffer(false)).sender();
+    assertThatThrownBy(() -> sender.send(TOPIC, "k", new byte[0]))
+        .isInstanceOfSatisfying(
+            Transport.NotSentException.class, e -> assertThat(e.reason()).isEqualTo("BUFFER_FULL"));
+  }
+
+  @Test
+  void aFullBufferReportedAfterSendReturnedStillCompletesTheSend() throws Exception {
+    FullBuffer producer = new FullBuffer(true);
+    Transport.Sender sender = KafkaTransport.withProducer(kafka("1h"), producer).sender();
+    CompletableFuture<Transport.Outcome> outcome = sender.send(TOPIC, "k", new byte[0]);
+    assertThat(outcome).isNotDone();
+    producer.pending.onCompletion(null, new BufferExhaustedException("buffer full"));
+    assertThat(outcome.get(1, TimeUnit.SECONDS).kind()).isEqualTo(Transport.Outcome.Kind.FAILED);
   }
 }
