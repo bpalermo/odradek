@@ -47,35 +47,31 @@ public final class ProducerRun extends Run {
       keys[k] = "key-" + k;
       nextSeq[k] = 1;
     }
-    RateSchedule schedule = settings.rateSchedule();
+    // The schedule steps without a restart, on time elapsed since now.
+    Pacer pacer = new Pacer(settings.rateSchedule());
     long start = System.nanoTime();
     boolean timed = !settings.duration().isZero();
     long end = start + settings.duration().toNanos();
     state("running");
     try (Transport.Sender sender = transport.sender()) {
-      // When the next record is due, on System.nanoTime().
-      long next = start;
       for (long i = 0; !stopping(); i++) {
         if (settings.count() > 0 && ledger.sent() >= settings.count()) {
           break;
         }
-        // The rate of the moment this record is due: the schedule steps without a restart.
-        long due = next;
-        double rate = schedule.rateAt(Duration.ofNanos(due - start));
-        if (rate == 0) {
-          break;
-        }
-        next = due + Math.max(1, Math.round(1e9 / rate));
-        if (!waitUntil(due)) {
-          break;
-        }
-        if (timed && System.nanoTime() - end >= 0) {
+        long due = pacer.due();
+        if (due < 0 || !waitUntil(start + due)) {
           break;
         }
         int k = (int) (i % keyCount);
         if (!awaitOutcome(pending.get(k))) {
           break;
         }
+        // The wait for the key's previous outcome may have outlasted the step, or the schedule.
+        long now = System.nanoTime();
+        if ((timed && now - end >= 0) || !pacer.admit(now - start)) {
+          break;
+        }
+        pacer.sent();
         String key = keys[k];
         long seq = nextSeq[k];
         long nowMs = System.currentTimeMillis();

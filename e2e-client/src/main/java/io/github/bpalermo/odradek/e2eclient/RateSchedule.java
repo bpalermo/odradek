@@ -72,15 +72,38 @@ public record RateSchedule(List<Step> steps) {
 
   /** The rate at {@code elapsed} since the start; 0 once a schedule that ends has ended. */
   public double rateAt(Duration elapsed) {
-    long at = elapsed.toNanos();
+    Active active = at(elapsed.toNanos());
+    return active == null ? 0 : active.rate();
+  }
+
+  /**
+   * The step in force at a moment, placed in time.
+   *
+   * @param rate its rate
+   * @param startNanos when it began, in nanoseconds since the start
+   * @param endNanos when it ends; {@link Long#MAX_VALUE} for a step that holds for good
+   */
+  public record Active(double rate, long startNanos, long endNanos) {
+    /** Nanoseconds between records at this rate, at least 1. */
+    public long intervalNanos() {
+      return Math.max(1, Math.round(1e9 / rate));
+    }
+  }
+
+  /** The step in force {@code elapsedNanos} after the start; null once the schedule has ended. */
+  public Active at(long elapsedNanos) {
+    long start = 0;
     for (Step step : steps) {
       long length = step.duration().toNanos();
-      if (length == 0 || at < length) {
-        return step.rate();
+      if (length == 0) {
+        return new Active(step.rate(), start, Long.MAX_VALUE);
       }
-      at -= length;
+      if (elapsedNanos < start + length) {
+        return new Active(step.rate(), start, start + length);
+      }
+      start += length;
     }
-    return 0;
+    return null;
   }
 
   /** As written. */

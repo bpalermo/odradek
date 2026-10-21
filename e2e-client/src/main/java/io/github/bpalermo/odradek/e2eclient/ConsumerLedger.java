@@ -2,6 +2,7 @@ package io.github.bpalermo.odradek.e2eclient;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -94,7 +95,7 @@ public final class ConsumerLedger {
 
   private final Events events;
   private final boolean soleConsumer;
-  private final Map<String, KeyState> keys = new TreeMap<>();
+  private final Map<Id, KeyState> keys = new TreeMap<>(Id.ORDER);
   private final List<Map<String, Object>> duplicateDetails = new ArrayList<>();
   private final Map<String, Long> consumerFailures = new TreeMap<>();
   private long delivered;
@@ -215,8 +216,22 @@ public final class ConsumerLedger {
     return k;
   }
 
-  private static String id(String runId, String origin, String key) {
-    return runId + "/" + origin + "/" + key;
+  private static Id id(String runId, String origin, String key) {
+    return new Id(runId, origin, key);
+  }
+
+  /**
+   * What a key's records are tracked by. A record rather than a joined string: neither the run nor
+   * the origin excludes any character, so no separator keeps two of them apart.
+   */
+  private record Id(String runId, String origin, String key) {
+    static final Comparator<Id> ORDER =
+        Comparator.comparing(Id::runId).thenComparing(Id::origin).thenComparing(Id::key);
+
+    @Override
+    public String toString() {
+      return runId + "/" + origin + "/" + key;
+    }
   }
 
   /** A record whose checksum does not match its fields. */

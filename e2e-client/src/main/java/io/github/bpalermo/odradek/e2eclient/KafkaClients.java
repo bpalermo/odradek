@@ -119,9 +119,11 @@ public final class KafkaClients {
 
   /**
    * The server configuration whose one cluster has the TLS of these settings, for TlsSources; null
-   * for plaintext.
+   * for plaintext. The overrides are the cluster's properties, so that TlsSources refuses what it
+   * refuses of a server's cluster: a {@code security.protocol} without TLS beside a {@code tls}
+   * section, which would otherwise turn TLS off without a word.
    */
-  static ServerConfig tlsConfig(Settings.Kafka kafka) {
+  static ServerConfig tlsConfig(Settings.Kafka kafka, Map<String, String> overrides) {
     Tls.Builder tls = Tls.newBuilder();
     switch (kafka.tls()) {
       case NONE -> {
@@ -137,6 +139,7 @@ public final class KafkaClients {
         .putClusters(
             CLUSTER,
             Cluster.newBuilder()
+                .putAllProperties(overrides)
                 .putProperties(
                     CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG, kafka.bootstrapServers())
                 .setTls(tls)

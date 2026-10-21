@@ -13,7 +13,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
+import java.util.function.Function;
+import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -50,16 +51,26 @@ public final class KafkaTransport implements Transport {
   private final TlsSources tls;
   private final Map<String, Object> producerProperties;
   private final Map<String, Object> consumerProperties;
+  private final Function<Map<String, Object>, Consumer<byte[], byte[]>> consumers;
 
   private KafkaTransport(
       Settings.Kafka kafka,
       TlsSources tls,
       Map<String, Object> producerProperties,
-      Map<String, Object> consumerProperties) {
+      Map<String, Object> consumerProperties,
+      Function<Map<String, Object>, Consumer<byte[], byte[]>> consumers) {
     this.kafka = kafka;
     this.tls = tls;
     this.producerProperties = producerProperties;
     this.consumerProperties = consumerProperties;
+    this.consumers = consumers;
+  }
+
+  /**
+   * A plaintext transport whose consumer {@code consumer} is, for tests. Its sender is unusable.
+   */
+  static KafkaTransport withConsumer(Settings.Kafka kafka, Consumer<byte[], byte[]> consumer) {
+    return new KafkaTransport(kafka, TlsSources.none(), Map.of(), Map.of(), _ -> consumer);
   }
 
   /**
@@ -76,11 +87,18 @@ public final class KafkaTransport implements Transport {
     String clientId = "e2e-client-" + settings.origin();
     Map<String, Object> producer = KafkaClients.producer(kafka, clientId, overrides);
     Map<String, Object> consumer = KafkaClients.consumer(kafka, clientId, overrides);
-    ServerConfig config = KafkaClients.tlsConfig(kafka);
+    ServerConfig config = KafkaClients.tlsConfig(kafka, overrides);
     TlsSources tls = config == null ? TlsSources.none() : TlsSources.create(config);
     tls.apply(KafkaClients.CLUSTER, producer);
     tls.apply(KafkaClients.CLUSTER, consumer);
-    return new KafkaTransport(kafka, tls, producer, consumer);
+    return new KafkaTransport(
+        kafka,
+        tls,
+        producer,
+        consumer,
+        properties ->
+            new KafkaConsumer<>(
+                properties, new ByteArrayDeserializer(), new ByteArrayDeserializer()));
   }
 
   @Override
@@ -147,7 +165,7 @@ public final class KafkaTransport implements Transport {
       Duration maxProcessing,
       int maxUnacked,
       Handler handler,
-      Consumer<Throwable> failed) {
+      java.util.function.Consumer<Throwable> failed) {
     PollLoop loop = new PollLoop(topic, handler, failed);
     Thread thread = new Thread(loop, "kafka-consumer-" + topic);
     thread.setDaemon(true);
@@ -166,7 +184,7 @@ public final class KafkaTransport implements Transport {
   private final class PollLoop implements Runnable, ConsumerRebalanceListener {
     private final String topic;
     private final Handler handler;
-    private final Consumer<Throwable> failed;
+    private final java.util.function.Consumer<Throwable> failed;
 
     /** The next offset to commit of each partition owned, once its records were handled. */
     private final Map<TopicPartition, Long> handled = new HashMap<>();
@@ -174,10 +192,11 @@ public final class KafkaTransport implements Transport {
     /** What the last successful commit of each partition was. */
     private final Map<TopicPartition, Long> committed = new HashMap<>();
 
-    private KafkaConsumer<byte[], byte[]> consumer;
+    private Consumer<byte[], byte[]> consumer;
+    private long lastCommit;
     volatile boolean closing;
 
-    PollLoop(String topic, Handler handler, Consumer<Throwable> failed) {
+    PollLoop(String topic, Handler handler, java.util.function.Consumer<Throwable> failed) {
       this.topic = topic;
       this.handler = handler;
       this.failed = failed;
@@ -187,11 +206,7 @@ public final class KafkaTransport implements Transport {
     public void run() {
       Throwable failure;
       try {
-        consumer =
-            new KafkaConsumer<>(
-                new HashMap<>(consumerProperties),
-                new ByteArrayDeserializer(),
-                new ByteArrayDeserializer());
+        consumer = consumers.apply(new HashMap<>(consumerProperties));
         consumer.subscribe(List.of(topic), this);
         failure = loop();
       } catch (RuntimeException e) {
@@ -213,8 +228,7 @@ public final class KafkaTransport implements Transport {
 
     /** Polls and handles until closed; returns what the handler threw, if it did. */
     private Throwable loop() {
-      long interval = kafka.commitInterval().toNanos();
-      long lastCommit = System.nanoTime();
+      lastCommit = System.nanoTime();
       while (!closing) {
         for (ConsumerRecord<byte[], byte[]> record : consumer.poll(POLL)) {
           if (closing) {
@@ -233,13 +247,21 @@ public final class KafkaTransport implements Transport {
             return e;
           }
           handled.put(new TopicPartition(record.topic(), record.partition()), record.offset() + 1);
+          // Within a batch too: a batch of a slow handler can outlast the interval many times.
+          commitIfDue();
         }
-        if (System.nanoTime() - lastCommit >= interval) {
-          lastCommit = System.nanoTime();
-          commitAsync();
-        }
+        commitIfDue();
       }
       return null;
+    }
+
+    /** Commits what moved, once {@code commitInterval} has passed since the last commit. */
+    private void commitIfDue() {
+      long now = System.nanoTime();
+      if (now - lastCommit >= kafka.commitInterval().toNanos()) {
+        lastCommit = now;
+        commitAsync();
+      }
     }
 
     private Map<TopicPartition, OffsetAndMetadata> moved(Collection<TopicPartition> partitions) {

@@ -1,9 +1,12 @@
 package io.github.bpalermo.odradek.e2eclient;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.config.v1.Tls;
+import io.github.bpalermo.odradek.server.tls.CredentialException;
+import io.github.bpalermo.odradek.server.tls.TlsSources;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -97,7 +100,7 @@ class KafkaClientsTest {
 
   @Test
   void tlsIsTheTlsSectionOfAClusterOfTheServer() {
-    assertThat(KafkaClients.tlsConfig(settings().kafka())).isNull();
+    assertThat(KafkaClients.tlsConfig(settings().kafka(), Map.of())).isNull();
 
     ServerConfig spiffe =
         KafkaClients.tlsConfig(
@@ -108,17 +111,44 @@ class KafkaClientsTest {
                     "unix:///run/agent.sock",
                     "--broker-spiffe-ids",
                     "spiffe://td/kafka,spiffe://td/kafka-2")
-                .kafka());
+                .kafka(),
+            Map.of());
     Tls tls = spiffe.getClustersOrThrow(KafkaClients.CLUSTER).getTls();
     assertThat(tls.getSpiffe().getWorkloadApiSocket()).isEqualTo("unix:///run/agent.sock");
     assertThat(tls.getAcceptedSpiffeIdsList())
         .containsExactly("spiffe://td/kafka", "spiffe://td/kafka-2");
 
     ServerConfig files =
-        KafkaClients.tlsConfig(settings("--tls", "files", "--tls-dir", "/certs").kafka());
+        KafkaClients.tlsConfig(settings("--tls", "files", "--tls-dir", "/certs").kafka(), Map.of());
     Tls fromFiles = files.getClustersOrThrow(KafkaClients.CLUSTER).getTls();
     assertThat(fromFiles.getFiles().getDir()).isEqualTo("/certs");
     assertThat(fromFiles.getAcceptedSpiffeIdsList()).isEmpty();
+  }
+
+  @Test
+  void overridesThatTurnTlsOffAreRefusedAsTheServerRefusesThem() {
+    for (String protocol : List.of("PLAINTEXT", "SASL_PLAINTEXT")) {
+      ServerConfig config =
+          KafkaClients.tlsConfig(
+              settings("--tls", "files", "--tls-dir", "/nonexistent").kafka(),
+              Map.of("security.protocol", protocol));
+      // Refused before any credentials are looked for.
+      assertThatThrownBy(() -> TlsSources.create(config))
+          .isInstanceOf(CredentialException.class)
+          .hasMessageContaining("security.protocol is " + protocol);
+    }
+    ServerConfig ssl =
+        KafkaClients.tlsConfig(
+            settings("--tls", "files", "--tls-dir", "/nonexistent").kafka(),
+            Map.of("security.protocol", "SSL", "linger.ms", "0"));
+    assertThat(ssl.getClustersOrThrow(KafkaClients.CLUSTER).getPropertiesMap())
+        .containsEntry("security.protocol", "SSL")
+        .containsEntry("linger.ms", "0")
+        .containsEntry("bootstrap.servers", "broker:9093");
+    // Accepted: what fails now is the missing directory.
+    assertThatThrownBy(() -> TlsSources.create(ssl))
+        .isInstanceOf(CredentialException.class)
+        .hasMessageNotContaining("security.protocol");
   }
 
   @Test

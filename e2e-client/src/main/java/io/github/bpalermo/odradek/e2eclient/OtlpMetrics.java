@@ -196,6 +196,11 @@ public final class OtlpMetrics implements Metrics {
     return new OtlpMetrics(provider, channel, group, lane, transport);
   }
 
+  /** Records into a provider the caller made, for tests. */
+  static OtlpMetrics of(SdkMeterProvider provider, String lane, String transport) {
+    return new OtlpMetrics(provider, null, null, lane, transport);
+  }
+
   private static Duration interval(String millis) {
     if (millis == null || millis.isBlank()) {
       return DEFAULT_INTERVAL;
@@ -253,7 +258,9 @@ public final class OtlpMetrics implements Metrics {
 
   @Override
   public void endToEndLatency(double millis, boolean self) {
-    endToEnd.record(millis, self ? this.self : cross);
+    // Two clocks can give a negative latency, which an OpenTelemetry histogram drops: recorded as
+    // 0, as in /results, which also counts them.
+    endToEnd.record(Math.max(0, millis), self ? this.self : cross);
   }
 
   @Override
@@ -274,7 +281,9 @@ public final class OtlpMetrics implements Metrics {
   @Override
   public void close() {
     provider.shutdown().join(5, TimeUnit.SECONDS);
-    channel.shutdownNow();
-    group.shutdownGracefully(0, 1, TimeUnit.SECONDS);
+    if (channel != null) {
+      channel.shutdownNow();
+      group.shutdownGracefully(0, 1, TimeUnit.SECONDS);
+    }
   }
 }

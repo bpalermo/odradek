@@ -330,6 +330,19 @@ class ConsumerLedgerTest {
   }
 
   @Test
+  void runsAndOriginsWithSlashesAreNotConfused() {
+    // Joined with "/", both would be "r/a/b/key-0".
+    ledger.delivered("r/a", "b", "key-0", 1, 1);
+    ledger.processed("r/a", "b", "key-0", 1);
+    assertThat(ledger.delivered("r", "a/b", "key-0", 1, 2).kind())
+        .isEqualTo(ConsumerLedger.Kind.FIRST);
+    ledger.processed("r", "a/b", "key-0", 1);
+
+    assertThat(results()).containsEntry("duplicates", 0L).containsEntry("processed", 2L);
+    assertThat((List<?>) results().get("keys")).hasSize(2);
+  }
+
+  @Test
   void recordsOfAnOlderProducerHaveAnEmptyOrigin() {
     ledger.delivered(RUN, "", "a", 1, 1);
     ledger.processed(RUN, "", "a", 1);

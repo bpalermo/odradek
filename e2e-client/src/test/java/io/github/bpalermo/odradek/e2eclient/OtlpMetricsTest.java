@@ -3,6 +3,11 @@ package io.github.bpalermo.odradek.e2eclient;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.HistogramPointData;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
@@ -37,6 +42,29 @@ class OtlpMetricsTest {
       // Nothing listens: the push at close fails, and is not waited for long.
       metrics.close();
     }
+  }
+
+  @Test
+  void aNegativeCrossClockLatencyIsExportedAsZeroAndNotDropped() {
+    InMemoryMetricReader reader = InMemoryMetricReader.create();
+    OtlpMetrics metrics =
+        OtlpMetrics.of(
+            SdkMeterProvider.builder().registerMetricReader(reader).build(), "a", "kafka");
+    metrics.endToEndLatency(-3, false);
+    metrics.endToEndLatency(2, false);
+
+    MetricData data =
+        reader.collectAllMetrics().stream()
+            .filter(metric -> metric.getName().equals("e2e.end_to_end.latency"))
+            .findFirst()
+            .orElseThrow();
+    HistogramPointData point = data.getHistogramData().getPoints().iterator().next();
+    assertThat(point.getAttributes().get(AttributeKey.stringKey("clock"))).isEqualTo("cross");
+    assertThat(point.getAttributes().get(AttributeKey.stringKey("lane"))).isEqualTo("a");
+    assertThat(point.getCount()).isEqualTo(2);
+    assertThat(point.getMin()).isZero();
+    assertThat(point.getSum()).isEqualTo(2.0);
+    metrics.close();
   }
 
   @Test
