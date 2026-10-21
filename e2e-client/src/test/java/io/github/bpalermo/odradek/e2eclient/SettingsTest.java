@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -121,6 +122,8 @@ class SettingsTest {
             "true",
             "--rate-schedule",
             "20:10m,50:5m,20:0",
+            "--schedule-start",
+            "2026-10-22T12:00:00Z",
             "--count",
             "100",
             "--duration",
@@ -182,6 +185,7 @@ class SettingsTest {
                 0,
                 true,
                 RateSchedule.parse("20:10m,50:5m,20:0"),
+                Instant.parse("2026-10-22T12:00:00Z"),
                 100,
                 Duration.ofMinutes(10),
                 3,
@@ -434,5 +438,14 @@ class SettingsTest {
         .containsKey("rate")
         .containsKey("failEvery")
         .doesNotContainKey("socket");
+  }
+
+  @Test
+  void aScheduleStartMustBeAnInstant() {
+    assertThatThrownBy(
+            () -> parse(Map.of(), "--mode", "producer", "--topic", "t", "--schedule-start", "noon"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("--schedule-start");
+    assertThat(parse(Map.of(), "--mode", "producer", "--topic", "t").scheduleStart()).isNull();
   }
 }

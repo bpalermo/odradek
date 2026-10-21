@@ -82,6 +82,8 @@ Each is kept over the whole run and over a rolling window (`--latency-window`, 6
 
 **Rate schedule.** `--rate-schedule 20:10m,50:5m,100:5m,200:5m,20:0` sends at 20 records per second for 10 minutes, then 50, 100 and 200 for 5 minutes each, then 20 for good (a last step of duration `0`). The rate steps without a restart, so the ledgers survive. A schedule whose last step has a duration ends there, like `--duration`. It replaces `--rate`.
 
+**Schedule start.** By default the schedule starts when the process does, so pods started minutes apart (a rollout, lanes scheduled one after the other) step at different moments. `--schedule-start 2026-10-22T12:00:00Z` starts it at that instant instead, the same for every pod: a pod started before it waits, and one started after it, or restarted, joins at the step in force without sending what it missed. Pods then step together to within their nodes' clock offset, a few milliseconds.
+
 ## Metrics
 
 Only when `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`) is set: OTLP over gRPC (`OTEL_EXPORTER_OTLP_PROTOCOL` must be `grpc` or unset), pushed every `OTEL_METRIC_EXPORT_INTERVAL` ms (30 s by default), with `service.name` from `OTEL_SERVICE_NAME` (default `odradek-e2e-client`) and the resource attributes of `OTEL_RESOURCE_ATTRIBUTES` (the deployments set `k8s.pod.name`). On the server's OpenTelemetry, gRPC and Netty: no second copies.
@@ -115,6 +117,7 @@ Every setting is a flag (`--name value` or `--name=value`) and an environment va
 | `--exit-when-done` | `E2E_EXIT_WHEN_DONE` | `false` | Producer mode: exit once everything is sent (a Job). Otherwise it serves its results until stopped (a Deployment). Both mode always runs until stopped |
 | `--rate` | `E2E_RATE` | `10` | Producer: records per second over all keys; fractions allowed |
 | `--rate-schedule` | `E2E_RATE_SCHEDULE` | none | Producer: `rate:duration` steps, e.g. `20:10m,50:5m,20:0`; replaces `--rate` (Latency) |
+| `--schedule-start` | `E2E_SCHEDULE_START` | none | Producer: the instant the schedule starts, the same for every pod, e.g. `2026-10-22T12:00:00Z`; empty for the process's own start (Latency) |
 | `--count` | `E2E_COUNT` | `0` | Producer: records to send; `0` for no limit |
 | `--duration` | `E2E_DURATION` | `0` | Producer: how long to send; `0` for no limit |
 | `--keys` | `E2E_KEYS` | `8` | Producer: number of keys |

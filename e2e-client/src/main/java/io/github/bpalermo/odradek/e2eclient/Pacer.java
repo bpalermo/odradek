@@ -20,7 +20,16 @@ final class Pacer {
   private long next;
 
   Pacer(RateSchedule schedule) {
+    this(schedule, 0);
+  }
+
+  /**
+   * A pacer that joins the schedule {@code joinedAt} nanoseconds after its start: the first record
+   * is due then, at the rate of the step in force, and nothing is sent for the time before.
+   */
+  Pacer(RateSchedule schedule, long joinedAt) {
     this.schedule = schedule;
+    this.next = joinedAt;
   }
 
   /** When the next record is due; -1 when the schedule ends before then. */
