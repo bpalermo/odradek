@@ -69,7 +69,16 @@ public final class ProducerRun extends Run {
           break;
         }
         long due = pacer.due();
-        if (due < 0 || !waitUntil(start + due)) {
+        if (due < 0) {
+          break;
+        }
+        // A record due after --duration ends is never sent, however far off it is: a shared
+        // schedule start can lie past the end. The run then ends at its end, not at the record's.
+        if (timed && start + due - end >= 0) {
+          waitUntil(end);
+          break;
+        }
+        if (!waitUntil(start + due)) {
           break;
         }
         int k = (int) (i % keyCount);
