@@ -54,7 +54,8 @@ import java.util.TreeSet;
  *
  * <ul>
  *   <li><b>What to send, to whom.</b> A record goes to a connected receiver with credit, the one
- *       holding the fewest unacknowledged records (the one that joined first on a tie). Partitions
+ *       holding the fewest unacknowledged records and, on a tie, the one sent a record longest ago,
+ *       so that idle receivers take turns rather than the first to join getting all. Partitions
  *       with something to send take turns, one record each, and within a partition the lowest
  *       offset goes first, so a record to deliver again precedes newer ones.
  *   <li><b>Ordering.</b> Under {@link Ordering#KEY} a record waits while an earlier record of its
@@ -337,6 +338,12 @@ public final class DispatchCore<R> {
     /** Number of records in {@link #held}. */
     int load;
 
+    /**
+     * When it was last sent a record, as a count of sends; 0 if never. Among receivers with the
+     * same load, the one that waited longest goes first, so idle receivers take turns.
+     */
+    long lastSent;
+
     /** What it was sent and has not acknowledged or given back, by partition and offset. */
     final TreeMap<Integer, TreeMap<Long, Rec<R>>> held = new TreeMap<>();
 
@@ -385,10 +392,18 @@ public final class DispatchCore<R> {
   /** In the order they joined. */
   private final LinkedHashMap<String, Receiver<R>> receivers = new LinkedHashMap<>();
 
-  /** The receivers with credit, least loaded first. Removed before load changes, added after. */
+  /**
+   * The receivers with credit, least loaded first, then the one sent to longest ago. Removed before
+   * load or {@code lastSent} changes, added after.
+   */
   private final TreeSet<Receiver<R>> available =
       new TreeSet<>(
-          Comparator.<Receiver<R>>comparingInt(r -> r.load).thenComparingLong(r -> r.seq));
+          Comparator.<Receiver<R>>comparingInt(r -> r.load)
+              .thenComparingLong(r -> r.lastSent)
+              .thenComparingLong(r -> r.seq));
+
+  /** Sends so far, which orders {@link Receiver#lastSent}. */
+  private long sends;
 
   /**
    * The records in flight, by the processing deadline they were sent under. The last is the one in
@@ -896,6 +911,7 @@ public final class DispatchCore<R> {
     Part<R> p = rec.part;
     available.remove(r);
     r.credit--;
+    r.lastSent = ++sends;
     if (rec.former != null) {
       rec.former.remove(r);
     }
