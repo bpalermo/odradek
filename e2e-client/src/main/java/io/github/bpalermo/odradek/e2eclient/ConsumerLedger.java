@@ -2,6 +2,7 @@ package io.github.bpalermo.odradek.e2eclient;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -12,8 +13,9 @@ import java.util.TreeMap;
  * The consumer's bookkeeping, with no I/O: what was delivered, in which order, how often, and what
  * that says about the run.
  *
- * <p>Records are tracked per run and key by {@code seq}. Each delivery is classified when it
- * arrives:
+ * <p>Records are tracked per run, origin (the producing process) and key by {@code seq}, so several
+ * producers can share a topic. Records of an older producer have an empty origin. Each delivery is
+ * classified when it arrives:
  *
  * <ul>
  *   <li><b>First delivery</b> of a {@code seq}. In order when it is one above the highest seen of
@@ -58,6 +60,7 @@ public final class ConsumerLedger {
   /** What is known of one key of one run. */
   private static final class KeyState {
     final String runId;
+    final String origin;
     final String key;
     byte[] state = new byte[64];
     long[] firstDeliveredMs = new long[64];
@@ -71,8 +74,9 @@ public final class ConsumerLedger {
     long longestReorder;
     long expectedRedeliveries;
 
-    KeyState(String runId, String key) {
+    KeyState(String runId, String origin, String key) {
       this.runId = runId;
+      this.origin = origin;
       this.key = key;
     }
 
@@ -91,7 +95,7 @@ public final class ConsumerLedger {
 
   private final Events events;
   private final boolean soleConsumer;
-  private final Map<String, KeyState> keys = new TreeMap<>();
+  private final Map<Id, KeyState> keys = new TreeMap<>(Id.ORDER);
   private final List<Map<String, Object>> duplicateDetails = new ArrayList<>();
   private final Map<String, Long> consumerFailures = new TreeMap<>();
   private long delivered;
@@ -105,9 +109,6 @@ public final class ConsumerLedger {
   private long malformed;
   private long foreignRun;
   private long consumerRestarts;
-  private long latencyCount;
-  private long latencySumMs;
-  private long latencyMaxMs;
 
   /**
    * @param events where anomalies are reported, one event each
@@ -125,11 +126,12 @@ public final class ConsumerLedger {
    * @throws IllegalArgumentException if {@code seq} is not between 1 and {@link #MAX_SEQ}
    */
   public synchronized Delivery delivered(
-      String runId, String key, long seq, long producerTs, long nowMs) {
+      String runId, String origin, String key, long seq, long nowMs) {
     if (seq < 1 || seq > MAX_SEQ) {
       throw new IllegalArgumentException("seq " + seq + " is not between 1 and " + MAX_SEQ);
     }
-    KeyState k = keys.computeIfAbsent(runId + "/" + key, _ -> new KeyState(runId, key));
+    KeyState k =
+        keys.computeIfAbsent(id(runId, origin, key), _ -> new KeyState(runId, origin, key));
     delivered++;
     k.delivered++;
     k.ensure(seq);
@@ -139,10 +141,7 @@ public final class ConsumerLedger {
       case PROCESSED -> {
         duplicates++;
         k.duplicates++;
-        Map<String, Object> detail = new LinkedHashMap<>();
-        detail.put("runId", runId);
-        detail.put("key", key);
-        detail.put("seq", seq);
+        Map<String, Object> detail = record(runId, origin, key, seq);
         detail.put("firstDeliveredMs", k.firstDeliveredMs[index]);
         detail.put("deliveredAgainMs", nowMs);
         if (duplicateDetails.size() < DETAIL_LIMIT) {
@@ -159,15 +158,11 @@ public final class ConsumerLedger {
       }
       default -> {
         k.firstDeliveredMs[index] = nowMs;
-        long latency = Math.max(0, nowMs - producerTs);
-        latencyCount++;
-        latencySumMs += latency;
-        latencyMaxMs = Math.max(latencyMaxMs, latency);
         if (seq > k.highestSeen + 1) {
           gaps++;
           k.gaps++;
           if (soleConsumer) {
-            Map<String, Object> detail = record(runId, key, seq);
+            Map<String, Object> detail = record(runId, origin, key, seq);
             detail.put("expected", k.highestSeen + 1);
             detail.put("missing", seq - k.highestSeen - 1);
             events.emit("anomaly", withType("gap", detail));
@@ -177,7 +172,7 @@ public final class ConsumerLedger {
           reorders++;
           k.reorders++;
           k.longestReorder = Math.max(k.longestReorder, depth);
-          Map<String, Object> detail = record(runId, key, seq);
+          Map<String, Object> detail = record(runId, origin, key, seq);
           detail.put("highestSeen", k.highestSeen);
           detail.put("depth", depth);
           events.emit("anomaly", withType("reorder", detail));
@@ -190,29 +185,53 @@ public final class ConsumerLedger {
   }
 
   /** The handler failed the record on purpose: it is not acknowledged and will come back. */
-  public synchronized void failed(String runId, String key, long seq) {
-    KeyState k = known(runId, key, seq);
+  public synchronized void failed(String runId, String origin, String key, long seq) {
+    KeyState k = known(runId, origin, key, seq);
     k.state[(int) seq] = FAILED;
     k.failures.merge(seq, 1, Integer::sum);
     deliberateFailures++;
   }
 
-  /** The handler processed the record: it is acknowledged. */
-  public synchronized void processed(String runId, String key, long seq) {
-    KeyState k = known(runId, key, seq);
-    if (k.state[(int) seq] != PROCESSED) {
+  /**
+   * The handler processed the record: it is acknowledged.
+   *
+   * @return whether it is the first time the record was processed
+   */
+  public synchronized boolean processed(String runId, String origin, String key, long seq) {
+    KeyState k = known(runId, origin, key, seq);
+    boolean first = k.state[(int) seq] != PROCESSED;
+    if (first) {
       k.processed++;
       processed++;
     }
     k.state[(int) seq] = PROCESSED;
+    return first;
   }
 
-  private KeyState known(String runId, String key, long seq) {
-    KeyState k = keys.get(runId + "/" + key);
+  private KeyState known(String runId, String origin, String key, long seq) {
+    KeyState k = keys.get(id(runId, origin, key));
     if (k == null || seq < 1 || seq >= k.state.length || k.state[(int) seq] == UNSEEN) {
-      throw new IllegalStateException(runId + "/" + key + "/" + seq + " was not delivered");
+      throw new IllegalStateException(id(runId, origin, key) + "/" + seq + " was not delivered");
     }
     return k;
+  }
+
+  private static Id id(String runId, String origin, String key) {
+    return new Id(runId, origin, key);
+  }
+
+  /**
+   * What a key's records are tracked by. A record rather than a joined string: neither the run nor
+   * the origin excludes any character, so no separator keeps two of them apart.
+   */
+  private record Id(String runId, String origin, String key) {
+    static final Comparator<Id> ORDER =
+        Comparator.comparing(Id::runId).thenComparing(Id::origin).thenComparing(Id::key);
+
+    @Override
+    public String toString() {
+      return runId + "/" + origin + "/" + key;
+    }
   }
 
   /** A record whose checksum does not match its fields. */
@@ -265,6 +284,7 @@ public final class ConsumerLedger {
       unresolved += keyUnresolved;
       Map<String, Object> out = new LinkedHashMap<>();
       out.put("runId", k.runId);
+      out.put("origin", k.origin);
       out.put("key", k.key);
       out.put("highestSeen", k.highestSeen);
       out.put("delivered", k.delivered);
@@ -307,11 +327,6 @@ public final class ConsumerLedger {
     out.put("foreignRun", foreignRun);
     out.put("consumerRestarts", consumerRestarts);
     out.put("consumerFailures", new TreeMap<>(consumerFailures));
-    Map<String, Object> latency = new LinkedHashMap<>();
-    latency.put("count", latencyCount);
-    latency.put("meanMs", latencyCount == 0 ? 0 : latencySumMs / latencyCount);
-    latency.put("maxMs", latencyMaxMs);
-    out.put("latency", latency);
     out.put("duplicateDetails", new ArrayList<>(duplicateDetails));
     out.put("duplicateDetailsTruncated", duplicates > duplicateDetails.size());
     out.put("keys", perKey);
@@ -345,9 +360,10 @@ public final class ConsumerLedger {
     return ranges.stream().map(range -> List.of(range[0], range[1])).toList();
   }
 
-  private static Map<String, Object> record(String runId, String key, long seq) {
+  private static Map<String, Object> record(String runId, String origin, String key, long seq) {
     Map<String, Object> out = new LinkedHashMap<>();
     out.put("runId", runId);
+    out.put("origin", origin);
     out.put("key", key);
     out.put("seq", seq);
     return out;

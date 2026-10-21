@@ -20,16 +20,48 @@ _TEST_PKI = [
     "src/test/java/io/github/bpalermo/odradek/server/tls/TestPki.java",
 ]
 
+_TLS_SRCS = glob(["src/main/java/io/github/bpalermo/odradek/server/tls/*.java"])
+
+# The tls package on its own, with no resources: the e2e-client's plain Kafka
+# transport uses the server's SPIFFE and rotating TLS code, and must not get
+# the server's logback.xml with it (it logs to stdout, which the e2e-client
+# keeps for its JSON lines).
+java_library(
+    name = "tls",
+    srcs = _TLS_SRCS,
+    javacopts = JAVACOPTS,
+    visibility = ["//e2e-client:__pkg__"],
+    deps = [
+        "//api/odradek/config/v1:config_java_proto",
+        "@grpc-java//api",
+        "@grpc-java//netty",
+        "@grpc-java//stub",
+        "@maven//:io_netty_netty_buffer",
+        "@maven//:io_netty_netty_handler",
+        "@maven//:io_netty_netty_transport",
+        "@maven//:io_netty_netty_transport_classes_epoll",
+        "@maven//:io_netty_netty_transport_native_unix_common",
+        "@maven//:org_apache_kafka_kafka_clients",
+        "@maven//:org_slf4j_slf4j_api",
+        "@protobuf//java/core",
+    ],
+)
+
 java_library(
     name = "server_lib",
-    srcs = glob(["src/main/java/**/*.java"]),
+    srcs = glob(
+        ["src/main/java/**/*.java"],
+        exclude = _TLS_SRCS,
+    ),
     javacopts = JAVACOPTS,
     resource_strip_prefix = "server/src/main/resources",
     resources = glob(["src/main/resources/**"]) + [":version"],
     visibility = ["//e2e:__pkg__"],
+    exports = [":tls"],
     # The OTLP exporter's transport on grpc-java, found through ServiceLoader.
     runtime_deps = ["@maven//:io_opentelemetry_opentelemetry_exporter_sender_grpc_managed_channel"],
     deps = [
+        ":tls",
         "//api/odradek/config/v1:config_java_proto",
         "//api/odradek/delivery/v1:delivery_java_grpc",
         "//api/odradek/delivery/v1:delivery_java_proto",

@@ -18,7 +18,7 @@ The same server can also run on its own as a dispatcher ([ADR 6](docs/adr/0006-s
 | `client/python/` | Python client library for applications (asyncio): a port of the protocol core, the generated API and the wheel (ADR 3) |
 | `conformance/` | Scenarios every client core must pass |
 | `e2e/` | End-to-end suites against real brokers: the server and the Java client (`src/`), the Python client (`python/`) |
-| `e2e-client/` | The test application of the in-cluster end-to-end run, on the Java client: a producer or a consumer, with fault knobs, that keeps its own account of every record and serves it on `GET /results` ([README](e2e-client/README.md)) |
+| `e2e-client/` | The test application of the in-cluster end-to-end run, on the Java client or the Kafka clients directly: a producer, a consumer or both, with fault knobs, that keeps its own account and latencies of every record and serves them on `GET /results` ([README](e2e-client/README.md)) |
 | `deploy/kubernetes/` | Example manifests, plain YAML with a `kustomization.yaml` each: a dispatcher (`dispatcher/`) and an application pod with the server as its sidecar (`application/`). `kubectl kustomize deploy/kubernetes/dispatcher` renders them; a unit test loads the configurations they embed |
 | `extension/java/` | Interfaces for extension jars: `RecordTransform`, the byte-to-byte codec step (encryption and similar) |
 | `bazel/` | Shared build code: formatter, linters, JUnit 6 macro, gRPC codegen shims |

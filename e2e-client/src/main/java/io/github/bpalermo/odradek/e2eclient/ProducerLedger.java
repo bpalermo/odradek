@@ -10,6 +10,10 @@ import java.util.TreeMap;
  * The producer's bookkeeping, with no I/O: each record sent and its outcome. A record's outcome is
  * counted once, whichever reports it first; one with none when the run ends is unknown.
  *
+ * <p>Records are identified by run, origin (this process), key and {@code seq}: the merge of
+ * several pods' results joins each producer's ledger with every consumer's {@code processedRanges}
+ * by them.
+ *
  * <p>Thread-safe.
  */
 public final class ProducerLedger {
@@ -33,6 +37,7 @@ public final class ProducerLedger {
 
   private final Events events;
   private final String runId;
+  private final String origin;
   private final Map<String, KeyState> keys = new TreeMap<>();
   private final Map<String, Long> failedByCode = new TreeMap<>();
   private final Map<String, Long> unknownByCode = new TreeMap<>();
@@ -42,12 +47,11 @@ public final class ProducerLedger {
   private long failed;
   private long unknown;
   private long notSent;
-  private long latencySumMs;
-  private long latencyMaxMs;
 
-  public ProducerLedger(Events events, String runId) {
+  public ProducerLedger(Events events, String runId, String origin) {
     this.events = events;
     this.runId = runId;
+    this.origin = origin;
   }
 
   /** A record was handed to the producer. */
@@ -76,18 +80,14 @@ public final class ProducerLedger {
   }
 
   /** Every cluster the topic requires acknowledged the record. */
-  public synchronized void acked(String key, long seq, long nowMs) {
+  public synchronized void acked(String key, long seq) {
     KeyState k = keys.get(key);
-    Long sentMs = k == null ? null : k.outstanding.remove(seq);
-    if (sentMs == null) {
+    if (k == null || k.outstanding.remove(seq) == null) {
       return;
     }
     acked++;
     k.acked++;
     k.lastAckedSeq = Math.max(k.lastAckedSeq, seq);
-    long latency = Math.max(0, nowMs - sentMs);
-    latencySumMs += latency;
-    latencyMaxMs = Math.max(latencyMaxMs, latency);
   }
 
   /** The record failed and was not written: {@code code} is the server's error code. */
@@ -159,15 +159,12 @@ public final class ProducerLedger {
     out.put("failedByCode", new TreeMap<>(failedByCode));
     out.put("unknownByCode", new TreeMap<>(unknownByCode));
     out.put("notSentByReason", new TreeMap<>(notSentByReason));
-    Map<String, Object> latency = new LinkedHashMap<>();
-    latency.put("meanMs", acked == 0 ? 0 : latencySumMs / acked);
-    latency.put("maxMs", latencyMaxMs);
-    out.put("ackLatency", latency);
     List<Map<String, Object>> perKey = new ArrayList<>();
     keys.forEach(
         (key, k) -> {
           Map<String, Object> entry = new LinkedHashMap<>();
           entry.put("runId", runId);
+          entry.put("origin", origin);
           entry.put("key", key);
           entry.put("sent", k.sent);
           entry.put("acked", k.acked);
@@ -186,6 +183,7 @@ public final class ProducerLedger {
   private Map<String, Object> detail(String key, long seq, String code, String message) {
     Map<String, Object> out = new LinkedHashMap<>();
     out.put("runId", runId);
+    out.put("origin", origin);
     out.put("key", key);
     out.put("seq", seq);
     out.put("code", code);

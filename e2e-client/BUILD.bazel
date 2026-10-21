@@ -6,16 +6,37 @@ load("//bazel/java:junit.bzl", "java_junit_test")
 
 package(default_visibility = ["//visibility:private"])
 
-# The test application of the in-cluster end-to-end run: a producer or a
-# consumer on the Java client, which keeps its own account of every record and
-# serves it on GET /results. See README.md.
+# The test application of the in-cluster end-to-end run: a producer, a consumer
+# or both, on the Java client or on the Kafka clients directly, which keeps its
+# own account of every record and serves it on GET /results. See README.md.
 java_library(
     name = "lib",
     srcs = glob(["src/main/java/**/*.java"]),
     javacopts = JAVACOPTS,
-    # The end-to-end suite runs both modes against a real server.
+    # The end-to-end suite runs every mode against a real server and broker.
     visibility = ["//e2e:__pkg__"],
-    deps = ["//client/java:client"],
+    # The OTLP exporter's transport on grpc-java, found through ServiceLoader:
+    # the server's, so there is one gRPC and one Netty.
+    runtime_deps = ["@maven//:io_opentelemetry_opentelemetry_exporter_sender_grpc_managed_channel"],
+    deps = [
+        "//api/odradek/config/v1:config_java_proto",
+        "//client/java:client",
+        # The kafka transport's TLS is the server's: SPIFFE Workload API,
+        # rotation, and brokers verified by SPIFFE ID.
+        "//server:tls",
+        "@grpc-java//api",
+        "@grpc-java//netty",
+        "@maven//:io_netty_netty_transport",
+        "@maven//:io_netty_netty_transport_classes_epoll",
+        "@maven//:io_opentelemetry_opentelemetry_api",
+        "@maven//:io_opentelemetry_opentelemetry_exporter_otlp",
+        "@maven//:io_opentelemetry_opentelemetry_sdk_common",
+        "@maven//:io_opentelemetry_opentelemetry_sdk_metrics",
+        "@maven//:org_apache_kafka_kafka_clients",
+        "@maven//:org_hdrhistogram_HdrHistogram",
+        "@maven//:org_slf4j_slf4j_api",
+        "@protobuf//java/core",
+    ],
 )
 
 # logback.xml, in a jar of its own so that it reaches the binary and not the
@@ -66,13 +87,27 @@ java_junit_test(
         "io.github.bpalermo.odradek.e2eclient.ConsumerLedgerTest",
         "io.github.bpalermo.odradek.e2eclient.FaultsTest",
         "io.github.bpalermo.odradek.e2eclient.JsonTest",
+        "io.github.bpalermo.odradek.e2eclient.KafkaClientsTest",
+        "io.github.bpalermo.odradek.e2eclient.KafkaTransportTest",
+        "io.github.bpalermo.odradek.e2eclient.LatencyTest",
+        "io.github.bpalermo.odradek.e2eclient.OtlpMetricsTest",
+        "io.github.bpalermo.odradek.e2eclient.PacerTest",
         "io.github.bpalermo.odradek.e2eclient.ProducerLedgerTest",
+        "io.github.bpalermo.odradek.e2eclient.RateScheduleTest",
         "io.github.bpalermo.odradek.e2eclient.RecordValueTest",
         "io.github.bpalermo.odradek.e2eclient.ResultsServerTest",
         "io.github.bpalermo.odradek.e2eclient.SettingsTest",
     ],
+    # OtlpMetricsTest starts the exporter, on Netty's epoll transport.
+    runtime_deps = ["//server:netty_epoll_native"],
     deps = [
         ":lib",
+        "//api/odradek/config/v1:config_java_proto",
+        "//server:tls",
+        "@maven//:io_opentelemetry_opentelemetry_api",
+        "@maven//:io_opentelemetry_opentelemetry_sdk_metrics",
+        "@maven//:io_opentelemetry_opentelemetry_sdk_testing",
+        "@maven//:org_apache_kafka_kafka_clients",
         "@maven//:org_assertj_assertj_core",
         "@maven//:org_junit_jupiter_junit_jupiter_api",
     ],

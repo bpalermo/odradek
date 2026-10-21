@@ -7,6 +7,9 @@ odradek_proto_library(
     # It imports buf/validate/validate.proto, which has no Clojure namespace.
     clojure = False,
     visibility = [
+        # The e2e-client's kafka transport loads its TLS as a cluster's tls
+        # section, with the server's TlsSources.
+        "//e2e-client:__pkg__",
         "//e2e:__subpackages__",
         "//server:__subpackages__",
     ],
