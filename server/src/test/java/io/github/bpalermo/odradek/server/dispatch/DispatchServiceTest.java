@@ -1585,6 +1585,43 @@ class DispatchServiceTest {
   }
 
   @Test
+  void aDeadlineTheHandOverMakesEndsThePollItReturnsInto() throws Exception {
+    start(quiet());
+    Sidecar slow = declared(declare("orders"));
+    assign(P0, P1);
+    add(P0, 0, "a");
+    slow.credits(1);
+    assertThat(slow.records(1)).containsExactly("0/0/1");
+    // A later declaration with a deadline of 20 ms, which applies to what is sent from then on.
+    Sidecar fast = declared(declare("orders", s -> s.setMaxProcessingMs(20)));
+    add(P1, 0, "b");
+    RecordingConsumer kafka = kafka();
+    waitsInItsPoll(kafka);
+    AtomicInteger duringRebalance = new AtomicInteger(-1);
+    kafka.schedulePollTask(
+        () -> {
+          int before = kafka.wakeups.get();
+          kafka.rebalance(List.of(P1));
+          duringRebalance.set(kafka.wakeups.get() - before);
+        });
+    // The hand-over has begun (the revocation is counted as the callback starts) and waits for the
+    // acknowledgement of P0's record. Meanwhile a credit sends P1's record under the 20 ms
+    // deadline, then that acknowledgement arrives: the hand-over handles both, well within the
+    // 100 ms the poll it runs in may wait, and the queue is empty when the callback ends.
+    eventually(
+        "the hand-over has begun",
+        () -> metric("odradek.consume.rebalances", "event", "revoked") == 1);
+    fast.credits(1);
+    assertThat(fast.records(1)).containsExactly("1/0/1");
+    slow.ack(0, 0, 0);
+    eventually("the revoked partition is committed", () -> committedNow(P0) == 1);
+    eventually("the rebalance is over", () -> duringRebalance.get() >= 0);
+    // The poll the callback returns into chose a wait of 100 ms; the new deadline, due before it
+    // would end, ends it.
+    assertThat(duringRebalance.get()).isEqualTo(1);
+  }
+
+  @Test
   void aCommandWhileTheHandOverRunsDoesNotWakeTheConsumer() throws Exception {
     start(quiet());
     Sidecar sidecar = declared(declare("orders"));

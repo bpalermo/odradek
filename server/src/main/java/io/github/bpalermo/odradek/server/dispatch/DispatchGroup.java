@@ -374,6 +374,15 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   /** The thread is in a poll that may block, callbacks included. Group thread only. */
   private boolean inPoll;
 
+  /** While {@link #inPoll}: when the poll the thread is in ends, on the {@link #now} clock. */
+  private long pollUntil;
+
+  /**
+   * While {@link #inPoll}: whether a callback has already ended that poll early. One poll may run
+   * several callbacks (a revocation, then an assignment), and one wakeup ends it.
+   */
+  private boolean pollEnded;
+
   private Consumer<byte[], byte[]> consumer;
   private boolean subscriptionChanged;
   private boolean pausesChanged;
@@ -564,6 +573,8 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     }
     inPoll = waitMs > 0;
     long start = inPoll ? now() : 0;
+    pollUntil = start + TimeUnit.MILLISECONDS.toNanos(waitMs);
+    pollEnded = false;
     try {
       return consumer.poll(Duration.ofMillis(waitMs));
     } catch (WakeupException e) {
@@ -581,7 +592,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
    * Runs a rebalance callback, which the consumer calls inside a poll: no command wakes the
    * consumer while it runs, since the hand-over waits for acknowledgements by handling commands
    * itself, and a wakeup would only cut its synchronous commit short. When it returns into a poll
-   * that may block, commands may wake the consumer again, at once if one was queued meanwhile.
+   * that may block, commands may wake the consumer again, at once if one was queued meanwhile, or
+   * if what the callback did is due before that poll would end: the hand-over handles credits, and
+   * a record sent under a short processing deadline must not wait out a timeout chosen before.
    */
   private void callback(Runnable callback) {
     wakeable.set(false);
@@ -590,7 +603,12 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     } finally {
       if (inPoll) {
         wakeable.set(true);
-        if (!commands.isEmpty() && wakeable.compareAndSet(true, false)) {
+        long now = now();
+        boolean dueSooner = now + waitNanos(now) - pollUntil < 0;
+        if (!pollEnded
+            && (!commands.isEmpty() || dueSooner)
+            && wakeable.compareAndSet(true, false)) {
+          pollEnded = true;
           consumer.wakeup();
         }
       }
