@@ -165,6 +165,13 @@ import java.util.TreeSet;
  * <p>The processing deadline is the one setting that can change while the core runs ({@link
  * #maxProcessing}): a record keeps the deadline in force when it was sent.
  *
+ * <h2>Timings</h2>
+ *
+ * <p>The core tells a {@link Timings}, if it is given one, how long a record waited between its
+ * fetch and its first delivery, and what it waited for most, and how long a receiver took to answer
+ * a delivery. The times are the core's, those that came with the events, so a wait is measured to
+ * the precision of the events: a record fetched and sent while one event is handled waited nothing.
+ *
  * <p>The same events at the same times give the same actions. An event costs time in proportion to
  * the records it concerns, times a logarithm; giving a partition up also walks that partition's
  * records and the receivers. Not thread-safe.
@@ -173,6 +180,47 @@ import java.util.TreeSet;
  *     record is acknowledged, and hands it back with every delivery
  */
 public final class DispatchCore<R> {
+
+  /** What a record waited for most between its fetch and its first delivery. */
+  public enum Wait {
+    /** Nothing: it was sent while the event that let it be sent was handled. */
+    NOTHING,
+    /** It could be sent, and no receiver had credit. */
+    CREDIT,
+    /**
+     * An earlier record of its key (under {@link Ordering#KEY}) or of its partition (under {@link
+     * Ordering#PARTITION}) was unacknowledged, or a blocked record of its partition kept it from
+     * being let in or, once ready, from being sent.
+     */
+    ORDERING,
+    /** The window held its partition back while it waited to be let in. */
+    WINDOW
+  }
+
+  /**
+   * Told what the core times, as it happens, on the thread that calls {@link #handle}. The methods
+   * do nothing unless overridden.
+   */
+  public interface Timings {
+    /** Times nothing. */
+    Timings NONE = new Timings() {};
+
+    /**
+     * A record is delivered for the first time by this core, {@code nanos} after it was fetched.
+     *
+     * @param waited what most of that time was spent waiting for; {@link Wait#NOTHING} when it is 0
+     */
+    default void queued(long nanos, Wait waited) {}
+
+    /**
+     * The receiver a record was in flight to answered, {@code nanos} after it was sent: it
+     * acknowledged the record, or rejected it, within the delivery's deadline. Not told: an answer
+     * after the deadline, whether or not the core has been told the time has passed (the record may
+     * have been sent since); and an answer from a receiver that was sent the record again while it
+     * held an expired copy, which may be for either.
+     */
+    default void answered(long nanos, boolean acknowledged) {}
+  }
 
   private enum State {
     /** Fetched; not yet let in by the window, or by the ordering under {@code PARTITION}. */
@@ -208,6 +256,36 @@ public final class DispatchCore<R> {
     boolean delivered;
 
     long sentAt;
+
+    /** When it was fetched, let in past {@code PENDING}, and made {@code READY}, last. */
+    long fetchedAt;
+
+    long admittedAt;
+    long readyAt;
+
+    /** The partition's count of window holds when it was fetched, less one if it was held then. */
+    long windowMark;
+
+    /** Whether the window held its partition back while it was {@code PENDING}. */
+    boolean windowHeld;
+
+    /**
+     * While {@code READY} for its first delivery: whether a blocked record below it in its
+     * partition keeps it from being sent now, since when, and how long that held it before then.
+     * Whether is its own field: the clock's values may be negative, so no value of {@code
+     * blockedSince} can mean "not blocked".
+     */
+    boolean blockedNow;
+
+    long blockedSince;
+
+    long blockedNanos;
+
+    /**
+     * Whether the receiver it is in flight to was sent it before and let that delivery's deadline
+     * pass: an answer from it may be for either copy, and cannot be timed.
+     */
+    boolean resentToFormer;
 
     /** The deliveries it is in flight among: those made under the same processing deadline. */
     Flight<R> flight;
@@ -305,6 +383,9 @@ public final class DispatchCore<R> {
     /** Whether its oldest pending record is held back by the window. */
     boolean atWindow;
 
+    /** How many times it came to be held back by the window. */
+    long windowHolds;
+
     /** The records this core sent that are still at or above the commit position. */
     int sent;
 
@@ -354,6 +435,7 @@ public final class DispatchCore<R> {
   }
 
   private final DispatchSettings settings;
+  private final Timings timings;
   private final long revokeGraceNanos;
 
   /** How long a partition being handed over still sends: half of the wait, see the class. */
@@ -421,7 +503,13 @@ public final class DispatchCore<R> {
   private boolean clockSet;
 
   public DispatchCore(DispatchSettings settings) {
+    this(settings, Timings.NONE);
+  }
+
+  /** A core that tells {@code timings} how long records wait. */
+  public DispatchCore(DispatchSettings settings, Timings timings) {
     this.settings = settings;
+    this.timings = timings;
     flights.add(new Flight<>(settings.maxProcessing().toNanos()));
     this.revokeGraceNanos = settings.revokeGrace().toNanos();
     this.handOverSendNanos = revokeGraceNanos / 2;
@@ -654,7 +742,10 @@ public final class DispatchCore<R> {
         p.deadLettering.remove(rec.offset);
       }
       case READY -> p.ready.remove(rec.offset);
-      case BLOCKED -> p.blocked.remove(rec.offset);
+      case BLOCKED -> {
+        p.blocked.remove(rec.offset);
+        reblocked(p);
+      }
       case PENDING, WAITING, DELAYED -> {}
     }
     untime(rec);
@@ -775,6 +866,8 @@ public final class DispatchCore<R> {
               fetched.sizeBytes(),
               keyed ? fetched.key() : null,
               fetched.payload());
+      rec.fetchedAt = now;
+      rec.windowMark = p.atWindow ? p.windowHolds - 1 : p.windowHolds;
       p.log.addLast(rec);
       p.pending.addLast(rec);
       p.end = rec.offset + 1;
@@ -812,6 +905,8 @@ public final class DispatchCore<R> {
         return;
       }
       p.pending.pollFirst();
+      rec.admittedAt = now;
+      rec.windowHeld = rec.windowMark != p.windowHolds;
       if (rec.key == null) {
         ready(rec);
         continue;
@@ -839,6 +934,7 @@ public final class DispatchCore<R> {
     if (held) {
       atWindow++;
       windowPauses++;
+      p.windowHolds++;
     } else {
       atWindow--;
     }
@@ -870,7 +966,40 @@ public final class DispatchCore<R> {
 
   private void ready(Rec<R> rec) {
     rec.state = State.READY;
+    rec.readyAt = now;
+    rec.blockedNow = false;
+    rec.blockedNanos = 0;
     rec.part.ready.put(rec.offset, rec);
+    if (!rec.delivered && behindBlock(rec)) {
+      rec.blockedNow = true;
+      rec.blockedSince = now;
+    }
+  }
+
+  private static <R> boolean behindBlock(Rec<R> rec) {
+    TreeSet<Long> blocked = rec.part.blocked;
+    return !blocked.isEmpty() && rec.offset > blocked.first();
+  }
+
+  /**
+   * The blocked records of a partition changed: starts or ends the time each record ready for its
+   * first delivery spends behind one, which is ordering time and not credit time. Blocking is rare,
+   * and a partition holds a bounded number of ready records.
+   */
+  private void reblocked(Part<R> p) {
+    for (Rec<R> rec : p.ready.values()) {
+      if (rec.delivered) {
+        continue;
+      }
+      boolean behind = behindBlock(rec);
+      if (behind && !rec.blockedNow) {
+        rec.blockedNow = true;
+        rec.blockedSince = now;
+      } else if (!behind && rec.blockedNow) {
+        rec.blockedNow = false;
+        rec.blockedNanos += now - rec.blockedSince;
+      }
+    }
   }
 
   /** Puts the partition among those that take turns sending, or takes it out. */
@@ -912,9 +1041,8 @@ public final class DispatchCore<R> {
     available.remove(r);
     r.credit--;
     r.lastSent = ++sends;
-    if (rec.former != null) {
-      rec.former.remove(r);
-    }
+    // A receiver that still holds an expired copy: its answers are ambiguous from now on.
+    rec.resentToFormer = rec.former != null && rec.former.remove(r);
     if (r.held.computeIfAbsent(p.id, id -> new TreeMap<>()).put(rec.offset, rec) == null) {
       r.load++;
     }
@@ -940,6 +1068,7 @@ public final class DispatchCore<R> {
             rec.delivered ? rec.cause : Cause.NONE));
     if (!rec.delivered) {
       rec.delivered = true;
+      queued(rec);
       p.sent++;
       if (p.draining) {
         // Nothing is fetched for a partition being handed over, and nothing counted as buffered.
@@ -954,6 +1083,34 @@ public final class DispatchCore<R> {
         out.add(new ResumeFetching<>(p.id));
       }
     }
+  }
+
+  /**
+   * Tells the timings how long a record waited for its first delivery, which happens now. Its time
+   * before it was let in is the window's or the ordering's; its time between being let in and being
+   * ready, behind its key, the ordering's; its time ready, the credit's.
+   */
+  private void queued(Rec<R> rec) {
+    long pending = rec.admittedAt - rec.fetchedAt;
+    // Ready, and behind a blocked record of its partition: credit would not have sent it.
+    long blocked = rec.blockedNanos + (rec.blockedNow ? now - rec.blockedSince : 0);
+    long ordering = rec.readyAt - rec.admittedAt + (rec.windowHeld ? 0 : pending) + blocked;
+    long window = rec.windowHeld ? pending : 0;
+    long credit = now - rec.readyAt - blocked;
+    Wait waited = Wait.NOTHING;
+    long most = 0;
+    if (credit > most) {
+      waited = Wait.CREDIT;
+      most = credit;
+    }
+    if (ordering > most) {
+      waited = Wait.ORDERING;
+      most = ordering;
+    }
+    if (window > most) {
+      waited = Wait.WINDOW;
+    }
+    timings.queued(now - rec.fetchedAt, waited);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1030,6 +1187,9 @@ public final class DispatchCore<R> {
       return;
     }
     for (Rec<R> rec : records) {
+      if (rec.holder == r) {
+        answered(rec, true);
+      }
       acknowledge(rec, out);
     }
     settle(p, out);
@@ -1044,12 +1204,26 @@ public final class DispatchCore<R> {
     }
     unhold(r, rec);
     if (rec.holder == r) {
+      answered(rec, false);
       rec.avoid = r;
       failed(
           rec, Cause.REJECTED, e.reason() == null || e.reason().isEmpty() ? null : e.reason(), out);
     } else {
       // Given back after its deadline passed: that attempt has failed already.
       rec.former.remove(r);
+    }
+  }
+
+  /**
+   * Tells the timings of an answer from the receiver a record is in flight to, if it can only be
+   * for this delivery and came within its deadline. One that came after the deadline, handled
+   * before the time was passed, is late; one from a receiver that holds an expired copy as well may
+   * be for that copy. Whether the answer counts does not depend on this.
+   */
+  private void answered(Rec<R> rec, boolean acknowledged) {
+    long took = now - rec.sentAt;
+    if (!rec.resentToFormer && took < rec.flight.deadlineNanos) {
+      timings.answered(took, acknowledged);
     }
   }
 
@@ -1181,6 +1355,7 @@ public final class DispatchCore<R> {
       } else {
         rec.state = State.BLOCKED;
         p.blocked.add(rec.offset);
+        reblocked(p);
         out.add(new PartitionBlocked<>(p.id, rec.offset));
         refresh(p);
       }
@@ -1230,6 +1405,7 @@ public final class DispatchCore<R> {
       case DELAYED -> untime(rec);
       case BLOCKED -> {
         p.blocked.remove(rec.offset);
+        reblocked(p);
         if (p.blocked.isEmpty()) {
           out.add(new PartitionUnblocked<>(p.id));
         }

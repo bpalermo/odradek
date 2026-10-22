@@ -138,7 +138,8 @@ final class ReceiveSession implements AppStream {
 
   private record AppCredit(long records) implements Event {}
 
-  private record AppAck(Ack ack) implements Event {}
+  /** The app acknowledged, at {@code arrivedNanos}. */
+  private record AppAck(Ack ack, long arrivedNanos) implements Event {}
 
   private record AppHalfClose() implements Event {}
 
@@ -148,7 +149,9 @@ final class ReceiveSession implements AppStream {
 
   private record Stop() implements Event {}
 
-  private record FromDispatcher(Link link, DeliverResponse response) implements Event {}
+  /** A message from a replica, which arrived at {@code arrivedNanos}. */
+  private record FromDispatcher(Link link, DeliverResponse response, long arrivedNanos)
+      implements Event {}
 
   private record LinkEnded(Link link, Status status) implements Event {}
 
@@ -241,8 +244,12 @@ final class ReceiveSession implements AppStream {
     }
   }
 
-  /** A record received and decoded, waiting for the app to have credit. */
-  private record Pending(Link link, int partition, ConsumedRecord record, boolean undecodable) {}
+  /**
+   * A record received and decoded, waiting for the app to have credit. {@code arrivedNanos} is when
+   * its batch arrived.
+   */
+  private record Pending(
+      Link link, int partition, ConsumedRecord record, boolean undecodable, long arrivedNanos) {}
 
   private final ServerCallStreamObserver<ConsumeResponse> call;
   private final Map<String, Topic> topics = new LinkedHashMap<>();
@@ -363,7 +370,7 @@ final class ReceiveSession implements AppStream {
 
   @Override
   public void ack(Ack ack) {
-    events.add(new AppAck(ack));
+    events.add(new AppAck(ack, now()));
   }
 
   @Override
@@ -465,12 +472,13 @@ final class ReceiveSession implements AppStream {
   private void handle(Event event) {
     switch (event) {
       case AppCredit credit -> split.appGranted(credit.records());
-      case AppAck acked -> acked(acked.ack());
+      case AppAck acked -> acked(acked.ack(), acked.arrivedNanos());
       case AppHalfClose _ -> exit = Status.OK;
       case AppCancel _ -> exit = Status.CANCELLED;
       case AppFail fail -> exit = fail.status();
       case Stop _ -> exit = Status.UNAVAILABLE.withDescription("the server is shutting down");
-      case FromDispatcher message -> received(message.link(), message.response());
+      case FromDispatcher message ->
+          received(message.link(), message.response(), message.arrivedNanos());
       case LinkEnded ended -> ended(ended.link(), ended.status());
     }
   }
@@ -547,6 +555,8 @@ final class ReceiveSession implements AppStream {
       long credit = split.appCredit();
       long undecodable = 0;
       long last = Long.MIN_VALUE;
+      // When this batch is written: the writes before it in this pump may have taken a while.
+      long written = now();
       // One batch is records of one partition from one stream, in offset order: a record delivered
       // again behind a newer one starts the next batch.
       while (!pending.isEmpty() && batch.getRecordsCount() < credit) {
@@ -559,7 +569,8 @@ final class ReceiveSession implements AppStream {
         pending.pollFirst();
         last = next.record().getOffset();
         batch.addRecords(next.record());
-        holdings.handed(topic.name, first.partition(), last, now);
+        holdings.handed(topic.name, first.partition(), last, written);
+        topic.metrics.handedOff(written - next.arrivedNanos());
         if (next.undecodable()) {
           undecodable++;
         }
@@ -605,9 +616,13 @@ final class ReceiveSession implements AppStream {
                                     .setRecords((int) Math.min(Integer.MAX_VALUE, records)))));
   }
 
-  /** Records arrived: decodes them and queues them for the app, or for rejection. */
+  /**
+   * Records arrived: decodes them and queues them for the app, or for rejection.
+   *
+   * @param arrived when the batch arrived
+   */
   private void records(
-      Link link, io.github.bpalermo.odradek.delivery.v1.RecordBatch batch, long now) {
+      Link link, io.github.bpalermo.odradek.delivery.v1.RecordBatch batch, long arrived) {
     Topic topic = link.topic;
     split.received(link.id, batch.getRecordsCount());
     topic.metrics.received(batch.getRecordsCount());
@@ -645,7 +660,7 @@ final class ReceiveSession implements AppStream {
             });
       } catch (RecordDecodeException e) {
         if (!topic.deliverUndecoded) {
-          reject(link, batch.getPartition(), record.getOffset(), e.getMessage(), now);
+          reject(link, batch.getPartition(), record.getOffset(), e.getMessage(), now());
           continue;
         }
         // As stored, with the error: the app acknowledges it like any other record.
@@ -659,7 +674,7 @@ final class ReceiveSession implements AppStream {
         out.setDecodeError(e.getMessage());
         undecodable = true;
       }
-      pending.addLast(new Pending(link, batch.getPartition(), out.build(), undecodable));
+      pending.addLast(new Pending(link, batch.getPartition(), out.build(), undecodable, arrived));
     }
   }
 
@@ -697,15 +712,23 @@ final class ReceiveSession implements AppStream {
                     .setReason(reason == null ? "" : reason)));
   }
 
-  /** The app acknowledged: passes on what it held of the range, to the stream it came from. */
-  private void acked(Ack ack) {
+  /**
+   * The app acknowledged: passes on what it held of the range, to the stream it came from.
+   *
+   * @param arrived when the acknowledgement arrived
+   */
+  private void acked(Ack ack, long arrived) {
+    Topic topic = topics.get(ack.getTopic());
     Holdings.Relay relay =
         holdings.ack(
             ack.getTopic(),
             ack.getPartition(),
             ack.getAssignmentEpoch(),
             ack.getFirstOffset(),
-            ack.getLastOffset());
+            ack.getLastOffset(),
+            topic == null
+                ? handed -> {}
+                : handed -> topic.metrics.appAcknowledged(arrived - handed));
     if (relay == null) {
       // Released, its stream gone, an earlier announcement of the partition, or never delivered
       // here: the record is delivered again by the dispatcher, or is not this pod's to speak for.
@@ -762,7 +785,7 @@ final class ReceiveSession implements AppStream {
   // The streams to the dispatcher
   // ---------------------------------------------------------------------------------------------
 
-  private void received(Link link, DeliverResponse response) {
+  private void received(Link link, DeliverResponse response, long arrived) {
     if (link.closed) {
       return;
     }
@@ -782,7 +805,7 @@ final class ReceiveSession implements AppStream {
           reconcileAll();
         }
       }
-      case RECORDS -> records(link, response.getRecords(), now());
+      case RECORDS -> records(link, response.getRecords(), arrived);
       case RELEASED -> released(link, response.getReleased().getPartitionsList());
       default -> {}
     }
@@ -814,7 +837,7 @@ final class ReceiveSession implements AppStream {
                   new StreamObserver<DeliverResponse>() {
                     @Override
                     public void onNext(DeliverResponse response) {
-                      events.add(new FromDispatcher(link, response));
+                      events.add(new FromDispatcher(link, response, now()));
                     }
 
                     @Override

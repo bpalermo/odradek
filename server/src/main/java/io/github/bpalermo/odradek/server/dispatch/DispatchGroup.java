@@ -57,6 +57,7 @@ import org.apache.kafka.clients.consumer.InvalidOffsetException;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.record.TimestampType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -93,7 +94,13 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   /** A group is one consumer group on one cluster. */
   record Key(String cluster, String group) {}
 
-  /** What every group of a dispatcher shares. */
+  /**
+   * What every group of a dispatcher shares.
+   *
+   * @param nanoClock the monotonic clock the cores run on
+   * @param wallClock milliseconds since the epoch, to measure how long after its timestamp a record
+   *     was fetched
+   */
   record Options(
       long window,
       int maxBufferedRecords,
@@ -105,7 +112,8 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       Duration deadLetterRetryMax,
       DeadLetters deadLetters,
       Supplier<Accepted> accepted,
-      LongSupplier nanoClock) {}
+      LongSupplier nanoClock,
+      LongSupplier wallClock) {}
 
   /** Who a group answers to: the service that created it. */
   interface Owner {
@@ -212,7 +220,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   }
 
   /** One declared topic. */
-  private final class Topic {
+  private final class Topic implements DispatchCore.Timings {
     final String name;
     final ServerMetrics.DispatchTopic metrics;
     final Map<String, Stream> receivers = new LinkedHashMap<>();
@@ -278,10 +286,28 @@ final class DispatchGroup implements ConsumerRebalanceListener {
                   options.maxBufferedBytes(),
                   options.revokeGrace(),
                   options.deadLetterRetry(),
-                  options.deadLetterRetryMax()));
+                  options.deadLetterRetryMax()),
+              this);
       adopt = true;
       incarnation = ++incarnations;
       reportedWindowPauses = 0;
+    }
+
+    @Override
+    public void queued(long nanos, DispatchCore.Wait waited) {
+      metrics.queued(
+          nanos,
+          switch (waited) {
+            case NOTHING -> ServerMetrics.QueueWait.NONE;
+            case CREDIT -> ServerMetrics.QueueWait.CREDIT;
+            case ORDERING -> ServerMetrics.QueueWait.ORDERING;
+            case WINDOW -> ServerMetrics.QueueWait.WINDOW;
+          });
+    }
+
+    @Override
+    public void answered(long nanos, boolean acknowledged) {
+      metrics.answered(nanos, acknowledged);
     }
   }
 
@@ -304,6 +330,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   private final Supplier<Consumer<byte[], byte[]>> factory;
   private final Map<String, String> topicsByMetricTag;
   private final ServerMetrics metrics;
+  private final ServerMetrics.DispatchLoop loopMetrics;
   private final Owner owner;
   private final LinkedBlockingQueue<Command> commands = new LinkedBlockingQueue<>();
   private final Thread thread;
@@ -349,6 +376,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     this.factory = factory;
     this.topicsByMetricTag = topicsByMetricTag;
     this.metrics = metrics;
+    this.loopMetrics = metrics.dispatchLoop(key.cluster(), key.group());
     this.owner = owner;
     this.revokeGraceNanos = options.revokeGrace().toNanos();
     this.idleGraceNanos = options.idleGrace().toNanos();
@@ -448,8 +476,12 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         e.partitions().forEach(this::reposition);
         continue;
       }
-      for (TopicPartition partition : records.partitions()) {
-        fetched(partition, records.records(partition));
+      if (!records.isEmpty()) {
+        // Once per poll: how long after their timestamps the records were fetched.
+        long fetchedAt = options.wallClock().getAsLong();
+        for (TopicPartition partition : records.partitions()) {
+          fetched(partition, records.records(partition), fetchedAt);
+        }
       }
       now = now();
       passTime(now);
@@ -469,7 +501,14 @@ final class DispatchGroup implements ConsumerRebalanceListener {
 
   /** Handles what is queued, waiting up to {@code waitMs} for the first; whether anything was. */
   private boolean drain(long waitMs) {
-    Command command = waitMs > 0 ? await(TimeUnit.MILLISECONDS.toNanos(waitMs)) : commands.poll();
+    Command command;
+    if (waitMs > 0) {
+      long start = now();
+      command = await(TimeUnit.MILLISECONDS.toNanos(waitMs));
+      loopMetrics.waited(now() - start);
+    } else {
+      command = commands.poll();
+    }
     boolean any = command != null;
     while (command != null) {
       handle(command);
@@ -868,7 +907,13 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     return out.build();
   }
 
-  private void fetched(TopicPartition partition, List<ConsumerRecord<byte[], byte[]>> records) {
+  /**
+   * Hands a partition's fetched records to its core.
+   *
+   * @param fetchedAt when the poll that returned them did, in milliseconds since the epoch
+   */
+  private void fetched(
+      TopicPartition partition, List<ConsumerRecord<byte[], byte[]>> records, long fetchedAt) {
     Topic topic = topics.get(partition.topic());
     if (topic == null || !owned.containsKey(partition)) {
       // Of a topic nobody declares any more, until the consumer gives its partitions up. Whoever
@@ -877,6 +922,11 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     }
     List<Fetched<Held>> fetched = new ArrayList<>(records.size());
     for (ConsumerRecord<byte[], byte[]> record : records) {
+      if (record.timestamp() >= 0 && record.timestampType() != TimestampType.NO_TIMESTAMP_TYPE) {
+        topic.metrics.fetched(
+            fetchedAt - record.timestamp(),
+            record.timestampType() == TimestampType.LOG_APPEND_TIME);
+      }
       ByteString key = record.key() == null ? null : UnsafeByteOperations.unsafeWrap(record.key());
       int size =
           Math.max(0, record.serializedKeySize()) + Math.max(0, record.serializedValueSize());

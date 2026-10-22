@@ -56,6 +56,24 @@ class DispatchCoreTest {
   private DispatchCore<String> core;
   private long now;
 
+  /**
+   * What the core timed, in order: "queued <nanos> <wait>", "acked <nanos>", "rejected <nanos>".
+   */
+  private final List<String> timed = new ArrayList<>();
+
+  private final DispatchCore.Timings timings =
+      new DispatchCore.Timings() {
+        @Override
+        public void queued(long nanos, DispatchCore.Wait waited) {
+          timed.add("queued " + nanos + " " + waited);
+        }
+
+        @Override
+        public void answered(long nanos, boolean acknowledged) {
+          timed.add((acknowledged ? "acked " : "rejected ") + nanos);
+        }
+      };
+
   // -------------------------------------------------------------------------------------------
   // Script
   // -------------------------------------------------------------------------------------------
@@ -74,7 +92,8 @@ class DispatchCoreTest {
                     maxBufferedBytes,
                     Duration.ofNanos(GRACE))
                 .withRedeliveryBackoff(Duration.ofNanos(backoff), Duration.ofNanos(backoffMax))
-                .withDeadLetterRetry(Duration.ofNanos(retry), Duration.ofNanos(retryMax)));
+                .withDeadLetterRetry(Duration.ofNanos(retry), Duration.ofNanos(retryMax)),
+            timings);
   }
 
   /**
@@ -1574,5 +1593,185 @@ class DispatchCoreTest {
     now = 100;
     fetch(0, "0");
     assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(500 + DEADLINE));
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Timings
+  // -------------------------------------------------------------------------------------------
+
+  @Test
+  void aRecordSentAtTheFirstOpportunityWaitedForNothing() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    now = 40;
+    fetch(0, "0", "1");
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 0 NOTHING");
+  }
+
+  @Test
+  void aRecordReadyWithNoReceiverWithCreditWaitedForCredit() {
+    start(Ordering.KEY);
+    assign(0, 0);
+    on(new ReceiverJoined<>("a"));
+    fetch(0, "0:k", "1:j");
+    now = 7;
+    assertThat(credits("a", 1)).containsExactly(deliver("a", 0, 0));
+    now = 9;
+    assertThat(credits("a", 1)).containsExactly(deliver("a", 0, 1));
+    assertThat(timed).containsExactly("queued 7 CREDIT", "queued 9 CREDIT");
+  }
+
+  @Test
+  void aRecordBehindItsKeyWaitedForTheOrdering() {
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0:k", "1:k");
+    now = 5;
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+    assertThat(timed).containsExactly("queued 0 NOTHING", "acked 5", "queued 5 ORDERING");
+  }
+
+  @Test
+  void aRecordBehindItsPartitionWaitedForTheOrdering() {
+    start(Ordering.PARTITION);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0", "1");
+    now = 4;
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+    assertThat(timed).containsExactly("queued 0 NOTHING", "acked 4", "queued 4 ORDERING");
+  }
+
+  @Test
+  void aRecordHeldBackByTheWindowWaitedForTheWindow() {
+    window = 1;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0", "1");
+    now = 6;
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+    // Held back as soon as it is fetched.
+    fetch(0, "2");
+    now = 8;
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 2), deliver("a", 0, 2));
+    assertThat(timed)
+        .containsExactly(
+            "queued 0 NOTHING", "acked 6", "queued 6 WINDOW", "acked 2", "queued 2 WINDOW");
+  }
+
+  @Test
+  void aRecordThatWaitedForSeveralThingsIsPutDownToTheLongestAndTheTotalIsKept() {
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 1);
+    fetch(0, "0:k", "1:k");
+    // Behind its key for 3, then without credit for 5.
+    now = 3;
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+    now = 8;
+    assertThat(credits("a", 1)).containsExactly(deliver("a", 0, 1));
+    // Behind its key for 4, then without credit for 1.
+    fetch(0, "2:k");
+    now = 12;
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 2));
+    now = 13;
+    assertThat(credits("a", 1)).containsExactly(deliver("a", 0, 2));
+    assertThat(timed)
+        .containsExactly(
+            "queued 0 NOTHING", "acked 3", "queued 8 CREDIT", "acked 4", "queued 5 ORDERING");
+  }
+
+  @Test
+  void onlyTheFirstDeliveryIsQueuedAndOnlyTheHoldersAnswerIsTimed() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    fetch(0, "0", "1");
+    now = 2;
+    // Offset 0 goes again, to b.
+    reject("a", 0, 0);
+    now = 3 + DEADLINE;
+    // Both offsets, with b, pass their deadline and go back to a.
+    assertThat(after(0)).containsExactly(deliver("a", 0, 0, 3), deliver("a", 0, 1, 2));
+    // b answers after its deadline: nothing is timed, since the records were sent again.
+    ack("b", 0, 0, 1);
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 0 NOTHING", "rejected 2");
+  }
+
+  @Test
+  void aReadyRecordBehindABlockedOneWaitedForTheOrderingNotForCredit() {
+    maxAttempts = 1;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 1);
+    assertThat(fetch(0, "0", "1")).containsExactly(deliver("a", 0, 0));
+    // 1 waits for credit until 0 blocks the partition at its deadline, then behind 0.
+    now = DEADLINE;
+    assertThat(on(new TimePassed<>())).containsExactly(new PartitionBlocked<>(0, 0));
+    now = DEADLINE + 10;
+    assertThat(credits("a", 5)).isEmpty();
+    now = 300;
+    assertThat(ack("a", 0, 0))
+        .containsExactly(new PartitionUnblocked<>(0), commit(0, 1), deliver("a", 0, 1));
+    // 100 without credit, 200 behind the blocked record: the total, put down to the ordering.
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 300 ORDERING");
+  }
+
+  @Test
+  void blockedTimeIsOrderingTimeOnAClockWhoseValuesAreNegative() {
+    // System.nanoTime() may be negative: the same scenario, every moment shifted below zero.
+    long origin = -1_000_000;
+    now = origin;
+    maxAttempts = 1;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 1);
+    assertThat(fetch(0, "0", "1")).containsExactly(deliver("a", 0, 0));
+    now = origin + DEADLINE;
+    assertThat(on(new TimePassed<>())).containsExactly(new PartitionBlocked<>(0, 0));
+    now = origin + DEADLINE + 10;
+    assertThat(credits("a", 5)).isEmpty();
+    now = origin + 300;
+    assertThat(ack("a", 0, 0))
+        .containsExactly(new PartitionUnblocked<>(0), commit(0, 1), deliver("a", 0, 1));
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 300 ORDERING");
+  }
+
+  @Test
+  void answersAfterTheDeadlineAreAcceptedAndNotTimedEvenBeforeTheTimeIsPassed() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0", "1");
+    // The deadline has passed, and the core has not been told yet.
+    now = DEADLINE + 5;
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+    assertThat(reject("a", 0, 1)).containsExactly(deliver("a", 0, 1, 2));
+    now = DEADLINE + 10;
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 2));
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 0 NOTHING", "acked 5");
+  }
+
+  @Test
+  void answersFromAReceiverSentAgainWhatItHeldExpiredAreAcceptedAndNotTimed() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0", "1");
+    now = DEADLINE;
+    // The only receiver gets both again, and still holds the first copies.
+    assertThat(on(new TimePassed<>()))
+        .containsExactly(deliver("a", 0, 0, 2), deliver("a", 0, 1, 2));
+    now = DEADLINE + 10;
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+    assertThat(reject("a", 0, 1)).containsExactly(deliver("a", 0, 1, 3));
+    // A third copy, while no expired one is held: its answer is timed again.
+    now = DEADLINE + 15;
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 2));
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 0 NOTHING", "acked 5");
   }
 }

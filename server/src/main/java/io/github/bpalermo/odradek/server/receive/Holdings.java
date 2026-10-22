@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.function.LongConsumer;
 
 /**
  * What the app holds of the topics a dispatcher delivers, and how that is told in the words of the
@@ -119,6 +120,11 @@ final class Holdings {
    * and be on its way, where an acknowledgement spanning it would cover it unprocessed.
    */
   Relay ack(String topic, int partition, long epoch, long first, long last) {
+    return ack(topic, partition, epoch, first, last, handed -> {});
+  }
+
+  /** As above, telling {@code handedAt} when each record the app no longer holds was handed. */
+  Relay ack(String topic, int partition, long epoch, long first, long last, LongConsumer handedAt) {
     Owned current = owned.get(new Partition(topic, partition));
     if (current == null || current.epoch != epoch || first > last) {
       return null;
@@ -132,7 +138,10 @@ final class Holdings {
     long end = -1;
     for (Map.Entry<Long, Long> record : acked.entrySet()) {
       long offset = record.getKey();
-      handedNanos.remove(record.getValue());
+      Long handed = handedNanos.remove(record.getValue());
+      if (handed != null) {
+        handedAt.accept(handed);
+      }
       if (start >= 0 && offset == end + 1) {
         end = offset;
         continue;

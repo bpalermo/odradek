@@ -47,9 +47,11 @@ import io.grpc.Server;
 import io.grpc.Status;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.HistogramPointData;
 import io.opentelemetry.sdk.metrics.data.LongPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
@@ -62,6 +64,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -392,6 +395,104 @@ class ReceiveServiceTest {
     return total;
   }
 
+  /** The single point of a histogram for one topic, which must have one. */
+  private HistogramPointData histogram(String name, String topic) {
+    List<HistogramPointData> points = new ArrayList<>();
+    for (MetricData data : reader.collectAllMetrics()) {
+      if (data.getName().equals(name)) {
+        for (HistogramPointData point : data.getHistogramData().getPoints()) {
+          if (topic.equals(point.getAttributes().get(AttributeKey.stringKey("topic")))) {
+            points.add(point);
+          }
+        }
+      }
+    }
+    assertThat(points).as("%s of %s", name, topic).hasSize(1);
+    return points.getFirst();
+  }
+
+  /** When positive, the next write of records to the app takes this long, once. */
+  private final AtomicLong slowWriteMs = new AtomicLong();
+
+  /** The server's end of the app's stream, with a write of records that can be made slow. */
+  private static final class SlowWrites extends ServerCallStreamObserver<ConsumeResponse> {
+    private final ServerCallStreamObserver<ConsumeResponse> call;
+    private final AtomicLong slowMs;
+
+    SlowWrites(ServerCallStreamObserver<ConsumeResponse> call, AtomicLong slowMs) {
+      this.call = call;
+      this.slowMs = slowMs;
+    }
+
+    @Override
+    public void onNext(ConsumeResponse response) {
+      long slow = response.hasRecords() ? slowMs.getAndSet(0) : 0;
+      if (slow > 0) {
+        try {
+          Thread.sleep(slow);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
+      call.onNext(response);
+    }
+
+    @Override
+    public void onError(Throwable t) {
+      call.onError(t);
+    }
+
+    @Override
+    public void onCompleted() {
+      call.onCompleted();
+    }
+
+    @Override
+    public boolean isCancelled() {
+      return call.isCancelled();
+    }
+
+    @Override
+    public void setOnCancelHandler(Runnable handler) {
+      call.setOnCancelHandler(handler);
+    }
+
+    @Override
+    public void setOnCloseHandler(Runnable handler) {
+      call.setOnCloseHandler(handler);
+    }
+
+    @Override
+    public void setCompression(String compression) {
+      call.setCompression(compression);
+    }
+
+    @Override
+    public boolean isReady() {
+      return call.isReady();
+    }
+
+    @Override
+    public void setOnReadyHandler(Runnable handler) {
+      call.setOnReadyHandler(handler);
+    }
+
+    @Override
+    public void disableAutoInboundFlowControl() {
+      call.disableAutoInboundFlowControl();
+    }
+
+    @Override
+    public void request(int count) {
+      call.request(count);
+    }
+
+    @Override
+    public void setMessageCompression(boolean enable) {
+      call.setMessageCompression(enable);
+    }
+  }
+
   private void start(ServerConfig.Builder builder) throws Exception {
     ServerConfig config = builder.build();
     codecs = CodecRegistry.create(config, ContractRegistry.empty(), getClass().getClassLoader());
@@ -423,7 +524,9 @@ class ReceiveServiceTest {
                   @Override
                   public StreamObserver<ConsumeRequest> consume(
                       StreamObserver<ConsumeResponse> responses) {
-                    return consume.consume(responses);
+                    return consume.consume(
+                        new SlowWrites(
+                            (ServerCallStreamObserver<ConsumeResponse>) responses, slowWriteMs));
                   }
                 })
             .build()
@@ -677,6 +780,89 @@ class ReceiveServiceTest {
     app.credits(1);
     assertThat(first.credits()).isEqualTo(1);
     assertThat(second.credits()).isEqualTo(1);
+  }
+
+  @Test
+  void theHandOffToTheAppAndTheAppsAcknowledgementAreTimed() throws Exception {
+    FakeReplica replica = single();
+    start(config());
+    App app = app();
+    app.subscribe(60_000, "orders", "refunds");
+    assertThat(app.next().hasSubscribed()).isTrue();
+    Stream first = replica.stream();
+    Stream second = replica.stream();
+    first.declare();
+    second.declare();
+
+    app.credits(1);
+    assertThat(first.credits()).isEqualTo(1);
+    assertThat(second.credits()).isEqualTo(1);
+    first.records(0, 0, "a");
+    long orders = app.assigned().getAssignmentEpoch();
+    assertThat(values(app.batch())).containsExactly("a");
+    // Beyond the app's credit: it waits for the next. Arrived (and stamped) before the wait starts.
+    second.records(0, 0, "b");
+    waitFor("b arrived", () -> metric("odradek.receive.records", "topic", "refunds") == 1);
+    app.nothing();
+    app.credits(1);
+    long refunds = app.assigned().getAssignmentEpoch();
+    assertThat(values(app.batch())).containsExactly("b");
+    app.ack("orders", 0, orders, 0, 0);
+    assertThat(range(first.ack())).isEqualTo(List.of(0, 0L, 0L));
+    app.ack("refunds", 0, refunds, 0, 0);
+    assertThat(range(second.ack())).isEqualTo(List.of(0, 0L, 0L));
+
+    HistogramPointData handedOrders = histogram("odradek.receive.handoff.duration", "orders");
+    assertThat(handedOrders.getCount()).isEqualTo(1);
+    HistogramPointData handedRefunds = histogram("odradek.receive.handoff.duration", "refunds");
+    assertThat(handedRefunds.getCount()).isEqualTo(1);
+    assertThat(handedRefunds.getMin()).isGreaterThanOrEqualTo(300);
+    // "a" was held by the app while it had no credit for "b".
+    HistogramPointData ackedOrders = histogram("odradek.receive.ack.duration", "orders");
+    assertThat(ackedOrders.getCount()).isEqualTo(1);
+    assertThat(ackedOrders.getMin()).isGreaterThanOrEqualTo(300);
+    assertThat(histogram("odradek.receive.ack.duration", "refunds").getCount()).isEqualTo(1);
+
+    // An acknowledgement of nothing held is not timed.
+    app.ack("orders", 0, orders, 0, 0);
+    first.nothing();
+    assertThat(histogram("odradek.receive.ack.duration", "orders").getCount()).isEqualTo(1);
+  }
+
+  @Test
+  void eachBatchIsTimedFromItsOwnWriteToTheApp() throws Exception {
+    FakeReplica replica = single();
+    start(config());
+    App app = subscribed();
+    Stream stream = replica.accepted();
+    // Two batches wait for the app's credit, then go in one pump; the first write is slow.
+    stream.records(0, 0, "a");
+    stream.records(1, 0, "b");
+    waitFor("both arrived", () -> metric("odradek.receive.records") == 2);
+    slowWriteMs.set(300);
+    long granted = System.nanoTime();
+    app.credits(10);
+    long zero = app.assigned().getAssignmentEpoch();
+    assertThat(values(app.batch())).containsExactly("a");
+    long one = app.assigned().getAssignmentEpoch();
+    assertThat(values(app.batch())).containsExactly("b");
+    assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - granted))
+        .isGreaterThanOrEqualTo(300);
+    // What the app can still take, passed on after both writes.
+    assertThat(stream.credits()).isEqualTo(8);
+    app.ack("orders", 1, one, 0, 0);
+    assertThat(range(stream.ack())).isEqualTo(List.of(1, 0L, 0L));
+    app.ack("orders", 0, zero, 0, 0);
+    assertThat(range(stream.ack())).isEqualTo(List.of(0, 0L, 0L));
+
+    // "b" was written after the slow write of "a": its hand-off took that long, and the app's
+    // acknowledgement of it, sent at once, took less.
+    HistogramPointData handed = histogram("odradek.receive.handoff.duration", "orders");
+    assertThat(handed.getCount()).isEqualTo(2);
+    assertThat(handed.getMax()).isGreaterThanOrEqualTo(300);
+    HistogramPointData acked = histogram("odradek.receive.ack.duration", "orders");
+    assertThat(acked.getCount()).isEqualTo(2);
+    assertThat(acked.getMin()).isLessThan(300);
   }
 
   // -------------------------------------------------------------------------------------------

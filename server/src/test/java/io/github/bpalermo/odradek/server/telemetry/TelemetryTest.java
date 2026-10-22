@@ -137,6 +137,137 @@ class TelemetryTest {
   }
 
   @Test
+  void stageLatenciesAreHistogramsInMillisecondsWithFineBuckets() {
+    ServerMetrics.DispatchTopic dispatch = metrics.dispatchTopic("main", "billing", "orders");
+    dispatch.fetched(12, false);
+    // Only clocks that disagree make a record arrive before its timestamp: it counts as 0.
+    dispatch.fetched(-5, true);
+    dispatch.queued(1_500_000, ServerMetrics.QueueWait.CREDIT);
+    dispatch.queued(0, ServerMetrics.QueueWait.NONE);
+    dispatch.queued(250_000, ServerMetrics.QueueWait.ORDERING);
+    dispatch.queued(4_000_000, ServerMetrics.QueueWait.WINDOW);
+    dispatch.answered(250_000, true);
+    dispatch.answered(3_000_000, false);
+    metrics.dispatchLoop("main", "billing").waited(10_000_000);
+    ServerMetrics.ReceiveTopic receive = metrics.receiveTopic("main", "billing", "orders");
+    receive.handedOff(2_000_000);
+    receive.handedOff(500_000);
+    receive.appAcknowledged(40_000_000);
+
+    double[] buckets =
+        ServerMetrics.DURATION_BUCKETS_MS.stream().mapToDouble(Double::doubleValue).toArray();
+    assertThat(buckets).startsWith(0.1, 0.25, 0.5, 1.0).contains(10.0, 15.0, 20.0);
+    Attributes topic =
+        Attributes.of(
+            ServerMetrics.CLUSTER,
+            "main",
+            ServerMetrics.GROUP,
+            "billing",
+            ServerMetrics.TOPIC,
+            "orders");
+    assertThat(metric("odradek.dispatch.fetch.lag"))
+        .hasUnit("ms")
+        .hasHistogramSatisfying(
+            histogram ->
+                histogram.hasPointsSatisfying(
+                    point ->
+                        point
+                            .hasCount(1)
+                            .hasSum(12)
+                            .hasBucketBoundaries(buckets)
+                            .hasAttributes(
+                                topic.toBuilder()
+                                    .put(ServerMetrics.TIMESTAMP_TYPE, "create_time")
+                                    .build()),
+                    point ->
+                        point
+                            .hasCount(1)
+                            .hasSum(0)
+                            .hasAttributes(
+                                topic.toBuilder()
+                                    .put(ServerMetrics.TIMESTAMP_TYPE, "log_append_time")
+                                    .build())));
+    assertThat(metric("odradek.dispatch.queue.duration"))
+        .hasUnit("ms")
+        .hasHistogramSatisfying(
+            histogram ->
+                histogram.hasPointsSatisfying(
+                    point ->
+                        point
+                            .hasSum(1.5)
+                            .hasBucketBoundaries(buckets)
+                            .hasAttributes(
+                                topic.toBuilder().put(ServerMetrics.REASON, "credit").build()),
+                    point ->
+                        point
+                            .hasSum(0)
+                            .hasAttributes(
+                                topic.toBuilder().put(ServerMetrics.REASON, "none").build()),
+                    point ->
+                        point
+                            .hasSum(0.25)
+                            .hasAttributes(
+                                topic.toBuilder().put(ServerMetrics.REASON, "ordering").build()),
+                    point ->
+                        point
+                            .hasSum(4)
+                            .hasAttributes(
+                                topic.toBuilder().put(ServerMetrics.REASON, "window").build())));
+    assertThat(metric("odradek.dispatch.ack.duration"))
+        .hasUnit("ms")
+        .hasHistogramSatisfying(
+            histogram ->
+                histogram.hasPointsSatisfying(
+                    point ->
+                        point
+                            .hasSum(0.25)
+                            .hasAttributes(
+                                topic.toBuilder()
+                                    .put(ServerMetrics.OUTCOME, "acknowledged")
+                                    .build()),
+                    point ->
+                        point
+                            .hasSum(3)
+                            .hasAttributes(
+                                topic.toBuilder().put(ServerMetrics.OUTCOME, "rejected").build())));
+    assertThat(metric("odradek.dispatch.loop.wait"))
+        .hasUnit("ms")
+        .hasHistogramSatisfying(
+            histogram ->
+                histogram.hasPointsSatisfying(
+                    point ->
+                        point
+                            .hasCount(1)
+                            .hasSum(10)
+                            .hasBucketBoundaries(buckets)
+                            .hasAttributes(
+                                Attributes.of(
+                                    ServerMetrics.CLUSTER,
+                                    "main",
+                                    ServerMetrics.GROUP,
+                                    "billing"))));
+    assertThat(metric("odradek.receive.handoff.duration"))
+        .hasUnit("ms")
+        .hasHistogramSatisfying(
+            histogram ->
+                histogram.hasPointsSatisfying(
+                    point ->
+                        point
+                            .hasCount(2)
+                            .hasSum(2.5)
+                            .hasMin(0.5)
+                            .hasMax(2)
+                            .hasBucketBoundaries(buckets)
+                            .hasAttributes(topic)));
+    assertThat(metric("odradek.receive.ack.duration"))
+        .hasUnit("ms")
+        .hasHistogramSatisfying(
+            histogram ->
+                histogram.hasPointsSatisfying(
+                    point -> point.hasCount(1).hasSum(40).hasAttributes(topic)));
+  }
+
+  @Test
   void certificateExpiryReloadsAndReadinessAreObserved() throws Exception {
     TestPki pki = new TestPki(dir, "ca");
     TestPki.write(
