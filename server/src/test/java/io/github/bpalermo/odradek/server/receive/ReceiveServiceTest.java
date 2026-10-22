@@ -789,10 +789,13 @@ class ReceiveServiceTest {
     App app = app();
     app.subscribe(60_000, "orders", "refunds");
     assertThat(app.next().hasSubscribed()).isTrue();
-    Stream first = replica.stream();
-    Stream second = replica.stream();
-    first.declare();
-    second.declare();
+    // The two streams are opened together: which topic's is accepted first is not known.
+    Stream one = replica.stream();
+    Stream two = replica.stream();
+    boolean ordersFirst = one.declare().getTopic().equals("orders");
+    two.declare();
+    Stream first = ordersFirst ? one : two;
+    Stream second = ordersFirst ? two : one;
 
     app.credits(1);
     assertThat(first.credits()).isEqualTo(1);
@@ -1021,12 +1024,16 @@ class ReceiveServiceTest {
     stream.records(0, 1, "a");
     stream.records(1, 1, "b");
     stream.released(0);
+    // The app's credit must not overtake the release, which comes on another stream. A record
+    // behind it on the same stream is counted only once the release has been handled.
+    stream.records(1, 2, "c");
+    waitFor("the release was handled", () -> metric("odradek.receive.records") == 3);
     app.credits(10);
     assertThat(app.assigned().getPartition()).isEqualTo(1);
-    assertThat(values(app.batch())).containsExactly("b");
+    assertThat(values(app.batch())).containsExactly("b", "c");
     app.nothing();
-    // The place of the dropped record is the app's again: all ten credits, less the one used.
-    assertThat(stream.credits()).isEqualTo(9);
+    // The place of the dropped record is the app's again: all ten credits, less the two used.
+    assertThat(stream.credits()).isEqualTo(8);
   }
 
   // -------------------------------------------------------------------------------------------
