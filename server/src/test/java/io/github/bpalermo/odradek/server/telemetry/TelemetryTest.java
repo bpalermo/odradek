@@ -23,6 +23,8 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Collection;
+import java.util.Map;
+import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -402,6 +404,28 @@ class TelemetryTest {
     } finally {
       collector.close();
     }
+  }
+
+  @Test
+  void everyReplicaIsItsOwnServiceInstance() {
+    UUID random = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    // Set: the environment's, then the configuration's.
+    assertThat(
+            Telemetry.serviceInstanceId(
+                Map.of("service.instance.id", "conf"),
+                Map.of("service.instance.id", "env"),
+                random))
+        .isEqualTo("env");
+    assertThat(
+            Telemetry.serviceInstanceId(
+                Map.of("service.instance.id", "conf"), Map.of("k8s.pod.name", "pod-0"), random))
+        .isEqualTo("conf");
+    // Not set: the pod's name, which tells replicas apart in Kubernetes.
+    assertThat(Telemetry.serviceInstanceId(Map.of(), Map.of("k8s.pod.name", "pod-0"), random))
+        .isEqualTo("pod-0");
+    // Neither: a random id, never the same for two processes.
+    assertThat(Telemetry.serviceInstanceId(Map.of(), Map.of(), random))
+        .isEqualTo(random.toString());
   }
 
   @Test

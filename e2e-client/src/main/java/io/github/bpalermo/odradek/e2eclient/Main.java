@@ -34,7 +34,8 @@ public final class Main {
           OtlpMetrics.create(
               System.getenv(),
               settings.lane(),
-              settings.transport().name().toLowerCase(Locale.ROOT));
+              settings.transport().name().toLowerCase(Locale.ROOT),
+              settings.origin());
     } catch (IllegalArgumentException e) {
       System.err.println("e2e-client: " + e.getMessage());
       System.err.print(Settings.usage());

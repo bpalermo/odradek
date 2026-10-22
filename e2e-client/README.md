@@ -86,7 +86,7 @@ Each is kept over the whole run and over a rolling window (`--latency-window`, 6
 
 ## Metrics
 
-Only when `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`) is set: OTLP over gRPC (`OTEL_EXPORTER_OTLP_PROTOCOL` must be `grpc` or unset), pushed every `OTEL_METRIC_EXPORT_INTERVAL` ms (30 s by default), with `service.name` from `OTEL_SERVICE_NAME` (default `odradek-e2e-client`) and the resource attributes of `OTEL_RESOURCE_ATTRIBUTES` (the deployments set `k8s.pod.name`). On the server's OpenTelemetry, gRPC and Netty: no second copies.
+Only when `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`) is set: OTLP over gRPC (`OTEL_EXPORTER_OTLP_PROTOCOL` must be `grpc` or unset), pushed every `OTEL_METRIC_EXPORT_INTERVAL` ms (30 s by default), with `service.name` from `OTEL_SERVICE_NAME` (default `odradek-e2e-client`) and the resource attributes of `OTEL_RESOURCE_ATTRIBUTES` (the deployments set `k8s.pod.name`). `service.instance.id` is the process's origin unless that variable sets it: each pod needs its own, or the pods export one series between them, whose cumulative values overwrite each other. On the server's OpenTelemetry, gRPC and Netty: no second copies.
 
 | Metric | Kind, unit | Attributes | What |
 | --- | --- | --- | --- |

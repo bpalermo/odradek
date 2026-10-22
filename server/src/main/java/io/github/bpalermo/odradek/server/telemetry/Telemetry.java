@@ -20,7 +20,9 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -124,6 +126,10 @@ public final class Telemetry implements Closeable {
     // The environment is the pod's own (its name, from the downward API), where the configuration
     // is shared by every replica: on a key that both set, the environment wins.
     fromEnvironment.forEach((k, v) -> attributes.put(AttributeKey.stringKey(k), v));
+    attributes.put(
+        SERVICE_INSTANCE_ID,
+        serviceInstanceId(
+            telemetry.getResourceAttributesMap(), fromEnvironment, UUID.randomUUID()));
     Duration interval =
         telemetry.hasExportInterval()
             ? Duration.ofSeconds(
@@ -140,6 +146,32 @@ public final class Telemetry implements Closeable {
             .build();
     LOG.info("metrics are pushed to {} every {}", telemetry.getEndpoint(), interval);
     return new Telemetry(new ServerMetrics(provider.get("odradek")), provider, channel, group);
+  }
+
+  static final AttributeKey<String> SERVICE_INSTANCE_ID =
+      AttributeKey.stringKey("service.instance.id");
+
+  /**
+   * The {@code service.instance.id} of this process: as the environment or the configuration set
+   * it, else the pod's name ({@code k8s.pod.name}), else {@code random}. Every replica must have
+   * its own: the translation to Prometheus makes it the {@code instance} label, and replicas
+   * without one export the same series, whose cumulative values then overwrite each other.
+   */
+  static String serviceInstanceId(
+      Map<String, String> fromConfiguration, Map<String, String> fromEnvironment, UUID random) {
+    for (Map<String, String> attributes : List.of(fromEnvironment, fromConfiguration)) {
+      String id = attributes.get(SERVICE_INSTANCE_ID.getKey());
+      if (id != null && !id.isBlank()) {
+        return id;
+      }
+    }
+    for (Map<String, String> attributes : List.of(fromEnvironment, fromConfiguration)) {
+      String pod = attributes.get("k8s.pod.name");
+      if (pod != null && !pod.isBlank()) {
+        return pod;
+      }
+    }
+    return random.toString();
   }
 
   /**

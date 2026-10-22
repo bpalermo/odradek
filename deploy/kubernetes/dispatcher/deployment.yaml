@@ -91,7 +91,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: k8s.pod.name=$(POD_NAME)
+              value: k8s.pod.name=$(POD_NAME),service.instance.id=$(POD_NAME)
             # The JVM image only: the share of the memory limit the heap may
             # take. Records in flight and fetched are held on the heap.
             - name: JAVA_TOOL_OPTIONS
