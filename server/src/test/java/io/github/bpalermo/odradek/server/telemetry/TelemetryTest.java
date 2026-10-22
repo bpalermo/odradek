@@ -102,6 +102,47 @@ class TelemetryTest {
   }
 
   @Test
+  void producePathDurationsAreInMillisecondsByTopicAndOutcome() {
+    metrics.produceSent("orders", 250_000);
+    metrics.produceAnswered("orders", 9_000_000, true);
+    metrics.produceAnswered("orders", 3_000_000, false);
+
+    double[] buckets =
+        ServerMetrics.DURATION_BUCKETS_MS.stream().mapToDouble(Double::doubleValue).toArray();
+    assertThat(metric("odradek.produce.send.duration"))
+        .hasUnit("ms")
+        .hasHistogramSatisfying(
+            histogram ->
+                histogram.hasPointsSatisfying(
+                    point ->
+                        point
+                            .hasCount(1)
+                            .hasSum(0.25)
+                            .hasBucketBoundaries(buckets)
+                            .hasAttributes(Attributes.of(ServerMetrics.TOPIC, "orders"))));
+    assertThat(metric("odradek.produce.duration"))
+        .hasUnit("ms")
+        .hasHistogramSatisfying(
+            histogram ->
+                histogram.hasPointsSatisfying(
+                    point ->
+                        point
+                            .hasSum(9)
+                            .hasAttributes(
+                                Attributes.of(
+                                    ServerMetrics.TOPIC, "orders", ServerMetrics.OUTCOME, "ok")),
+                    point ->
+                        point
+                            .hasSum(3)
+                            .hasAttributes(
+                                Attributes.of(
+                                    ServerMetrics.TOPIC,
+                                    "orders",
+                                    ServerMetrics.OUTCOME,
+                                    "error"))));
+  }
+
+  @Test
   void streamsGoUpAndDown() {
     metrics.produceStreamOpened();
     metrics.produceStreamOpened();

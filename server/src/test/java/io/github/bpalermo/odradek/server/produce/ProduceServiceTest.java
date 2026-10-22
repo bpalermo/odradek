@@ -1,5 +1,6 @@
 package io.github.bpalermo.odradek.server.produce;
 
+import static io.opentelemetry.api.common.AttributeKey.stringKey;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.google.protobuf.ByteString;
@@ -31,8 +32,13 @@ import io.grpc.Status;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.stub.StreamObserver;
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.HistogramPointData;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -53,6 +59,9 @@ class ProduceServiceTest {
   private static final long NOW = 1_800_000_000_000L;
 
   private final Map<String, MockProducer<byte[], byte[]>> kafka = new HashMap<>();
+  private final InMemoryMetricReader reader = InMemoryMetricReader.create();
+  private final SdkMeterProvider meters =
+      SdkMeterProvider.builder().registerMetricReader(reader).build();
   private CodecRegistry codecs;
   private Server server;
   private ManagedChannel channel;
@@ -130,7 +139,11 @@ class ProduceServiceTest {
               return mock;
             });
     service =
-        new ProduceService(config, ProduceRoutes.create(config, producers, codecs), () -> NOW);
+        new ProduceService(
+            config,
+            ProduceRoutes.create(config, producers, codecs),
+            () -> NOW,
+            new ServerMetrics(meters.get("odradek")));
     String name = InProcessServerBuilder.generateName();
     server =
         InProcessServerBuilder.forName(name)
@@ -151,6 +164,7 @@ class ProduceServiceTest {
 
   @AfterEach
   void stop() throws InterruptedException {
+    meters.close();
     if (channel != null) {
       channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
       server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
@@ -209,6 +223,24 @@ class ProduceServiceTest {
     return mock;
   }
 
+  /** The points of a histogram, waiting up to 10 seconds for {@code count} records in all. */
+  private List<HistogramPointData> histogram(String name, long count) throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (true) {
+      List<HistogramPointData> points =
+          reader.collectAllMetrics().stream()
+              .filter(m -> m.getName().equals(name))
+              .map(MetricData::getHistogramData)
+              .flatMap(h -> h.getPoints().stream())
+              .toList();
+      if (points.stream().mapToLong(HistogramPointData::getCount).sum() >= count
+          || System.nanoTime() > deadline) {
+        return points;
+      }
+      Thread.sleep(5);
+    }
+  }
+
   private static String text(byte[] bytes) {
     return new String(bytes, StandardCharsets.UTF_8);
   }
@@ -257,6 +289,38 @@ class ProduceServiceTest {
               assertThat(w.getOffset()).isZero();
             });
     assertThat(kafka.get("b").history()).isEmpty();
+  }
+
+  @Test
+  void recordsHandedToKafkaAreTimedFromArrival() throws Exception {
+    start(config());
+    AppStream app = opened("s1");
+    app.send(record(1, "nowhere", "v"));
+    assertThat(app.result().getError().getCode())
+        .isEqualTo(ErrorCode.ERROR_CODE_TOPIC_NOT_CONFIGURED);
+    app.send(record(2, "single", "v"));
+    MockProducer<byte[], byte[]> a = sent("a", 1);
+    Thread.sleep(20);
+    a.completeNext();
+    assertThat(app.result().getSeq()).isEqualTo(2);
+
+    // Only the record that went to Kafka: an answer without it would pull the durations down.
+    assertThat(histogram("odradek.produce.send.duration", 1))
+        .singleElement()
+        .satisfies(
+            p -> {
+              assertThat(p.getCount()).isEqualTo(1);
+              assertThat(p.getAttributes().get(stringKey("topic"))).isEqualTo("single");
+            });
+    assertThat(histogram("odradek.produce.duration", 1))
+        .singleElement()
+        .satisfies(
+            p -> {
+              assertThat(p.getCount()).isEqualTo(1);
+              assertThat(p.getSum()).as("waited for the broker").isGreaterThanOrEqualTo(20);
+              assertThat(p.getAttributes().get(stringKey("topic"))).isEqualTo("single");
+              assertThat(p.getAttributes().get(stringKey("outcome"))).isEqualTo("ok");
+            });
   }
 
   @Test
