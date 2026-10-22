@@ -555,6 +555,8 @@ final class ReceiveSession implements AppStream {
       long credit = split.appCredit();
       long undecodable = 0;
       long last = Long.MIN_VALUE;
+      // When this batch is written: the writes before it in this pump may have taken a while.
+      long written = now();
       // One batch is records of one partition from one stream, in offset order: a record delivered
       // again behind a newer one starts the next batch.
       while (!pending.isEmpty() && batch.getRecordsCount() < credit) {
@@ -567,8 +569,8 @@ final class ReceiveSession implements AppStream {
         pending.pollFirst();
         last = next.record().getOffset();
         batch.addRecords(next.record());
-        holdings.handed(topic.name, first.partition(), last, now);
-        topic.metrics.handedOff(now - next.arrivedNanos());
+        holdings.handed(topic.name, first.partition(), last, written);
+        topic.metrics.handedOff(written - next.arrivedNanos());
         if (next.undecodable()) {
           undecodable++;
         }

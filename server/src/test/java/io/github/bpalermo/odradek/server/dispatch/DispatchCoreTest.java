@@ -1701,4 +1701,57 @@ class DispatchCoreTest {
     ack("b", 0, 0, 1);
     assertThat(timed).containsExactly("queued 0 NOTHING", "queued 0 NOTHING", "rejected 2");
   }
+
+  @Test
+  void aReadyRecordBehindABlockedOneWaitedForTheOrderingNotForCredit() {
+    maxAttempts = 1;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 1);
+    assertThat(fetch(0, "0", "1")).containsExactly(deliver("a", 0, 0));
+    // 1 waits for credit until 0 blocks the partition at its deadline, then behind 0.
+    now = DEADLINE;
+    assertThat(on(new TimePassed<>())).containsExactly(new PartitionBlocked<>(0, 0));
+    now = DEADLINE + 10;
+    assertThat(credits("a", 5)).isEmpty();
+    now = 300;
+    assertThat(ack("a", 0, 0))
+        .containsExactly(new PartitionUnblocked<>(0), commit(0, 1), deliver("a", 0, 1));
+    // 100 without credit, 200 behind the blocked record: the total, put down to the ordering.
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 300 ORDERING");
+  }
+
+  @Test
+  void answersAfterTheDeadlineAreAcceptedAndNotTimedEvenBeforeTheTimeIsPassed() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0", "1");
+    // The deadline has passed, and the core has not been told yet.
+    now = DEADLINE + 5;
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+    assertThat(reject("a", 0, 1)).containsExactly(deliver("a", 0, 1, 2));
+    now = DEADLINE + 10;
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 2));
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 0 NOTHING", "acked 5");
+  }
+
+  @Test
+  void answersFromAReceiverSentAgainWhatItHeldExpiredAreAcceptedAndNotTimed() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    fetch(0, "0", "1");
+    now = DEADLINE;
+    // The only receiver gets both again, and still holds the first copies.
+    assertThat(on(new TimePassed<>()))
+        .containsExactly(deliver("a", 0, 0, 2), deliver("a", 0, 1, 2));
+    now = DEADLINE + 10;
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+    assertThat(reject("a", 0, 1)).containsExactly(deliver("a", 0, 1, 3));
+    // A third copy, while no expired one is held: its answer is timed again.
+    now = DEADLINE + 15;
+    assertThat(ack("a", 0, 1)).containsExactly(commit(0, 2));
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 0 NOTHING", "acked 5");
+  }
 }
