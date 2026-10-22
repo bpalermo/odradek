@@ -303,8 +303,10 @@ public final class ServerMetrics {
     dispatchLoopWait =
         duration(
             "odradek.dispatch.loop.wait",
-            "How long each idle wait of a group's thread for a command lasted. It waits up to"
-                + " 10 ms, and fetched records are not seen until it polls again.");
+            "How long each wait of a group's thread in its consumer's poll lasted, having nothing"
+                + " queued: until records arrived, a command was queued, or something was due."
+                + " The whole call, rebalance callbacks included: a hand-over makes it longer"
+                + " than the 100 ms the poll is asked to wait at most.");
     receiveHandoffDuration =
         duration(
             "odradek.receive.handoff.duration",
@@ -557,7 +559,10 @@ public final class ServerMetrics {
       attributes = Attributes.of(CLUSTER, cluster, GROUP, group);
     }
 
-    /** The thread waited {@code nanos} for a command, having nothing to do. */
+    /**
+     * The thread waited {@code nanos} in its consumer's poll, having nothing to do, for records, a
+     * command or the next thing due.
+     */
     public void waited(long nanos) {
       dispatchLoopWait.record(millis(nanos), attributes);
     }
