@@ -41,6 +41,7 @@ import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -51,11 +52,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
 import org.apache.kafka.clients.producer.MockProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -63,6 +67,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RoundRobinPartitioner;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.RecordTooLargeException;
+import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.header.internals.RecordHeaders;
@@ -81,13 +86,157 @@ class DispatchServiceTest {
   private static final TopicPartition P1 = new TopicPartition("orders", 1);
   private static final TopicPartition R0 = new TopicPartition("refunds", 0);
 
-  /** Remembers commits on the side: the mock cannot be asked from another thread or once closed. */
+  /**
+   * Remembers commits on the side: the mock cannot be asked from another thread or once closed.
+   *
+   * <p>Where the group's thread relies on it, it behaves as a real consumer does, which the mock
+   * alone does not: a poll waits, up to its timeout, until it has something to return (a scheduled
+   * task, an added record, records left from the last poll) or is woken; and a wakeup makes the
+   * next blocking call throw {@link WakeupException}, a poll or a commit or a lookup of offsets,
+   * until one has. A wakeup asked for while a scheduled task runs is checked by nothing in that
+   * poll, and so is pending when it returns: what a wakeup that comes just as a poll returns does
+   * to a real consumer.
+   */
   private static final class RecordingConsumer extends MockConsumer<byte[], byte[]> {
     final Map<TopicPartition, Long> commits = new ConcurrentHashMap<>();
     final List<Set<String>> subscriptions = new CopyOnWriteArrayList<>();
 
+    /** The timeouts of the last polls, and whether each had something to return: for failures. */
+    final List<String> recentPolls = new CopyOnWriteArrayList<>();
+
+    /** Wakeups asked for. */
+    final AtomicInteger wakeups = new AtomicInteger();
+
+    /** Polls that a wakeup ended. */
+    final AtomicInteger wokenPolls = new AtomicInteger();
+
+    /** Other calls that met a wakeup and threw. */
+    final AtomicInteger wokenCalls = new AtomicInteger();
+
+    /** The timeout of the poll that waits now; null when none does. */
+    volatile Duration waiting;
+
+    /** Run by {@link #committed}, before it answers. */
+    volatile Runnable onCommitted = () -> {};
+
+    /** Guards {@link #woken} and {@link #poked}; held while a poll waits, never with the mock's. */
+    private final Object signal = new Object();
+
+    private boolean woken;
+
+    /** Whether a poll has something to return, and so does not wait. */
+    private boolean poked;
+
     RecordingConsumer() {
       super("none");
+    }
+
+    @Override
+    public ConsumerRecords<byte[], byte[]> poll(Duration timeout) {
+      boolean wake;
+      synchronized (signal) {
+        recentPolls.add(timeout.toMillis() + (poked ? " poked" : "") + (woken ? " woken" : ""));
+        if (recentPolls.size() > 20) {
+          recentPolls.removeFirst();
+        }
+        long deadline = System.nanoTime() + timeout.toNanos();
+        waiting = timeout;
+        try {
+          long left = timeout.toNanos();
+          while (!woken && !poked && left > 0) {
+            TimeUnit.NANOSECONDS.timedWait(signal, left);
+            left = deadline - System.nanoTime();
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        } finally {
+          waiting = null;
+        }
+        wake = woken;
+        woken = false;
+        poked = false;
+      }
+      if (wake) {
+        wokenPolls.incrementAndGet();
+        throw new WakeupException();
+      }
+      ConsumerRecords<byte[], byte[]> records = super.poll(timeout);
+      if (!records.isEmpty()) {
+        // There may be more, which a real consumer would return without waiting.
+        poke();
+      }
+      return records;
+    }
+
+    @Override
+    public void wakeup() {
+      wakeups.incrementAndGet();
+      synchronized (signal) {
+        woken = true;
+        signal.notifyAll();
+      }
+    }
+
+    private void poke() {
+      synchronized (signal) {
+        poked = true;
+        signal.notifyAll();
+      }
+    }
+
+    /** What a blocking call does first: throws if a wakeup is pending. */
+    private void wakeupPoint() {
+      synchronized (signal) {
+        if (woken) {
+          woken = false;
+          wokenCalls.incrementAndGet();
+          throw new WakeupException();
+        }
+      }
+    }
+
+    @Override
+    public void schedulePollTask(Runnable task) {
+      super.schedulePollTask(task);
+      poke();
+    }
+
+    @Override
+    public void addRecord(ConsumerRecord<byte[], byte[]> record) {
+      super.addRecord(record);
+      poke();
+    }
+
+    @Override
+    public void resume(Collection<TopicPartition> partitions) {
+      super.resume(partitions);
+      poke();
+    }
+
+    @Override
+    public Map<TopicPartition, OffsetAndMetadata> committed(Set<TopicPartition> partitions) {
+      wakeupPoint();
+      onCommitted.run();
+      return super.committed(partitions);
+    }
+
+    @Override
+    public Map<TopicPartition, Long> beginningOffsets(Collection<TopicPartition> partitions) {
+      wakeupPoint();
+      return super.beginningOffsets(partitions);
+    }
+
+    @Override
+    public Map<TopicPartition, Long> endOffsets(Collection<TopicPartition> partitions) {
+      wakeupPoint();
+      return super.endOffsets(partitions);
+    }
+
+    @Override
+    public Map<TopicPartition, OffsetAndTimestamp> offsetsForTimes(
+        Map<TopicPartition, Long> timestampsToSearch) {
+      wakeupPoint();
+      return super.offsetsForTimes(timestampsToSearch);
     }
 
     @Override
@@ -100,6 +249,7 @@ class DispatchServiceTest {
 
     @Override
     public synchronized void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
+      wakeupPoint();
       offsets.forEach((partition, offset) -> commits.put(partition, offset.offset()));
       super.commitSync(offsets);
     }
@@ -756,7 +906,7 @@ class DispatchServiceTest {
     assertThat(recorded("odradek.dispatch.ack.duration", "outcome", "acknowledged")).isEqualTo(1);
     assertThat(recorded("odradek.dispatch.ack.duration", "outcome", "rejected")).isEqualTo(1);
 
-    // The group's thread waited for commands in between, a few milliseconds at a time.
+    // The group's thread waited in its poll in between.
     List<HistogramPointData> waits =
         histogram("odradek.dispatch.loop.wait", "cluster", "main", "group", "billing");
     assertThat(waits).hasSize(1);
@@ -1277,5 +1427,214 @@ class DispatchServiceTest {
       add(P0, offset, "k");
     }
     assertThat(working.records(48)).hasSize(48);
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // The group's thread: it waits in its poll, and commands wake the consumer
+  // -------------------------------------------------------------------------------------------
+
+  /** Nothing due for long: no commit at an interval, and a long revoke deadline. */
+  private static ServerConfig.Builder quiet() {
+    return config()
+        .setConsume(
+            Consume.newBuilder()
+                .setCommitInterval(Durations.fromSeconds(3600))
+                .setRevokeDeadline(Durations.fromSeconds(30)));
+  }
+
+  /** Waits until the group's thread waits in its poll for as long as it may: it has nothing due. */
+  private static void waitsInItsPoll(RecordingConsumer kafka) throws InterruptedException {
+    Duration longest = Duration.ofMillis(DispatchGroup.MAX_POLL_WAIT_MS);
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    Duration seen = kafka.waiting;
+    while (!longest.equals(seen) && System.nanoTime() < deadline) {
+      Thread.sleep(5);
+      seen = kafka.waiting;
+    }
+    assertThat(seen)
+        .as("the group's thread waits in its poll; the last polls: %s", kafka.recentPolls)
+        .isEqualTo(longest);
+  }
+
+  /** Waits, on the group's thread, for a wakeup beyond the {@code before} first. */
+  private static void awaitWakeup(RecordingConsumer kafka, int before) {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (kafka.wakeups.get() <= before && System.nanoTime() < deadline) {
+      Thread.onSpinWait();
+    }
+  }
+
+  @Test
+  void aCommandWakesTheConsumerWhereTheThreadWaits() throws Exception {
+    start(quiet());
+    Sidecar sidecar = declared(declare("orders"));
+    assign(P0);
+    add(P0, 0, "a");
+    RecordingConsumer kafka = kafka();
+    // Fetched, and waiting for credit, with nothing due.
+    waitsInItsPoll(kafka);
+    int woken = kafka.wokenPolls.get();
+    sidecar.credits(1);
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+    // The credit ended the wait: the poll was woken, and did not run to its timeout.
+    assertThat(kafka.wokenPolls.get()).isGreaterThan(woken);
+  }
+
+  @Test
+  void aRecordIsHandedOnAsSoonAsTheConsumerHasIt() throws Exception {
+    start(quiet());
+    Sidecar sidecar = declared(declare("orders"));
+    assign(P0);
+    sidecar.credits(10);
+    RecordingConsumer kafka = kafka();
+    waitsInItsPoll(kafka);
+    long since = System.nanoTime();
+    kafka.addRecord(stamped(0, System.currentTimeMillis(), TimestampType.CREATE_TIME));
+    // The poll returns it at once, rather than at the end of its wait.
+    assertThat(sidecar.millisUntil("0/0/1", since)).isLessThan(DispatchGroup.MAX_POLL_WAIT_MS / 2);
+    List<HistogramPointData> lag = histogram("odradek.dispatch.fetch.lag", "topic", "orders");
+    assertThat(lag).hasSize(1);
+    assertThat(lag.getFirst().getMax()).isLessThan(DispatchGroup.MAX_POLL_WAIT_MS / 2);
+  }
+
+  @Test
+  void aWakeupPendingAsThePollReturnsDoesNotCostTheNextCommit() throws Exception {
+    start(quiet());
+    Sidecar first = declared(declare("orders"));
+    assign(P0);
+    add(P0, 0, "a");
+    add(P0, 1, "b");
+    first.credits(10);
+    assertThat(first.records(2)).containsExactly("0/0/1", "0/1/1");
+    first.ack(0, 0, 1);
+    first.requests.onCompleted();
+    assertThat(first.status().isOk()).isTrue();
+    RecordingConsumer kafka = kafka();
+    waitsInItsPoll(kafka);
+
+    // A declaration with other settings, which nobody holds the topic with now, arrives as the
+    // poll returns: the wakeup it asks for is pending when the thread hands the partition over
+    // and commits it synchronously.
+    Sidecar second = stream();
+    int before = kafka.wakeups.get();
+    kafka.schedulePollTask(
+        () -> {
+          second.declare(declare("orders", s -> s.setOrdering(Ordering.ORDERING_NONE)));
+          awaitWakeup(kafka, before);
+        });
+    second.accepted();
+    eventually("the partition is committed", () -> committedNow(P0) == 2);
+    // The commit met the wakeup, and was made again.
+    assertThat(kafka.wokenCalls.get()).isPositive();
+    // And the topic goes on with its new settings, from there.
+    add(P0, 2, "c");
+    second.credits(1);
+    assertThat(second.records(1)).containsExactly("0/2/1");
+  }
+
+  @Test
+  void aWakeupPendingAsTheHandOverBeginsDoesNotCostItsCommit() throws Exception {
+    start(quiet());
+    Sidecar sidecar = declared(declare("orders"));
+    assign(P0, P1);
+    add(P0, 0, "a");
+    sidecar.credits(10);
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+    sidecar.ack(0, 0, 0);
+    RecordingConsumer kafka = kafka();
+    waitsInItsPoll(kafka);
+    // A wakeup asked for as the poll gave way to the rebalance: pending in onPartitionsRevoked.
+    kafka.schedulePollTask(
+        () -> {
+          kafka.wakeup();
+          kafka.rebalance(List.of(P1));
+        });
+    eventually("the revoked partition is committed", () -> committedNow(P0) == 1);
+    assertThat(kafka.wokenCalls.get()).isPositive();
+    assertThat(metric("odradek.dispatch.handovers", "outcome", "completed")).isEqualTo(1);
+  }
+
+  @Test
+  void aCommandWhileTheHandOverRunsDoesNotWakeTheConsumer() throws Exception {
+    start(quiet());
+    Sidecar sidecar = declared(declare("orders"));
+    assign(P0, P1);
+    add(P0, 0, "a");
+    sidecar.credits(10);
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+    RecordingConsumer kafka = kafka();
+    waitsInItsPoll(kafka);
+    // Earlier calls may have met a wakeup a command asked for as a callback began.
+    int woken = kafka.wokenCalls.get();
+    AtomicInteger duringRebalance = new AtomicInteger(-1);
+    kafka.schedulePollTask(
+        () -> {
+          int before = kafka.wakeups.get();
+          kafka.rebalance(List.of(P1));
+          duringRebalance.set(kafka.wakeups.get() - before);
+        });
+    // The hand-over waits for the acknowledgement, which arrives while it runs.
+    sidecar.nothing();
+    sidecar.ack(0, 0, 0);
+    eventually("the revoked partition is committed", () -> committedNow(P0) == 1);
+    eventually("the rebalance is over", () -> duringRebalance.get() >= 0);
+    assertThat(duringRebalance.get()).isZero();
+    assertThat(kafka.wokenCalls.get()).isEqualTo(woken);
+    assertThat(metric("odradek.dispatch.handovers", "outcome", "completed")).isEqualTo(1);
+  }
+
+  @Test
+  void aCommandQueuedDuringACallbackWakesThePollItReturnsInto() throws Exception {
+    start(quiet());
+    Sidecar sidecar = declared(declare("orders"));
+    RecordingConsumer kafka = kafka();
+    waitsInItsPoll(kafka);
+    // A credit queued while onPartitionsAssigned looks up the committed offsets.
+    AtomicInteger once = new AtomicInteger();
+    kafka.onCommitted =
+        () -> {
+          if (once.getAndIncrement() == 0) {
+            sidecar.credits(1);
+            try {
+              Thread.sleep(300);
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+            }
+          }
+        };
+    AtomicInteger duringRebalance = new AtomicInteger(-1);
+    kafka.schedulePollTask(
+        () -> {
+          kafka.updateBeginningOffsets(Map.of(P0, 0L));
+          kafka.updateEndOffsets(Map.of(P0, 0L));
+          int before = kafka.wakeups.get();
+          kafka.rebalance(List.of(P0));
+          duringRebalance.set(kafka.wakeups.get() - before);
+        });
+    eventually("the rebalance is over", () -> duringRebalance.get() >= 0);
+    // Not while the callback ran, but as it returned, since the credit was waiting.
+    assertThat(duringRebalance.get()).isEqualTo(1);
+    add(P0, 0, "a");
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+  }
+
+  @Test
+  void aWakeupPendingAsPartitionsAreAssignedDoesNotStopTheirAdoption() throws Exception {
+    start(quiet());
+    Sidecar sidecar = declared(declare("orders"));
+    RecordingConsumer kafka = kafka();
+    waitsInItsPoll(kafka);
+    kafka.schedulePollTask(
+        () -> {
+          kafka.updateBeginningOffsets(Map.of(P0, 0L));
+          kafka.updateEndOffsets(Map.of(P0, 0L));
+          kafka.wakeup();
+          kafka.rebalance(List.of(P0));
+        });
+    add(P0, 0, "a");
+    sidecar.credits(1);
+    assertThat(sidecar.records(1)).containsExactly("0/0/1");
+    // The lookup of the committed offset met the wakeup, and was made again.
+    assertThat(kafka.wokenCalls.get()).isPositive();
   }
 }

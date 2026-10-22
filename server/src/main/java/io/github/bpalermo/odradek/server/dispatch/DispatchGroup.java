@@ -46,6 +46,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import org.apache.kafka.clients.consumer.CloseOptions;
@@ -57,6 +58,7 @@ import org.apache.kafka.clients.consumer.InvalidOffsetException;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.record.TimestampType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,8 +70,11 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Everything here but {@link #submit} runs on that thread: the consumer, the cores and every
  * message written to a stream after its handshake. gRPC threads only queue commands. The thread
- * never waits for a sidecar: it waits for a command, for at most a few milliseconds, and polls the
- * consumer without blocking, so the consumer is polled however slow the sidecars are.
+ * never waits for a sidecar: when it has nothing to do it waits in the consumer's poll, until
+ * records arrive, until the next thing it has to do at a time of its own, or until a command is
+ * queued, which wakes the consumer ({@link #submit}). So records are handed to the cores as soon as
+ * the consumer has them, a command is acted on as soon as it is queued, and the consumer is polled
+ * however slow the sidecars are.
  *
  * <p>The group exists while it has a topic. A topic is added by the first declaration for it, and
  * removed when it has had no stream for the idle grace; the consumer's subscription follows.
@@ -77,8 +82,14 @@ import org.slf4j.LoggerFactory;
 final class DispatchGroup implements ConsumerRebalanceListener {
   private static final Logger LOG = LoggerFactory.getLogger(DispatchGroup.class);
 
-  /** The longest the thread waits for a command when nothing is happening. */
-  private static final long MAX_IDLE_WAIT_MS = 10;
+  /**
+   * The longest the thread waits in a poll. Only a guard: what it waits for either has a time the
+   * wait is cut to, or wakes the consumer.
+   */
+  static final long MAX_POLL_WAIT_MS = 100;
+
+  /** While partitions are handed over, the longest the thread waits for a command at a time. */
+  private static final long HAND_OVER_WAIT_MS = 10;
 
   /**
    * At most one line per topic in this time about each of: records that sidecars reject, records
@@ -353,6 +364,16 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   /** Counts the runs of this group's topics. */
   private long incarnations;
 
+  /**
+   * Whether a command queued now has to wake the consumer: the thread is in a poll that may block,
+   * and not in a rebalance callback. Set by the thread, and cleared by whoever wakes the consumer,
+   * so that one poll is woken once. See {@link #submit}.
+   */
+  private final AtomicBoolean wakeable = new AtomicBoolean();
+
+  /** The thread is in a poll that may block, callbacks included. Group thread only. */
+  private boolean inPoll;
+
   private Consumer<byte[], byte[]> consumer;
   private boolean subscriptionChanged;
   private boolean pausesChanged;
@@ -393,9 +414,22 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     thread.start();
   }
 
-  /** Queues a command. The only method other threads call while the group runs. */
+  /**
+   * Queues a command, and wakes the consumer if the thread waits in a poll. The only method other
+   * threads call while the group runs.
+   *
+   * <p>A wakeup makes the consumer's next blocking call throw {@link WakeupException}, whichever it
+   * is. The thread allows one only while it is in its own poll ({@link #poll}), never while a
+   * rebalance callback runs inside it ({@link #callback}); but one that was asked for just as that
+   * poll returned, or as a callback began, is still pending afterwards. So every other blocking
+   * call to the consumer goes through {@link #blocking}, which sees it through, and the poll treats
+   * it as having returned nothing.
+   */
   void submit(Command command) {
     commands.add(command);
+    if (wakeable.compareAndSet(true, false)) {
+      consumer.wakeup();
+    }
   }
 
   /** Whether nothing is queued; the owner asks under the lock it queues declarations under. */
@@ -436,9 +470,8 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   /** Runs until the dispatcher stops or the group has no topic left. */
   private void loop() {
     lastCommitNanos = now();
-    long wait = 0;
     while (true) {
-      boolean busy = drain(wait);
+      drain();
       if (stopping) {
         return;
       }
@@ -451,7 +484,6 @@ final class DispatchGroup implements ConsumerRebalanceListener {
           return;
         }
         // A declaration is queued.
-        wait = 0;
         continue;
       }
       if (subscriptionChanged) {
@@ -468,9 +500,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
 
       ConsumerRecords<byte[], byte[]> records;
       try {
-        // Never blocks: the wait is on the command queue, where an acknowledgement is acted on
-        // at once and not at the end of a poll.
-        records = consumer.poll(Duration.ZERO);
+        // Waits for records, or for the next thing to do at a time of its own; a command cuts the
+        // wait short, so an acknowledgement is acted on at once and not at the end of the poll.
+        records = poll(waitNanos(now()));
       } catch (InvalidOffsetException e) {
         // A committed offset that retention has since removed.
         e.partitions().forEach(this::reposition);
@@ -490,8 +522,92 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         commitAsync();
       }
       topics.values().forEach(this::report);
-      busy |= !records.isEmpty();
-      wait = busy ? 0 : Math.min(Math.max(1, wait * 2), MAX_IDLE_WAIT_MS);
+    }
+  }
+
+  /**
+   * How long the thread may wait in its next poll: until a core's next deadline, the next commit or
+   * the end of a topic's idle grace, whichever comes first, and at most {@link #MAX_POLL_WAIT_MS}.
+   */
+  private long waitNanos(long now) {
+    long due = lastCommitNanos + commitIntervalNanos;
+    for (Topic topic : topics.values()) {
+      OptionalLong next = topic.core.nextDeadlineNanos();
+      if (next.isPresent() && next.getAsLong() - due < 0) {
+        due = next.getAsLong();
+      }
+      if (topic.receivers.isEmpty() && topic.idleSince + idleGraceNanos - due < 0) {
+        due = topic.idleSince + idleGraceNanos;
+      }
+    }
+    return Math.max(0, Math.min(due - now, TimeUnit.MILLISECONDS.toNanos(MAX_POLL_WAIT_MS)));
+  }
+
+  /**
+   * Polls the consumer, waiting up to {@code waitNanos} for records unless a command is queued, and
+   * letting {@link #submit} wake it meanwhile. A wakeup, that one or one still pending from before,
+   * returns nothing.
+   */
+  private ConsumerRecords<byte[], byte[]> poll(long waitNanos) {
+    // Rounded up: the consumer counts in milliseconds, and a wait cut short would only poll again.
+    long waitMs = TimeUnit.NANOSECONDS.toMillis(waitNanos + TimeUnit.MILLISECONDS.toNanos(1) - 1);
+    if (waitMs > 0) {
+      // Allowed before the queue is looked at: a command queued after the look wakes the consumer.
+      wakeable.set(true);
+      if (!commands.isEmpty()) {
+        wakeable.set(false);
+        waitMs = 0;
+      }
+    }
+    inPoll = waitMs > 0;
+    long start = inPoll ? now() : 0;
+    try {
+      return consumer.poll(Duration.ofMillis(waitMs));
+    } catch (WakeupException e) {
+      return ConsumerRecords.empty();
+    } finally {
+      if (inPoll) {
+        inPoll = false;
+        wakeable.set(false);
+        loopMetrics.waited(now() - start);
+      }
+    }
+  }
+
+  /**
+   * Runs a rebalance callback, which the consumer calls inside a poll: no command wakes the
+   * consumer while it runs, since the hand-over waits for acknowledgements by handling commands
+   * itself, and a wakeup would only cut its synchronous commit short. When it returns into a poll
+   * that may block, commands may wake the consumer again, at once if one was queued meanwhile.
+   */
+  private void callback(Runnable callback) {
+    wakeable.set(false);
+    try {
+      callback.run();
+    } finally {
+      if (inPoll) {
+        wakeable.set(true);
+        if (!commands.isEmpty() && wakeable.compareAndSet(true, false)) {
+          consumer.wakeup();
+        }
+      }
+    }
+  }
+
+  /**
+   * Makes a call to the consumer that may block: a synchronous commit, or a lookup of committed or
+   * start offsets. A wakeup that {@link #submit} asked for just as a poll returned, or as a
+   * callback began, may still be pending, and makes the call throw: it is made again, which for a
+   * commit or a lookup only repeats it. Once that wakeup is spent no other is asked for while the
+   * call runs, since the thread is out of its poll or in a callback, so this ends.
+   */
+  private <T> T blocking(Supplier<T> call) {
+    while (true) {
+      try {
+        return call.get();
+      } catch (WakeupException e) {
+        LOG.debug("a call to the consumer of group {} met a wakeup meant for a poll", key.group());
+      }
     }
   }
 
@@ -499,22 +615,11 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     return options.nanoClock().getAsLong();
   }
 
-  /** Handles what is queued, waiting up to {@code waitMs} for the first; whether anything was. */
-  private boolean drain(long waitMs) {
-    Command command;
-    if (waitMs > 0) {
-      long start = now();
-      command = await(TimeUnit.MILLISECONDS.toNanos(waitMs));
-      loopMetrics.waited(now() - start);
-    } else {
-      command = commands.poll();
-    }
-    boolean any = command != null;
-    while (command != null) {
+  /** Handles what is queued, without waiting. */
+  private void drain() {
+    for (Command command = commands.poll(); command != null; command = commands.poll()) {
       handle(command);
-      command = commands.poll();
     }
-    return any;
   }
 
   private Command await(long nanos) {
@@ -1070,7 +1175,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     if (known.isEmpty()) {
       return;
     }
-    Map<TopicPartition, OffsetAndMetadata> committed = consumer.committed(known);
+    Map<TopicPartition, OffsetAndMetadata> committed = blocking(() -> consumer.committed(known));
     Map<TopicPartition, Long> positions = new HashMap<>();
     Set<TopicPartition> uncommitted = new HashSet<>();
     for (TopicPartition partition : known) {
@@ -1118,8 +1223,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       }
     }
     if (!timestamps.isEmpty()) {
-      consumer
-          .offsetsForTimes(timestamps)
+      blocking(() -> consumer.offsetsForTimes(timestamps))
           .forEach(
               (TopicPartition partition, OffsetAndTimestamp found) -> {
                 if (found != null) {
@@ -1139,10 +1243,10 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       (end ? latest : earliest).add(partition);
     }
     if (!earliest.isEmpty()) {
-      positions.putAll(consumer.beginningOffsets(earliest));
+      positions.putAll(blocking(() -> consumer.beginningOffsets(earliest)));
     }
     if (!latest.isEmpty()) {
-      positions.putAll(consumer.endOffsets(latest));
+      positions.putAll(blocking(() -> consumer.endOffsets(latest)));
     }
     return positions;
   }
@@ -1189,34 +1293,43 @@ final class DispatchGroup implements ConsumerRebalanceListener {
 
   @Override
   public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
-    if (!partitions.isEmpty()) {
-      metrics.rebalanced(key.cluster(), key.group(), "assigned");
-      adopt(partitions);
-    }
+    callback(
+        () -> {
+          if (!partitions.isEmpty()) {
+            metrics.rebalanced(key.cluster(), key.group(), "assigned");
+            adopt(partitions);
+          }
+        });
   }
 
   @Override
   public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
-    if (!partitions.isEmpty()) {
-      metrics.rebalanced(key.cluster(), key.group(), "revoked");
-    }
-    // Runs inside poll(): nothing is fetched while the cores finish what they had sent.
-    handOver(partitions);
-    pausesChanged = true;
+    callback(
+        () -> {
+          if (!partitions.isEmpty()) {
+            metrics.rebalanced(key.cluster(), key.group(), "revoked");
+          }
+          // Runs inside poll(): nothing is fetched while the cores finish what they had sent.
+          handOver(partitions);
+          pausesChanged = true;
+        });
   }
 
   @Override
   public void onPartitionsLost(Collection<TopicPartition> partitions) {
-    if (!partitions.isEmpty()) {
-      metrics.rebalanced(key.cluster(), key.group(), "lost");
-    }
-    Map<Topic, List<Integer>> byTopic = byTopic(partitions);
-    byTopic.forEach((topic, numbers) -> on(topic, new PartitionsLost<>(numbers)));
-    partitions.forEach(this::forget);
-    pausesChanged = true;
-    if (!byTopic.isEmpty()) {
-      LOG.warn("group {} on cluster {} lost {}", key.group(), key.cluster(), partitions);
-    }
+    callback(
+        () -> {
+          if (!partitions.isEmpty()) {
+            metrics.rebalanced(key.cluster(), key.group(), "lost");
+          }
+          Map<Topic, List<Integer>> byTopic = byTopic(partitions);
+          byTopic.forEach((topic, numbers) -> on(topic, new PartitionsLost<>(numbers)));
+          partitions.forEach(this::forget);
+          pausesChanged = true;
+          if (!byTopic.isEmpty()) {
+            LOG.warn("group {} on cluster {} lost {}", key.group(), key.cluster(), partitions);
+          }
+        });
   }
 
   /** The partitions among these that a core has, by topic. */
@@ -1279,7 +1392,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         LOG.warn("hand-over of {} did not complete in time; committing what is known", mine);
         break;
       }
-      long wait = Math.min(giveUp - now, TimeUnit.MILLISECONDS.toNanos(MAX_IDLE_WAIT_MS));
+      long wait = Math.min(giveUp - now, TimeUnit.MILLISECONDS.toNanos(HAND_OVER_WAIT_MS));
       for (Topic topic : byTopic.keySet()) {
         OptionalLong next = topic.core.nextDeadlineNanos();
         if (next.isPresent()) {
@@ -1382,7 +1495,11 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       return;
     }
     try {
-      consumer.commitSync(offsets);
+      blocking(
+          () -> {
+            consumer.commitSync(offsets);
+            return null;
+          });
     } catch (RuntimeException e) {
       LOG.warn(
           "commit of {} failed; what was acknowledged above the last commit is delivered again",
