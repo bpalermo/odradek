@@ -88,10 +88,13 @@ java_junit_test(
 )
 
 # The same suite against the packaged server, started as a separate process
-# with a configuration file and stopped with SIGTERM: what a pod runs.
+# with a configuration file and stopped with SIGTERM: what a pod runs. It takes
+# 9 to 13 minutes on a CI runner, too close to large's 15: hence the longer
+# timeout.
 java_junit_test(
     name = "e2e_jvm_binary_test",
     size = "large",
+    timeout = "eternal",
     srcs = glob(["src/test/java/**/*.java"]),
     data = ["//server"],
     env = {"ODRADEK_E2E_SERVER": "$(rootpath //server)"},
