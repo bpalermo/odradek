@@ -11,7 +11,7 @@
             SendRejection StreamEnded StreamOpened]
            [io.github.bpalermo.odradek.kafka.v1 ProduceRecord ProduceResponse ProduceResult]
            [java.util ArrayList HashMap List UUID]
-           [java.util.concurrent CompletableFuture ExecutionException TimeUnit TimeoutException]))
+           [java.util.concurrent CompletableFuture TimeUnit]))
 
 (set! *warn-on-reflection* true)
 
@@ -40,17 +40,40 @@
 
 (declare open-stream! apply!)
 
+(defn- drained?
+  "Whether every result has been delivered: a future is out of `futures` before
+  it completes, and completing it runs what the application chained on it.
+  Completions on the calling thread are not waited for. Called with the lock
+  held."
+  [{:keys [^HashMap completing ^HashMap futures]}]
+  (let [self (Thread/currentThread)]
+    (and (.isEmpty futures)
+         (every? #(= self %) (.keySet completing)))))
+
 (defn- perform!
   "Carries out actions. Called with the lock held; results reach the
   application after it is released, through `after`."
-  [{:keys [lock scheduler backoff requests fatal ^HashMap futures] :as producer}
+  [{:keys [lock scheduler backoff requests fatal ^HashMap completing ^HashMap futures]
+    :as producer}
    ^List actions ^ArrayList after]
   (doseq [^ProduceAction action actions]
     (case (.name (.getKindCase action))
       "TRANSMIT" (stream/transmit! @requests (.getTransmit action))
       "COMPLETED" (let [result (.getResult (.getCompleted action))]
                     (when-let [future (.remove futures (.getSeq result))]
-                      (.add after #(complete! future result))))
+                      ;; The thread that performs the actions runs what they
+                      ;; leave in after.
+                      (let [thread (Thread/currentThread)]
+                        (.put completing thread (inc (long (or (.get completing thread) 0))))
+                        (.add after #(try
+                                       (complete! future result)
+                                       (finally
+                                         (locking lock
+                                           (let [n (long (.get completing thread))]
+                                             (if (= 1 n)
+                                               (.remove completing thread)
+                                               (.put completing thread (dec n))))
+                                           (.notifyAll ^Object lock))))))))
       "OPEN_STREAM" (stream/schedule! scheduler
                                       (stream/next-delay-ms! backoff)
                                       #(locking lock (open-stream! producer)))
@@ -62,23 +85,17 @@
 (defn- apply!
   "Applies an event that came from the stream of `from-generation`, or from the
   application (-1)."
-  [{:keys [lock ^ProduceCore core backoff requests generation closed
-           ^HashMap futures ^CompletableFuture drained]
-    :as producer}
+  [{:keys [lock ^ProduceCore core backoff requests generation] :as producer}
    ^ProduceEvent event from-generation]
   (let [after (ArrayList.)]
     (locking lock
       ;; An event of a stream that has since been replaced is ignored.
       (when (or (neg? (long from-generation)) (= from-generation @generation))
-        (when (.hasClose event)
-          (vreset! closed true))
         (when (.hasStreamEnded event)
           (vreset! requests nil))
         (when (and (.hasReceived event) (.hasReady (.getReceived event)))
           (stream/reset-backoff! backoff))
         (perform! producer (.handle core event) after)
-        (when (and @closed (.isEmpty futures))
-          (.complete drained nil))
         (.notifyAll ^Object lock)))
     (doseq [f after]
       (f))))
@@ -118,10 +135,11 @@
                   :backoff (stream/backoff)
                   ;; seq -> the future of the record it was assigned to.
                   :futures (HashMap.)
-                  :drained (CompletableFuture.)
+                  ;; Futures out of :futures whose completion has not yet run,
+                  ;; by the thread that will run it -> how many.
+                  :completing (HashMap.)
                   :requests (volatile! nil)
                   :generation (volatile! 0)
-                  :closed (volatile! false)
                   :shut-down (volatile! false)
                   :fatal (volatile! nil)}]
     (locking (:lock producer)
@@ -180,17 +198,27 @@
 
 (defn close!
   "Stops taking records, waits up to a minute for the results of those already
-  sent, and ends the stream. Records still unanswered then stay with the
-  server; their futures do not complete."
-  [{:keys [lock requests generation shut-down ^CompletableFuture drained] :as producer}]
+  sent, and ends the stream. A result counts once its future has completed, and
+  what was chained on it has run on the thread that completed it. What runs
+  elsewhere is the app's to wait for: async stages, and a callback that another
+  thread waiting on the same future happens to run instead. Records still
+  unanswered then stay with the server; their futures do not complete.
+
+  Called from what was chained on a future, it does not wait for completions
+  on its own thread, which cannot run until it returns."
+  [{:keys [lock requests generation shut-down] :as producer}]
   (apply! producer close-event -1)
-  (try
-    (.get drained (long close-timeout-s) TimeUnit/SECONDS)
-    (catch InterruptedException _
-      (.interrupt (Thread/currentThread)))
-    (catch ExecutionException _ nil)
-    (catch TimeoutException _ nil))
   (locking lock
+    (let [deadline (+ (System/nanoTime) (.toNanos TimeUnit/SECONDS close-timeout-s))]
+      (try
+        (loop []
+          (when-not (drained? producer)
+            (let [remaining (- deadline (System/nanoTime))]
+              (when (pos? remaining)
+                (.timedWait TimeUnit/NANOSECONDS lock remaining)
+                (recur)))))
+        (catch InterruptedException _
+          (.interrupt (Thread/currentThread)))))
     (vreset! shut-down true)
     (vswap! generation inc)
     (stream/cancel! @requests "producer closed")
