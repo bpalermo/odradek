@@ -131,8 +131,12 @@ class DispatchServiceTest {
       super("none");
     }
 
+    /** Every poll, woken or not. */
+    final AtomicInteger polls = new AtomicInteger();
+
     @Override
     public ConsumerRecords<byte[], byte[]> poll(Duration timeout) {
+      polls.incrementAndGet();
       boolean wake;
       synchronized (signal) {
         recentPolls.add(timeout.toMillis() + (poked ? " poked" : "") + (woken ? " woken" : ""));
@@ -154,7 +158,11 @@ class DispatchServiceTest {
         }
         wake = woken;
         woken = false;
-        poked = false;
+        // A poll that throws runs no scheduled task: what was pending stays so, and the next poll
+        // must not wait for it.
+        if (!wake) {
+          poked = false;
+        }
       }
       if (wake) {
         wokenPolls.incrementAndGet();
@@ -1440,6 +1448,28 @@ class DispatchServiceTest {
             Consume.newBuilder()
                 .setCommitInterval(Durations.fromSeconds(3600))
                 .setRevokeDeadline(Durations.fromSeconds(30)));
+  }
+
+  @Test
+  void aCommitIntervalBelowAMillisecondDoesNotMakeTheThreadSpin() throws Exception {
+    // It reaches the group in whole milliseconds, as zero: a commit then always due would make
+    // every poll return at once.
+    start(
+        config()
+            .setConsume(
+                Consume.newBuilder()
+                    .setCommitInterval(Durations.fromNanos(500_000))
+                    .setRevokeDeadline(Durations.fromSeconds(30))));
+    declared(declare("orders"));
+    assign(P0);
+    RecordingConsumer kafka = kafka();
+    Thread.sleep(100);
+    int before = kafka.polls.get();
+    Thread.sleep(500);
+    // A poll at most every millisecond, about 500; a thread that spins makes tens of thousands.
+    assertThat(kafka.polls.get() - before)
+        .as("polls in 500 ms; the last polls: %s", kafka.recentPolls)
+        .isLessThan(2_000);
   }
 
   /** Waits until the group's thread waits in its poll for as long as it may: it has nothing due. */

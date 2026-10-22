@@ -401,7 +401,10 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     this.owner = owner;
     this.revokeGraceNanos = options.revokeGrace().toNanos();
     this.idleGraceNanos = options.idleGrace().toNanos();
-    this.commitIntervalNanos = options.commitInterval().toNanos();
+    // At least a millisecond: the interval reaches here in whole milliseconds, and one of zero
+    // would make a commit always due, so that every poll returned at once and an idle group spun.
+    this.commitIntervalNanos =
+        Math.max(options.commitInterval().toNanos(), TimeUnit.MILLISECONDS.toNanos(1));
     this.thread = new Thread(this::run, "odradek-dispatch-" + key.cluster() + "-" + key.group());
     this.thread.setDaemon(true);
   }
