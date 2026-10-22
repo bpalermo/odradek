@@ -1722,6 +1722,26 @@ class DispatchCoreTest {
   }
 
   @Test
+  void blockedTimeIsOrderingTimeOnAClockWhoseValuesAreNegative() {
+    // System.nanoTime() may be negative: the same scenario, every moment shifted below zero.
+    long origin = -1_000_000;
+    now = origin;
+    maxAttempts = 1;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 1);
+    assertThat(fetch(0, "0", "1")).containsExactly(deliver("a", 0, 0));
+    now = origin + DEADLINE;
+    assertThat(on(new TimePassed<>())).containsExactly(new PartitionBlocked<>(0, 0));
+    now = origin + DEADLINE + 10;
+    assertThat(credits("a", 5)).isEmpty();
+    now = origin + 300;
+    assertThat(ack("a", 0, 0))
+        .containsExactly(new PartitionUnblocked<>(0), commit(0, 1), deliver("a", 0, 1));
+    assertThat(timed).containsExactly("queued 0 NOTHING", "queued 300 ORDERING");
+  }
+
+  @Test
   void answersAfterTheDeadlineAreAcceptedAndNotTimedEvenBeforeTheTimeIsPassed() {
     start(Ordering.NONE);
     assign(0, 0);

@@ -270,10 +270,14 @@ public final class DispatchCore<R> {
     boolean windowHeld;
 
     /**
-     * While {@code READY} for its first delivery: since when a blocked record below it in its
-     * partition has kept it from being sent, or -1; and how long that held it before then.
+     * While {@code READY} for its first delivery: whether a blocked record below it in its
+     * partition keeps it from being sent now, since when, and how long that held it before then.
+     * Whether is its own field: the clock's values may be negative, so no value of {@code
+     * blockedSince} can mean "not blocked".
      */
-    long blockedSince = -1;
+    boolean blockedNow;
+
+    long blockedSince;
 
     long blockedNanos;
 
@@ -963,10 +967,11 @@ public final class DispatchCore<R> {
   private void ready(Rec<R> rec) {
     rec.state = State.READY;
     rec.readyAt = now;
-    rec.blockedSince = -1;
+    rec.blockedNow = false;
     rec.blockedNanos = 0;
     rec.part.ready.put(rec.offset, rec);
     if (!rec.delivered && behindBlock(rec)) {
+      rec.blockedNow = true;
       rec.blockedSince = now;
     }
   }
@@ -987,11 +992,12 @@ public final class DispatchCore<R> {
         continue;
       }
       boolean behind = behindBlock(rec);
-      if (behind && rec.blockedSince < 0) {
+      if (behind && !rec.blockedNow) {
+        rec.blockedNow = true;
         rec.blockedSince = now;
-      } else if (!behind && rec.blockedSince >= 0) {
+      } else if (!behind && rec.blockedNow) {
+        rec.blockedNow = false;
         rec.blockedNanos += now - rec.blockedSince;
-        rec.blockedSince = -1;
       }
     }
   }
@@ -1087,7 +1093,7 @@ public final class DispatchCore<R> {
   private void queued(Rec<R> rec) {
     long pending = rec.admittedAt - rec.fetchedAt;
     // Ready, and behind a blocked record of its partition: credit would not have sent it.
-    long blocked = rec.blockedNanos + (rec.blockedSince >= 0 ? now - rec.blockedSince : 0);
+    long blocked = rec.blockedNanos + (rec.blockedNow ? now - rec.blockedSince : 0);
     long ordering = rec.readyAt - rec.admittedAt + (rec.windowHeld ? 0 : pending) + blocked;
     long window = rec.windowHeld ? pending : 0;
     long credit = now - rec.readyAt - blocked;
