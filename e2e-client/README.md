@@ -15,7 +15,7 @@ Image: `quay.io/odradek/e2e-client` (linux/amd64 and linux/arm64, JVM, on the se
 
 ## What it checks
 
-**Producer mode** sends records to a topic at a rate R (or a schedule of rates, `--rate-schedule`), round robin over K keys (`key-0` … `key-<K-1>`), for a count N or a duration, whichever ends first, or until stopped. A record of a key is sent only once the previous record of that key has its outcome: that is what Odradek's ordering guarantee covers (records of one stream reach each partition in order), so a consumer may hold the key's records to strict order. The rate is a target: with every key waiting on an acknowledgement it is at most K divided by the acknowledgement latency.
+**Producer mode** sends records to a topic at a rate R (or a schedule of rates, `--rate-schedule`), round robin over K keys (`key-0` … `key-<K-1>`, in an order each origin draws for itself, so that producers sending in step do not send the same key at the same instant), for a count N or a duration, whichever ends first, or until stopped. A record of a key is sent only once the previous record of that key has its outcome: that is what Odradek's ordering guarantee covers (records of one stream reach each partition in order), so a consumer may hold the key's records to strict order. The rate is a target: with every key waiting on an acknowledgement it is at most K divided by the acknowledgement latency.
 
 Each record's value is JSON, its Kafka key the key:
 
