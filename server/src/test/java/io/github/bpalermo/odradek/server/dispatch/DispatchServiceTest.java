@@ -178,9 +178,10 @@ class DispatchServiceTest {
 
     @Override
     public void wakeup() {
-      wakeups.incrementAndGet();
       synchronized (signal) {
         woken = true;
+        // Counted once registered: a test that sees the count knows the wakeup is pending.
+        wakeups.incrementAndGet();
         signal.notifyAll();
       }
     }
@@ -1517,6 +1518,8 @@ class DispatchServiceTest {
     assign(P0);
     sidecar.credits(10);
     RecordingConsumer kafka = kafka();
+    // The assignment is a scheduled task: a record can be added only once it has run.
+    eventually("P0 is assigned", () -> kafka.assignment().contains(P0));
     waitsInItsPoll(kafka);
     long since = System.nanoTime();
     kafka.addRecord(stamped(0, System.currentTimeMillis(), TimestampType.CREATE_TIME));
@@ -1619,6 +1622,43 @@ class DispatchServiceTest {
     // The poll the callback returns into chose a wait of 100 ms; the new deadline, due before it
     // would end, ends it.
     assertThat(duringRebalance.get()).isEqualTo(1);
+  }
+
+  @Test
+  void aWakeupALaterCallbackSpendsIsAskedForAgain() throws Exception {
+    start(quiet());
+    Sidecar slow = declared(declare("orders"));
+    assign(P0, P1);
+    add(P0, 0, "a");
+    slow.credits(1);
+    assertThat(slow.records(1)).containsExactly("0/0/1");
+    Sidecar fast = declared(declare("orders", s -> s.setMaxProcessingMs(20)));
+    add(P1, 0, "b");
+    RecordingConsumer kafka = kafka();
+    waitsInItsPoll(kafka);
+    TopicPartition p2 = new TopicPartition("orders", 2);
+    int woken = kafka.wokenCalls.get();
+    AtomicInteger duringRebalance = new AtomicInteger(-1);
+    kafka.schedulePollTask(
+        () -> {
+          kafka.updateBeginningOffsets(Map.of(p2, 0L));
+          kafka.updateEndOffsets(Map.of(p2, 0L));
+          int before = kafka.wakeups.get();
+          // One poll, two callbacks: P0 revoked, then P2 assigned.
+          kafka.rebalance(List.of(P1, p2));
+          duringRebalance.set(kafka.wakeups.get() - before);
+        });
+    // The revocation's hand-over sends P1's record under a 20 ms deadline and ends with a wakeup;
+    // the assignment's lookup of committed offsets spends it, so the assignment asks again.
+    eventually(
+        "the hand-over has begun",
+        () -> metric("odradek.consume.rebalances", "event", "revoked") == 1);
+    fast.credits(1);
+    assertThat(fast.records(1)).containsExactly("1/0/1");
+    slow.ack(0, 0, 0);
+    eventually("the rebalance is over", () -> duringRebalance.get() >= 0);
+    assertThat(kafka.wokenCalls.get()).as("a lookup met the first wakeup").isGreaterThan(woken);
+    assertThat(duringRebalance.get()).isEqualTo(2);
   }
 
   @Test

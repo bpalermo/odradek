@@ -627,6 +627,8 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       try {
         return call.get();
       } catch (WakeupException e) {
+        // Spent here, so it ends no poll: a callback that comes after may ask for another.
+        pollEnded = false;
         LOG.debug("a call to the consumer of group {} met a wakeup meant for a poll", key.group());
       }
     }
