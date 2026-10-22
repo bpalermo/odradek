@@ -109,10 +109,11 @@ public final class ProduceService {
 
     @Override
     public void onNext(ProduceRequest request) {
+      long arrived = System.nanoTime();
       try {
         switch (request.getMsgCase()) {
           case OPEN -> open(request);
-          case RECORD -> record(request.getRecord());
+          case RECORD -> record(request.getRecord(), arrived);
           case MSG_NOT_SET -> fail(Status.INVALID_ARGUMENT.withDescription("empty ProduceRequest"));
         }
       } catch (RuntimeException e) {
@@ -170,7 +171,8 @@ public final class ProduceService {
           this::finishIfDone);
     }
 
-    private void record(ProduceRecord record) {
+    /** Hands a record to Kafka; {@code arrived} is when the stream gave it, for the metrics. */
+    private void record(ProduceRecord record, long arrived) {
       if (session == null) {
         fail(Status.INVALID_ARGUMENT.withDescription("the first message must be ProduceOpen"));
         return;
@@ -247,6 +249,7 @@ public final class ProduceService {
                 metrics.produced(
                     topic, result.hasError() ? result.getError().getCode().name() : null);
                 session.complete(result);
+                metrics.produceAnswered(topic, System.nanoTime() - arrived, !result.hasError());
               });
       // The session lock is not held here: send() may wait for metadata, and the callbacks that
       // need the lock run on the producers' I/O threads.
@@ -277,6 +280,7 @@ public final class ProduceService {
           write.failed(index, e);
         }
       }
+      metrics.produceSent(topic, System.nanoTime() - arrived);
     }
 
     /** Answers a record that is not handed to Kafka, and remembers the answer for resends. */

@@ -92,6 +92,8 @@ public final class ServerMetrics {
   private final DoubleHistogram dispatchLoopWait;
   private final DoubleHistogram receiveHandoffDuration;
   private final DoubleHistogram receiveAckDuration;
+  private final DoubleHistogram produceSendDuration;
+  private final DoubleHistogram produceDuration;
   private final KafkaClientMetrics kafkaClients;
 
   public ServerMetrics(Meter meter) {
@@ -317,6 +319,20 @@ public final class ServerMetrics {
             "odradek.receive.ack.duration",
             "From a record received from a dispatcher being written to the app's stream to the"
                 + " app's acknowledgement of it arriving.");
+    produceSendDuration =
+        duration(
+            "odradek.produce.send.duration",
+            "From a record's arrival on a Produce stream to its hand-over to the Kafka producer of"
+                + " every cluster it goes to: the topic's codec, and the producers' wait for"
+                + " metadata or for room in their buffers.");
+    produceDuration =
+        duration(
+            "odradek.produce.duration",
+            "From a record's arrival on a Produce stream to its result being written to the"
+                + " stream (or kept for a resend, if the stream is gone), by outcome: the"
+                + " hand-over, the Kafka producers' linger and the brokers' acknowledgements, and"
+                + " the result's way back to the stream. What the app measures beyond it is the"
+                + " client, the socket and gRPC, both ways.");
   }
 
   private DoubleHistogram duration(String name, String description) {
@@ -361,6 +377,19 @@ public final class ServerMetrics {
         1,
         Attributes.of(
             TOPIC, topic, CLUSTER, cluster, REQUIRED, required, OUTCOME, ok ? OK : ERROR));
+  }
+
+  /** A record was handed to the producer of every cluster {@code nanos} after it arrived. */
+  public void produceSent(String topic, long nanos) {
+    produceSendDuration.record(millis(nanos), Attributes.of(TOPIC, topic));
+  }
+
+  /**
+   * The result of a record handed to Kafka was written to the stream {@code nanos} after the record
+   * arrived; {@code ok} unless the result is an error.
+   */
+  public void produceAnswered(String topic, long nanos, boolean ok) {
+    produceDuration.record(millis(nanos), Attributes.of(TOPIC, topic, OUTCOME, ok ? OK : ERROR));
   }
 
   public void produceStreamOpened() {
