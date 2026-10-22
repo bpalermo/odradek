@@ -13,7 +13,8 @@
            [java.nio.charset StandardCharsets]
            [java.nio.file Files Path]
            [java.nio.file.attribute FileAttribute]
-           [java.util.concurrent CompletableFuture ExecutionException TimeUnit]))
+           [java.util.concurrent CompletableFuture ExecutionException TimeUnit]
+           [java.util.function BiConsumer]))
 
 (def ^:private timeout-ms 30000)
 
@@ -240,6 +241,27 @@
           (odradek/close! producer)
           (is (= :closed
                  (:odradek/error (thrown-data #(odradek/send! producer {:topic "t" :value "v"})))))))
+      (finally
+        (kill-server! server)))))
+
+(deftest close-returns-once-the-last-result-has-reached-what-was-chained-on-it
+  (let [answer (promise)
+        server (start-server {:produce (produce-handler
+                                        {:epoch "e1" :window 10 :log (atom [])
+                                         :answer (fn [record] @answer (written record))})})]
+    (try
+      (with-open [conn (odradek/connect *socket*)]
+        (let [producer (odradek/producer conn)
+              answered (atom false)]
+          (.whenComplete ^CompletableFuture (odradek/send! producer {:topic "t" :value "v"})
+                         (reify BiConsumer
+                           (accept [_ result _]
+                             ;; Slow bookkeeping on the result: close! must wait for it.
+                             (Thread/sleep 300)
+                             (reset! answered (map? result)))))
+          (deliver answer true)
+          (odradek/close! producer)
+          (is @answered)))
       (finally
         (kill-server! server)))))
 

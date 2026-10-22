@@ -1,6 +1,7 @@
 load("@rules_java//java:defs.bzl", "java_library")
 load("//bazel:version.bzl", "VERSION")
 load("//bazel/java:defs.bzl", "JAVACOPTS")
+load("//bazel/java:junit.bzl", "java_junit_test")
 load("//bazel/maven:defs.bzl", "GRPC_DEPENDENCIES", "maven_artifact")
 
 package(default_visibility = ["//visibility:private"])
@@ -45,4 +46,22 @@ maven_artifact(
     extra_dependencies = GRPC_DEPENDENCIES,
     visibility = ["//visibility:public"],
     exports = [":client"],
+)
+
+java_junit_test(
+    name = "test",
+    size = "small",
+    srcs = glob(["src/test/java/**/*.java"]),
+    javacopts = JAVACOPTS,
+    test_classes = ["io.github.bpalermo.odradek.client.ProducerTest"],
+    deps = [
+        ":client",
+        "//api/odradek/kafka/v1:odradek_java_grpc",
+        "//api/odradek/kafka/v1:odradek_java_proto",
+        "@grpc-java//api",
+        "@grpc-java//inprocess",
+        "@grpc-java//stub",
+        "@maven//:org_assertj_assertj_core",
+        "@maven//:org_junit_jupiter_junit_jupiter_api",
+    ],
 )

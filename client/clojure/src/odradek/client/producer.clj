@@ -40,17 +40,31 @@
 
 (declare open-stream! apply!)
 
+(defn- complete-drained-if-done!
+  "Lets close! return once closed and every result has been delivered: a future
+  is out of `futures` before it completes, and completing it runs what the
+  application chained on it. Called with the lock held."
+  [{:keys [closed completing ^HashMap futures ^CompletableFuture drained]}]
+  (when (and @closed (.isEmpty futures) (zero? (long @completing)))
+    (.complete drained nil)))
+
 (defn- perform!
   "Carries out actions. Called with the lock held; results reach the
   application after it is released, through `after`."
-  [{:keys [lock scheduler backoff requests fatal ^HashMap futures] :as producer}
+  [{:keys [lock scheduler backoff requests fatal completing ^HashMap futures] :as producer}
    ^List actions ^ArrayList after]
   (doseq [^ProduceAction action actions]
     (case (.name (.getKindCase action))
       "TRANSMIT" (stream/transmit! @requests (.getTransmit action))
       "COMPLETED" (let [result (.getResult (.getCompleted action))]
                     (when-let [future (.remove futures (.getSeq result))]
-                      (.add after #(complete! future result))))
+                      (vswap! completing inc)
+                      (.add after #(try
+                                     (complete! future result)
+                                     (finally
+                                       (locking lock
+                                         (vswap! completing dec)
+                                         (complete-drained-if-done! producer)))))))
       "OPEN_STREAM" (stream/schedule! scheduler
                                       (stream/next-delay-ms! backoff)
                                       #(locking lock (open-stream! producer)))
@@ -62,8 +76,7 @@
 (defn- apply!
   "Applies an event that came from the stream of `from-generation`, or from the
   application (-1)."
-  [{:keys [lock ^ProduceCore core backoff requests generation closed
-           ^HashMap futures ^CompletableFuture drained]
+  [{:keys [lock ^ProduceCore core backoff requests generation closed]
     :as producer}
    ^ProduceEvent event from-generation]
   (let [after (ArrayList.)]
@@ -77,8 +90,7 @@
         (when (and (.hasReceived event) (.hasReady (.getReceived event)))
           (stream/reset-backoff! backoff))
         (perform! producer (.handle core event) after)
-        (when (and @closed (.isEmpty futures))
-          (.complete drained nil))
+        (complete-drained-if-done! producer)
         (.notifyAll ^Object lock)))
     (doseq [f after]
       (f))))
@@ -119,6 +131,8 @@
                   ;; seq -> the future of the record it was assigned to.
                   :futures (HashMap.)
                   :drained (CompletableFuture.)
+                  ;; Futures out of :futures whose completion has not yet run.
+                  :completing (volatile! 0)
                   :requests (volatile! nil)
                   :generation (volatile! 0)
                   :closed (volatile! false)
@@ -180,7 +194,8 @@
 
 (defn close!
   "Stops taking records, waits up to a minute for the results of those already
-  sent, and ends the stream. Records still unanswered then stay with the
+  sent, and ends the stream. A result counts once its future has completed,
+  with what was chained on it run. Records still unanswered then stay with the
   server; their futures do not complete."
   [{:keys [lock requests generation shut-down ^CompletableFuture drained] :as producer}]
   (apply! producer close-event -1)

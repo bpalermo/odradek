@@ -43,6 +43,10 @@ public final class Producer implements AutoCloseable {
   private final Map<Long, CompletableFuture<SendResult>> futures = new HashMap<>();
   private final Backoff backoff = new Backoff();
   private final CompletableFuture<Void> drained = new CompletableFuture<>();
+
+  /** Futures taken out of {@link #futures} whose completion has not yet run. */
+  private int completing;
+
   private StreamObserver<ProduceRequest> requests;
   private long generation;
   private boolean closed;
@@ -127,7 +131,8 @@ public final class Producer implements AutoCloseable {
 
   /**
    * Stops taking records, waits up to a minute for the results of those already sent, and ends the
-   * stream. Records still unanswered then stay with the server; their futures do not complete.
+   * stream. A result counts once its future has completed, with what was chained on it run. Records
+   * still unanswered then stay with the server; their futures do not complete.
    */
   @Override
   public void close() {
@@ -172,9 +177,7 @@ public final class Producer implements AutoCloseable {
         backoff.reset();
       }
       perform(core.handle(event), after);
-      if (closed && futures.isEmpty()) {
-        drained.complete(null);
-      }
+      completeDrainedIfDone();
       lock.notifyAll();
     }
     after.forEach(Runnable::run);
@@ -193,7 +196,18 @@ public final class Producer implements AutoCloseable {
           ProduceResult result = action.getCompleted().getResult();
           CompletableFuture<SendResult> future = futures.remove(result.getSeq());
           if (future != null) {
-            after.add(() -> complete(future, result));
+            completing++;
+            after.add(
+                () -> {
+                  try {
+                    complete(future, result);
+                  } finally {
+                    synchronized (lock) {
+                      completing--;
+                      completeDrainedIfDone();
+                    }
+                  }
+                });
           }
         }
         case OPEN_STREAM ->
@@ -216,6 +230,17 @@ public final class Producer implements AutoCloseable {
                     .withDescription(action.getFatal().getMessage());
         case ACCEPTED, REJECTED, KIND_NOT_SET -> {}
       }
+    }
+  }
+
+  /**
+   * Lets {@link #close} return once closed and every result has been delivered: a future is out of
+   * {@link #futures} before it completes, and completing it runs what the app chained on it, which
+   * close() promises has happened by the time it returns. Called with the lock held.
+   */
+  private void completeDrainedIfDone() {
+    if (closed && futures.isEmpty() && completing == 0) {
+      drained.complete(null);
     }
   }
 
