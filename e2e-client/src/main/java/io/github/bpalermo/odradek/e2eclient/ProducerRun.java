@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -15,6 +16,11 @@ import java.util.concurrent.TimeoutException;
  * Producer mode: records at a set rate, or a schedule of rates, over a set of keys, round robin. A
  * record is sent only once the previous record of its key has its outcome, which is what Odradek's
  * ordering covers: a key's records reach Kafka in order however the stream breaks and resumes.
+ *
+ * <p>Each process goes round its keys in an order of its own, drawn from its origin. Processes that
+ * share a topic and a schedule start send in step, and in one order they would send the same key at
+ * the same instant: a consumer that keeps a key's records in order would then hold every process's
+ * record but the first behind it, which is the test's doing and not traffic's.
  */
 public final class ProducerRun extends Run {
   private final ProducerLedger ledger;
@@ -48,6 +54,7 @@ public final class ProducerRun extends Run {
       keys[k] = "key-" + k;
       nextSeq[k] = 1;
     }
+    int[] order = keyOrder(settings.origin(), keyCount);
     // The schedule steps without a restart, on time elapsed since its start: now, or the instant
     // every process was given, placed on this process's monotonic clock. Before that instant the
     // first record waits for it; after it, this process joins at the step in force.
@@ -81,7 +88,7 @@ public final class ProducerRun extends Run {
         if (!waitUntil(start + due)) {
           break;
         }
-        int k = (int) (i % keyCount);
+        int k = order[(int) (i % keyCount)];
         if (!awaitOutcome(pending.get(k))) {
           break;
         }
@@ -115,6 +122,16 @@ public final class ProducerRun extends Run {
     // close() waited for the results of what was sent; what has none now may or may not be written.
     ledger.unanswered();
     state(stopping() ? "stopped" : "done");
+  }
+
+  /** The order in which {@code origin} goes round {@code keyCount} keys: one of its own, always. */
+  static int[] keyOrder(String origin, int keyCount) {
+    List<Integer> order = new ArrayList<>(keyCount);
+    for (int k = 0; k < keyCount; k++) {
+      order.add(k);
+    }
+    Collections.shuffle(order, new Random(origin.hashCode()));
+    return order.stream().mapToInt(Integer::intValue).toArray();
   }
 
   private Transport.Outcome outcome(
