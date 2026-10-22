@@ -304,7 +304,9 @@ public final class ServerMetrics {
         duration(
             "odradek.dispatch.loop.wait",
             "How long each wait of a group's thread in its consumer's poll lasted, having nothing"
-                + " queued: until records arrived, a command was queued, or something was due.");
+                + " queued: until records arrived, a command was queued, or something was due."
+                + " The whole call, rebalance callbacks included: a hand-over makes it longer"
+                + " than the 100 ms the poll is asked to wait at most.");
     receiveHandoffDuration =
         duration(
             "odradek.receive.handoff.duration",
