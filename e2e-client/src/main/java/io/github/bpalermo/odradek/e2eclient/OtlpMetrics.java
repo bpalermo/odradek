@@ -210,6 +210,11 @@ public final class OtlpMetrics implements Metrics {
             .put(AttributeKey.stringKey("service.name"), "odradek-e2e-client")
             .put(AttributeKey.stringKey("service.instance.id"), origin);
     fromEnvironment.forEach((k, v) -> resource.put(AttributeKey.stringKey(k), v));
+    // A blank one is unset, as on the server: otherwise every pod given it would share it.
+    String instance = fromEnvironment.get("service.instance.id");
+    if (instance == null || instance.isBlank()) {
+      resource.put(AttributeKey.stringKey("service.instance.id"), origin);
+    }
     if (serviceName != null && !serviceName.isBlank()) {
       resource.put(AttributeKey.stringKey("service.name"), serviceName.strip());
     }

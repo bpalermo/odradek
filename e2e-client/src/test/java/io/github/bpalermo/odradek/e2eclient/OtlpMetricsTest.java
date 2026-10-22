@@ -92,6 +92,13 @@ class OtlpMetricsTest {
             OtlpMetrics.resource(null, Map.of("service.instance.id", "set"), "lane-a-0-1f2e3d4c")
                 .get(id))
         .isEqualTo("set");
+    // Blank is unset: the origin stays, or every pod given the same blank would share it.
+    for (String blank : new String[] {"", "  "}) {
+      assertThat(
+              OtlpMetrics.resource(null, Map.of("service.instance.id", blank), "lane-a-0-1f2e3d4c")
+                  .get(id))
+          .isEqualTo("lane-a-0-1f2e3d4c");
+    }
   }
 
   @Test
