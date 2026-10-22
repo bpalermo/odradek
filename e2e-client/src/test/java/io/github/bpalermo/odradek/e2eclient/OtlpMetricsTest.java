@@ -15,7 +15,7 @@ import org.junit.jupiter.api.Test;
 class OtlpMetricsTest {
   @Test
   void withoutAnEndpointNothingIsExported() {
-    Metrics metrics = OtlpMetrics.create(Map.of(), "a", "kafka");
+    Metrics metrics = OtlpMetrics.create(Map.of(), "a", "kafka", "pod-0-abc");
 
     assertThat(metrics).isNotInstanceOf(OtlpMetrics.class);
     metrics.produceLatency(1);
@@ -30,7 +30,8 @@ class OtlpMetricsTest {
                 "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317",
                 "OTEL_RESOURCE_ATTRIBUTES", "k8s.pod.name=lane-a-0"),
             "a",
-            "kafka");
+            "kafka",
+            "o");
     try {
       assertThat(metrics).isInstanceOf(OtlpMetrics.class);
       metrics.produceLatency(1.5);
@@ -74,12 +75,30 @@ class OtlpMetricsTest {
     Map<String, String> attributes =
         OtlpMetrics.resourceAttributes("service.name=from-attributes,k8s.pod.name=lane-a-0");
 
-    assertThat(OtlpMetrics.resource(null, Map.of()).get(name)).isEqualTo("odradek-e2e-client");
-    assertThat(OtlpMetrics.resource(null, attributes).get(name)).isEqualTo("from-attributes");
-    assertThat(OtlpMetrics.resource(" ", attributes).get(name)).isEqualTo("from-attributes");
-    Attributes both = OtlpMetrics.resource("from-variable", attributes);
+    assertThat(OtlpMetrics.resource(null, Map.of(), "o").get(name)).isEqualTo("odradek-e2e-client");
+    assertThat(OtlpMetrics.resource(null, attributes, "o").get(name)).isEqualTo("from-attributes");
+    assertThat(OtlpMetrics.resource(" ", attributes, "o").get(name)).isEqualTo("from-attributes");
+    Attributes both = OtlpMetrics.resource("from-variable", attributes, "o");
     assertThat(both.get(name)).isEqualTo("from-variable");
     assertThat(both.get(AttributeKey.stringKey("k8s.pod.name"))).isEqualTo("lane-a-0");
+  }
+
+  @Test
+  void eachProcessIsItsOwnServiceInstanceUnlessTheEnvironmentNamesOne() {
+    AttributeKey<String> id = AttributeKey.stringKey("service.instance.id");
+    assertThat(OtlpMetrics.resource(null, Map.of(), "lane-a-0-1f2e3d4c").get(id))
+        .isEqualTo("lane-a-0-1f2e3d4c");
+    assertThat(
+            OtlpMetrics.resource(null, Map.of("service.instance.id", "set"), "lane-a-0-1f2e3d4c")
+                .get(id))
+        .isEqualTo("set");
+    // Blank is unset: the origin stays, or every pod given the same blank would share it.
+    for (String blank : new String[] {"", "  "}) {
+      assertThat(
+              OtlpMetrics.resource(null, Map.of("service.instance.id", blank), "lane-a-0-1f2e3d4c")
+                  .get(id))
+          .isEqualTo("lane-a-0-1f2e3d4c");
+    }
   }
 
   @Test
@@ -91,12 +110,13 @@ class OtlpMetricsTest {
                         "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318",
                         "OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
                     "a",
-                    "kafka"))
+                    "kafka",
+                    "o"))
         .hasMessageContaining("must be grpc");
     assertThatThrownBy(
             () ->
                 OtlpMetrics.create(
-                    Map.of("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"), "a", "kafka"))
+                    Map.of("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"), "a", "kafka", "o"))
         .hasMessageContaining("http://host:port");
     assertThatThrownBy(
             () ->
@@ -105,7 +125,8 @@ class OtlpMetricsTest {
                         "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317",
                         "OTEL_METRIC_EXPORT_INTERVAL", "soon"),
                     "a",
-                    "kafka"))
+                    "kafka",
+                    "o"))
         .hasMessageContaining("OTEL_METRIC_EXPORT_INTERVAL");
   }
 

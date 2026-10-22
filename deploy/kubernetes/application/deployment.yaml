@@ -53,7 +53,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: k8s.pod.name=$(POD_NAME)
+              value: k8s.pod.name=$(POD_NAME),service.instance.id=$(POD_NAME)
           ports:
             - name: health
               containerPort: 9464

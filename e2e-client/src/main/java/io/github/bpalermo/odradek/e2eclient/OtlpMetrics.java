@@ -135,7 +135,8 @@ public final class OtlpMetrics implements Metrics {
    * @throws IllegalArgumentException if a variable is malformed, or asks for a protocol other than
    *     gRPC
    */
-  public static Metrics create(Map<String, String> env, String lane, String transport) {
+  public static Metrics create(
+      Map<String, String> env, String lane, String transport, String origin) {
     String address = env.getOrDefault(METRICS_ENDPOINT, env.getOrDefault(ENDPOINT, "")).trim();
     if (address.isEmpty()) {
       return Metrics.none();
@@ -179,7 +180,7 @@ public final class OtlpMetrics implements Metrics {
     }
     ManagedChannel channel = builder.build();
 
-    Attributes resource = resource(env.get(SERVICE_NAME), fromEnvironment);
+    Attributes resource = resource(env.get(SERVICE_NAME), fromEnvironment, origin);
     @SuppressWarnings("deprecation") // setChannel is how the exporter is given our own channel.
     OtlpGrpcMetricExporter exporter = OtlpGrpcMetricExporter.builder().setChannel(channel).build();
     SdkMeterProvider provider =
@@ -194,14 +195,26 @@ public final class OtlpMetrics implements Metrics {
   /**
    * The resource's attributes, as the SDKs make them: {@code service.name} is {@code
    * odradek-e2e-client}, unless {@code OTEL_RESOURCE_ATTRIBUTES} sets it, unless {@code
-   * OTEL_SERVICE_NAME} does, which wins.
+   * OTEL_SERVICE_NAME} does, which wins. {@code service.instance.id} is the process's origin unless
+   * {@code OTEL_RESOURCE_ATTRIBUTES} sets it: every pod needs its own, since the translation to
+   * Prometheus makes it the {@code instance} label, and pods without one export the same series,
+   * whose cumulative values then overwrite each other.
    *
    * @param serviceName the value of {@code OTEL_SERVICE_NAME}; null or blank when unset
+   * @param origin this process, as written into its records
    */
-  static Attributes resource(String serviceName, Map<String, String> fromEnvironment) {
+  static Attributes resource(
+      String serviceName, Map<String, String> fromEnvironment, String origin) {
     AttributesBuilder resource =
-        Attributes.builder().put(AttributeKey.stringKey("service.name"), "odradek-e2e-client");
+        Attributes.builder()
+            .put(AttributeKey.stringKey("service.name"), "odradek-e2e-client")
+            .put(AttributeKey.stringKey("service.instance.id"), origin);
     fromEnvironment.forEach((k, v) -> resource.put(AttributeKey.stringKey(k), v));
+    // A blank one is unset, as on the server: otherwise every pod given it would share it.
+    String instance = fromEnvironment.get("service.instance.id");
+    if (instance == null || instance.isBlank()) {
+      resource.put(AttributeKey.stringKey("service.instance.id"), origin);
+    }
     if (serviceName != null && !serviceName.isBlank()) {
       resource.put(AttributeKey.stringKey("service.name"), serviceName.strip());
     }
