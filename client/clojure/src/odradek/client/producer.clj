@@ -198,9 +198,11 @@
 
 (defn close!
   "Stops taking records, waits up to a minute for the results of those already
-  sent, and ends the stream. A result counts once its future has completed,
-  with what was chained on it run. Records still unanswered then stay with the
-  server; their futures do not complete.
+  sent, and ends the stream. A result counts once its future has completed, and
+  what was chained on it has run on the thread that completed it. What runs
+  elsewhere is the app's to wait for: async stages, and a callback that another
+  thread waiting on the same future happens to run instead. Records still
+  unanswered then stay with the server; their futures do not complete.
 
   Called from what was chained on a future, it does not wait for completions
   on its own thread, which cannot run until it returns."
