@@ -42,14 +42,15 @@ public final class Producer implements AutoCloseable {
   private final ProduceCore core;
   private final Map<Long, CompletableFuture<SendResult>> futures = new HashMap<>();
   private final Backoff backoff = new Backoff();
-  private final CompletableFuture<Void> drained = new CompletableFuture<>();
 
-  /** Futures taken out of {@link #futures} whose completion has not yet run. */
-  private int completing;
+  /**
+   * Futures taken out of {@link #futures} whose completion has not yet run, by the thread that will
+   * run it.
+   */
+  private final Map<Thread, Integer> completing = new HashMap<>();
 
   private StreamObserver<ProduceRequest> requests;
   private long generation;
-  private boolean closed;
   private boolean shutDown;
   private Status fatal;
 
@@ -133,18 +134,27 @@ public final class Producer implements AutoCloseable {
    * Stops taking records, waits up to a minute for the results of those already sent, and ends the
    * stream. A result counts once its future has completed, with what was chained on it run. Records
    * still unanswered then stay with the server; their futures do not complete.
+   *
+   * <p>Called from what was chained on a future, it does not wait for completions on its own
+   * thread, which cannot run until it returns.
    */
   @Override
   public void close() {
     apply(ProduceEvent.newBuilder().setClose(Close.getDefaultInstance()).build(), -1);
-    try {
-      drained.get(60, TimeUnit.SECONDS);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
-      // Nothing more to wait for.
-    }
     synchronized (lock) {
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+      while (!drained()) {
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0) {
+          break;
+        }
+        try {
+          TimeUnit.NANOSECONDS.timedWait(lock, remaining);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+      }
       shutDown = true;
       generation++;
       if (requests != null) {
@@ -167,9 +177,6 @@ public final class Producer implements AutoCloseable {
         // An event of a stream that has since been replaced.
         return;
       }
-      if (event.hasClose()) {
-        closed = true;
-      }
       if (event.hasStreamEnded()) {
         requests = null;
       }
@@ -177,7 +184,6 @@ public final class Producer implements AutoCloseable {
         backoff.reset();
       }
       perform(core.handle(event), after);
-      completeDrainedIfDone();
       lock.notifyAll();
     }
     after.forEach(Runnable::run);
@@ -196,15 +202,17 @@ public final class Producer implements AutoCloseable {
           ProduceResult result = action.getCompleted().getResult();
           CompletableFuture<SendResult> future = futures.remove(result.getSeq());
           if (future != null) {
-            completing++;
+            // The thread that performs the actions runs what they leave in after.
+            Thread thread = Thread.currentThread();
+            completing.merge(thread, 1, Integer::sum);
             after.add(
                 () -> {
                   try {
                     complete(future, result);
                   } finally {
                     synchronized (lock) {
-                      completing--;
-                      completeDrainedIfDone();
+                      completing.computeIfPresent(thread, (t, n) -> n == 1 ? null : n - 1);
+                      lock.notifyAll();
                     }
                   }
                 });
@@ -234,14 +242,14 @@ public final class Producer implements AutoCloseable {
   }
 
   /**
-   * Lets {@link #close} return once closed and every result has been delivered: a future is out of
-   * {@link #futures} before it completes, and completing it runs what the app chained on it, which
-   * close() promises has happened by the time it returns. Called with the lock held.
+   * Whether every result has been delivered: a future is out of {@link #futures} before it
+   * completes, and completing it runs what the app chained on it, which close() promises has
+   * happened by the time it returns. Completions on the calling thread are not waited for. Called
+   * with the lock held.
    */
-  private void completeDrainedIfDone() {
-    if (closed && futures.isEmpty() && completing == 0) {
-      drained.complete(null);
-    }
+  private boolean drained() {
+    Thread self = Thread.currentThread();
+    return futures.isEmpty() && completing.keySet().stream().allMatch(self::equals);
   }
 
   private static void complete(CompletableFuture<SendResult> future, ProduceResult result) {

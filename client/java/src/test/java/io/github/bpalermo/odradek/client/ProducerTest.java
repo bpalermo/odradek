@@ -12,9 +12,11 @@ import io.grpc.Server;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.stub.StreamObserver;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -103,5 +105,26 @@ class ProducerTest {
     service.answer.countDown();
     producer.close();
     assertThat(answered).isTrue();
+  }
+
+  @Test
+  void closeCalledFromWhatWasChainedOnTheLastResultReturnsAtOnce() throws Exception {
+    Producer producer = client.producer();
+    CountDownLatch closed = new CountDownLatch(1);
+    AtomicLong tookNanos = new AtomicLong();
+    producer
+        .send(OutgoingRecord.to("t").key("k").value(new byte[] {1}))
+        .whenComplete(
+            (result, error) -> {
+              // Close after the last ack: this completion is on the stack, and close() must not
+              // wait for it.
+              long begun = System.nanoTime();
+              producer.close();
+              tookNanos.set(System.nanoTime() - begun);
+              closed.countDown();
+            });
+    service.answer.countDown();
+    assertThat(closed.await(30, TimeUnit.SECONDS)).isTrue();
+    assertThat(Duration.ofNanos(tookNanos.get())).isLessThan(Duration.ofSeconds(2));
   }
 }

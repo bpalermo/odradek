@@ -265,6 +265,28 @@
       (finally
         (kill-server! server)))))
 
+(deftest close-called-from-what-was-chained-on-the-last-result-returns-at-once
+  (let [answer (promise)
+        server (start-server {:produce (produce-handler
+                                        {:epoch "e1" :window 10 :log (atom [])
+                                         :answer (fn [record] @answer (written record))})})]
+    (try
+      (with-open [conn (odradek/connect *socket*)]
+        (let [producer (odradek/producer conn)
+              took-ms (promise)]
+          (.whenComplete ^CompletableFuture (odradek/send! producer {:topic "t" :value "v"})
+                         (reify BiConsumer
+                           (accept [_ _ _]
+                             ;; Close after the last ack: this completion is on the
+                             ;; stack, and close! must not wait for it.
+                             (let [begun (System/nanoTime)]
+                               (odradek/close! producer)
+                               (deliver took-ms (quot (- (System/nanoTime) begun) 1000000))))))
+          (deliver answer true)
+          (is (< (long (deref took-ms timeout-ms Long/MAX_VALUE)) 2000))))
+      (finally
+        (kill-server! server)))))
+
 (deftest unanswered-record-is-resent-to-the-same-server-epoch
   (let [first-log (atom [])
         second-log (atom [])
