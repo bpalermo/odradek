@@ -25,16 +25,18 @@ We will let a sidecar hand back, without using an attempt, records it holds that
 
 ### The protocol
 
-- `DeliverRequest` gains a `Return` message: a partition and the offsets, on this stream, of records the sidecar is giving back unread. A sidecar returns only records it has not written to the application's stream.
+- `DeliverRequest` gains a `Return` message: a partition and, for each record the sidecar is giving back unread, its offset and the attempt number it was delivered with. A sidecar returns only records it has not written to the application's stream, and each delivery at most once.
+- **Which delivery a return is for.** Offset and stream alone do not say: a replica sends a record again to the same stream when that stream is the only one with credit, and a return of the first copy that arrives late would then match the second, which the application may already have. The attempt number does say. On one stream a record is sent again under the *same* attempt only in answer to that stream's own return (or after the stream ended), and the stream's messages arrive in order, so that return has been handled before the new copy exists. A copy sent again after a missed deadline carries the next attempt. So a return counts only when the stream holds the record in flight under the attempt it names.
 - The dispatcher treats a returned record as it treats the records of a receiver that left: it is sent again at once, under the same attempt number, with no wait. It avoids the returning stream for that send when another receiver has credit. It counts the record under `odradek.dispatch.redeliveries` with `reason` `returned`, a new value, not a failed attempt.
 - A returned record does not give back its credit, as `Credits` already says of a record that is released or delivered again elsewhere. That is what keeps a stuck pod from attracting records: its streams have spent their credit on the records it returned, and a stalled sidecar grants no new credit.
-- A return for a record the stream does not hold, or holds after its deadline has already passed, is ignored. A late return changes nothing: the miss was counted when the deadline passed.
+- **A late return** (the stream holds the record past its deadline, or under another attempt) gives back nothing. The miss was counted when the deadline passed, and a newer copy on the same stream stays where it is. What it does do is forget the expired copy: the stream no longer holds it, so it stops counting towards the stream's load and its acknowledgement is no longer awaited from there, as a late rejection does today. A return for a record the stream does not hold is ignored.
+- **The deadline a return is measured against.** The sidecar knows its own application's deadline, but the replica applies the deadline of the declaration it accepted last, and a record keeps the one it was sent under. During a rollout that changes it the two differ. So each `RecordBatch` carries the deadline its records were sent under, and the sidecar measures the half-deadline rule against that. A replica starts a new batch when the deadline changes.
 - **Compatibility.** `Accepted` gains a field by which a dispatcher says it understands `Return`. A sidecar sends `Return` only on a stream whose `Accepted` said so. With an older dispatcher it keeps today's behaviour, and an older sidecar never sends one.
 
 ### When a sidecar returns
 
 - **When its application stalls.** The sidecar already notices when the application has held a record longer than its processing deadline (it then grants no more credit). At that moment it returns every record it holds that the application has not taken, on every stream.
-- **When a record has waited too long.** It returns a record that has waited in the sidecar for half its processing deadline without the application taking it, stalled or not. A record that has waited that long would leave the application less than half of the deadline it asked for.
+- **When a record has waited too long.** It returns a record that has waited in the sidecar for half the processing deadline it was sent under (the one its batch carries) without the application taking it, stalled or not. A record that has waited that long would leave the application less than half of the deadline it asked for.
 - It never returns a record it has written to the application's stream. Whatever the application has received is acknowledged or misses its deadline as today, and that miss still counts.
 
 ## Consequences
@@ -49,11 +51,11 @@ The protocol grows a message and a capability field, and the dispatcher core gro
 
 Work that follows from this record, in one change:
 
-- `api/odradek/delivery/v1/delivery.proto`: `Return`, and the capability on `Accepted`.
+- `api/odradek/delivery/v1/delivery.proto`: `Return` with an offset and an attempt per record, the capability on `Accepted`, and the deadline on `RecordBatch`.
 - `server/dispatch`: handle `Return` in `DispatchCore`, with the `returned` reason.
 - `server/receive`: return on stall and after half the deadline in `ReceiveSession`; the credit rules in `CreditSplit` stay as they are.
 - `docs/design.md`: the credit split, "What a receiving sidecar does", the dispatch core, Redelivery, limits and dead letters, and the metrics table (`returned` on `odradek.dispatch.redeliveries`, and a new `odradek.receive.returned` counter on the sidecar).
-- Tests: a dispatcher core test that a returned record is resent at once under the same attempt and avoids the returning stream; a receive test that a stalled session returns what it holds and nothing it handed on; an end-to-end test with three replicas and one stuck pod in which no other record uses an attempt.
+- Tests: a dispatcher core test that a returned record is resent at once under the same attempt and avoids the returning stream; that a late return of a copy that missed its deadline, after the record was sent again to the same stream, leaves the new copy alone and forgets the old one; a receive test that a stalled session returns what it holds and nothing it handed on, and that the half-deadline rule follows the deadline a batch carries; an end-to-end test with three replicas and one stuck pod in which no other record uses an attempt.
 - The in-cluster scenario G, run again: deadline redeliveries equal to the deliberate failures, and no dead letter of a key the application does not fail.
 
 Two alternatives were set aside:
