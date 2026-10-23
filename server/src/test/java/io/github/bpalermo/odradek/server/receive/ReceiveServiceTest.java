@@ -94,6 +94,9 @@ class ReceiveServiceTest {
   /** The list every replica answers a declaration with. */
   private volatile ReplicaList listed = ReplicaList.getDefaultInstance();
 
+  /** How far the sessions' clock is ahead of the real one: a jump that wakes no timer. */
+  private final AtomicLong ahead = new AtomicLong();
+
   // -------------------------------------------------------------------------------------------
   // A scripted replica
   // -------------------------------------------------------------------------------------------
@@ -521,7 +524,7 @@ class ReceiveServiceTest {
                 service,
                 "1.2.3",
                 Duration.ofSeconds(2),
-                System::nanoTime,
+                () -> System.nanoTime() + ahead.get(),
                 // The shortest delays: 50 ms, 100 ms, 200 ms and so on.
                 () -> new Backoff(bound -> 0)),
             metrics,
@@ -1644,6 +1647,27 @@ class ReceiveServiceTest {
     assertThat(waited).isBetween(900L, 1800L);
     app.ack("orders", 0, epoch, 0, 0);
     assertThat(range(streams[0].ack())).isEqualTo(List.of(0, 0L, 0L));
+  }
+
+  @Test
+  void aRecordPastHalfItsDeadlineIsGivenBackEvenWhenTheAppHasCreditForIt() throws Exception {
+    start(config());
+    App app = app();
+    app.subscribe(60_000, "orders");
+    assertThat(app.next().hasSubscribed()).isTrue();
+    Stream[] streams = twoReplicasOneCredit(app, true);
+    streams[0].records(0, 0, "a");
+    long epoch = app.assigned().getAssignmentEpoch();
+    app.batch();
+    streams[1].records(1, 9, "b");
+    app.ack("orders", 0, epoch, 0, 0);
+    assertThat(range(streams[0].ack())).isEqualTo(List.of(0, 0L, 0L));
+    // Half of b's deadline passes before the session looks again, which credit makes it do: b
+    // would reach the app close to its deadline, and is given back instead.
+    ahead.addAndGet(TimeUnit.SECONDS.toNanos(31));
+    app.credits(1);
+    assertThat(streams[1].returned().getRecords(0).getOffset()).isEqualTo(9L);
+    app.nothing();
   }
 
   @Test

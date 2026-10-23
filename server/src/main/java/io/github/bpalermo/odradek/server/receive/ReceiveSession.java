@@ -550,6 +550,8 @@ final class ReceiveSession implements AppStream {
 
   /** Hands the app what its credit allows, then grants the dispatcher what the app can take. */
   private void pump(long now) {
+    // First what waited too long to be handed now: the app would take it close to its deadline.
+    giveBack(now, false);
     while (!pending.isEmpty() && split.appCredit() > 0) {
       Pending first = pending.peekFirst();
       Topic topic = first.link().topic;
@@ -621,8 +623,8 @@ final class ReceiveSession implements AppStream {
         LOG.info("the app of group {} acknowledges again: granting credit again", group);
       }
     }
-    giveBack(now);
     if (stalled) {
+      giveBack(now, true);
       return;
     }
     // One stream per topic and listed replica; while no list is known, one per topic.
@@ -642,14 +644,14 @@ final class ReceiveSession implements AppStream {
 
   /**
    * Gives back to their replicas, without using an attempt, the records waiting here that the app
-   * cannot take in time (ADR 7): all of them while the app holds a record past its deadline, and
-   * otherwise those that have waited half of the deadline they were sent under. Their deadline runs
-   * at the replica from when it sent them, so behind an app that is stuck they would miss it, and
-   * use an attempt, without the app ever seeing them. Elsewhere they are delivered at once. Only to
-   * replicas that said they understand it; the credit the records used is not given back, so a
-   * stuck app is not sent more.
+   * cannot take in time (ADR 7): those that have waited half of the deadline they were sent under,
+   * and with {@code everything}, when the app holds a record past its deadline, all of them. Their
+   * deadline runs at the replica from when it sent them, so behind an app that is stuck they would
+   * miss it, and use an attempt, without the app ever seeing them. Elsewhere they are delivered at
+   * once. Only to replicas that said they understand it; the credit the records used is not given
+   * back, so a stuck app is not sent more.
    */
-  private void giveBack(long now) {
+  private void giveBack(long now, boolean everything) {
     if (pending.isEmpty()) {
       return;
     }
@@ -661,7 +663,7 @@ final class ReceiveSession implements AppStream {
       Link link = waiting.link();
       if (!link.acceptsReturn
           || link.closed
-          || (!stalled && now - waiting.arrivedNanos() < waiting.giveBackNanos())) {
+          || (!everything && now - waiting.arrivedNanos() < waiting.giveBackNanos())) {
         continue;
       }
       all.remove();
@@ -698,7 +700,7 @@ final class ReceiveSession implements AppStream {
                 "{} record(s) of topic {} given back to the dispatcher unread: the app {}",
                 topic.returns,
                 topic.name,
-                stalled
+                everything
                     ? "has held a record past its processing deadline"
                     : "had not taken them within half the deadline they were sent under");
             topic.returns = 0;

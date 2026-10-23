@@ -1020,8 +1020,11 @@ class ReplicasE2eTest {
     ServerHarness.createTopic(ServerHarness.KAFKA_A, deadLetters, 1);
     try {
       replicas(3);
-      deadLettering(deadLetters, 120_000, false);
-      App stuck = deadLettering(deadLetters, 2_000, true);
+      // One deadline for both: the replicas send under the one declared last, whichever app that
+      // is. Long enough for the other app to answer on a slow machine.
+      int deadline = 5_000;
+      deadLettering(deadLetters, deadline, false);
+      App stuck = deadLettering(deadLetters, deadline, true);
       awaitMembers(3);
 
       List<String> produced = new ArrayList<>();
@@ -1031,7 +1034,7 @@ class ReplicasE2eTest {
         Thread.sleep(50);
       }
       // Records keep coming for well past the stuck app's deadline.
-      for (int round = 0; round < 25; round++) {
+      for (int round = 0; round < 50; round++) {
         produced.addAll(produce("b" + round + "-", 1));
         Thread.sleep(200);
       }

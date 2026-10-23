@@ -733,6 +733,49 @@ class DispatchCoreTest {
   }
 
   @Test
+  void aReturnHandledAfterTheDeadlineOfWhatItNamesIsTooLateToKeepTheAttempt() {
+    maxAttempts = 1;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    // The deadline passes, and the return is handled before the time is passed to the core.
+    now += DEADLINE;
+    assertThat(on(new Returned<>("a", 0, given(0))))
+        .containsExactly(new DeadLetter<>(0, 0, "0/0", 1, Cause.DEADLINE, null, 0));
+  }
+
+  @Test
+  void givingBackTheNewCopyLeavesTheExpiredOneOnTheSameStreamAcknowledgeable() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 2);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    assertThat(after(DEADLINE)).containsExactly(deliver("a", 0, 0, 2));
+    // a's app is still on attempt 1, and its sidecar gives attempt 2 back unread.
+    assertThat(on(new Returned<>("a", 0, List.of(new GivenBack(0, 2))))).isEmpty();
+    assertThat(core.inFlight()).isZero();
+    // The app finishes attempt 1: that acknowledgement counts.
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+  }
+
+  @Test
+  void aLateReturnOfTheFirstOfTwoExpiredCopiesLeavesTheSecondAcknowledgeable() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 2);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    assertThat(after(DEADLINE)).containsExactly(deliver("a", 0, 0, 2));
+    // Attempt 2 misses its deadline too, and nobody has credit for attempt 3.
+    assertThat(after(DEADLINE)).isEmpty();
+    // Attempt 1 comes back unread, late; a's app is on attempt 2 and acknowledges it.
+    assertThat(on(new Returned<>("a", 0, List.of(new GivenBack(0, 1))))).isEmpty();
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+  }
+
+  @Test
   void recordsGivenBackNeverExhaustARecord() {
     maxAttempts = 1;
     start(Ordering.NONE);

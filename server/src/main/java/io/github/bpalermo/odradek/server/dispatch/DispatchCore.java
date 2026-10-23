@@ -298,8 +298,11 @@ public final class DispatchCore<R> {
     /** Where the record is in flight. */
     Receiver<R> holder;
 
-    /** Receivers that were sent the record, let its deadline pass, and may still acknowledge. */
-    List<Receiver<R>> former;
+    /**
+     * The deliveries whose deadline passed and whose receiver may still acknowledge them: one per
+     * receiver and attempt, since a receiver sent the record again may hold an older copy too.
+     */
+    List<Copy<R>> former;
 
     /** Where the last attempt failed. */
     Receiver<R> avoid;
@@ -415,6 +418,9 @@ public final class DispatchCore<R> {
       return commit() >= limit;
     }
   }
+
+  /** A delivery that let its deadline pass: to whom, and under which attempt. */
+  private record Copy<R>(Receiver<R> receiver, int attempt) {}
 
   private static final class Receiver<R> {
     final String id;
@@ -541,7 +547,12 @@ public final class DispatchCore<R> {
       case CreditsGranted<R> e -> credits(e);
       case Acknowledged<R> e -> acknowledged(e, out);
       case Rejected<R> e -> rejected(e, out);
-      case Returned<R> e -> givenBack(e);
+      case Returned<R> e -> {
+        // A return handled after the deadline of what it names is too late to keep the attempt:
+        // that delivery has failed, whether or not the time was passed to the core yet.
+        expire(out);
+        givenBack(e);
+      }
       case DeadLetterWritten<R> e -> deadLetterWritten(e, out);
       case DeadLetterFailed<R> e -> deadLetterFailed(e, out);
       case TimePassed<R> _ -> expire(out);
@@ -1048,7 +1059,7 @@ public final class DispatchCore<R> {
     r.credit--;
     r.lastSent = ++sends;
     // A receiver that still holds an expired copy: its answers are ambiguous from now on.
-    rec.resentToFormer = rec.former != null && rec.former.remove(r);
+    rec.resentToFormer = holdsCopy(rec, r);
     if (r.held.computeIfAbsent(p.id, id -> new TreeMap<>()).put(rec.offset, rec) == null) {
       r.load++;
     }
@@ -1137,8 +1148,9 @@ public final class DispatchCore<R> {
       for (Rec<R> rec : records.values()) {
         if (rec.holder == r) {
           returned(rec, Cause.RECEIVER_LEFT);
-        } else {
-          rec.former.remove(r);
+        }
+        if (rec.former != null) {
+          rec.former.removeIf(copy -> copy.receiver() == r);
         }
       }
     }
@@ -1147,9 +1159,9 @@ public final class DispatchCore<R> {
 
   /**
    * A receiver gave records back unread. Each one it holds in flight under the attempt named is
-   * taken back as if it had left, and sent elsewhere when another receiver has credit. One it holds
-   * past its deadline has failed already and is only forgotten by it; if the receiver was sent the
-   * record again since, under the next attempt, that copy stays where it is.
+   * taken back as if it had left, and sent elsewhere when another receiver has credit. A copy it
+   * holds past its deadline has failed already and is only forgotten: whatever other copy of the
+   * record it holds, in flight or expired, it may still acknowledge.
    */
   private void givenBack(Returned<R> e) {
     Receiver<R> r = receivers.get(e.receiver());
@@ -1163,12 +1175,31 @@ public final class DispatchCore<R> {
         continue;
       }
       if (rec.holder == r && rec.attempts == given.attempt()) {
-        unhold(r, rec);
         rec.avoid = r;
         returned(rec, Cause.RETURNED);
-      } else if (rec.former != null && rec.former.remove(r) && rec.holder != r) {
-        unhold(r, rec);
+      } else if (rec.former == null || !rec.former.remove(new Copy<>(r, given.attempt()))) {
+        continue;
       }
+      release(r, rec);
+    }
+  }
+
+  /** Whether the receiver holds an expired copy of the record. */
+  private static <R> boolean holdsCopy(Rec<R> rec, Receiver<R> r) {
+    if (rec.former != null) {
+      for (Copy<R> copy : rec.former) {
+        if (copy.receiver() == r) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /** The receiver no longer holds the record once it holds no copy of it. */
+  private void release(Receiver<R> r, Rec<R> rec) {
+    if (rec.holder != r && !holdsCopy(rec, r)) {
+      unhold(r, rec);
     }
   }
 
@@ -1235,15 +1266,16 @@ public final class DispatchCore<R> {
     if (rec == null) {
       return;
     }
+    // A rejection names no attempt: it ends whatever copies of the record the receiver holds.
     unhold(r, rec);
+    if (rec.former != null) {
+      rec.former.removeIf(copy -> copy.receiver() == r);
+    }
     if (rec.holder == r) {
       answered(rec, false);
       rec.avoid = r;
       failed(
           rec, Cause.REJECTED, e.reason() == null || e.reason().isEmpty() ? null : e.reason(), out);
-    } else {
-      // Given back after its deadline passed: that attempt has failed already.
-      rec.former.remove(r);
     }
   }
 
@@ -1270,7 +1302,7 @@ public final class DispatchCore<R> {
         if (rec.former == null) {
           rec.former = new ArrayList<>(1);
         }
-        rec.former.add(rec.holder);
+        rec.former.add(new Copy<>(rec.holder, rec.attempts));
         rec.avoid = rec.holder;
         failed(rec, Cause.DEADLINE, null, out);
       }
@@ -1452,8 +1484,8 @@ public final class DispatchCore<R> {
       unhold(rec.holder, rec);
     }
     if (rec.former != null) {
-      for (Receiver<R> r : rec.former) {
-        unhold(r, rec);
+      for (Copy<R> copy : rec.former) {
+        unhold(copy.receiver(), rec);
       }
     }
     rec.holder = null;
