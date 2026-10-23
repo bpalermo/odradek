@@ -12,3 +12,4 @@ Decisions that shape Odradek, one per file, in the format described by Michael N
 | [4](0004-one-version-for-server-and-clients.md) | Release the server and all clients under one version | Accepted |
 | [5](0005-graalvm-native-image-for-the-server.md) | Build a GraalVM native image of the server | Accepted |
 | [6](0006-standalone-dispatcher-for-consumption.md) | Consume through a standalone dispatcher that sidecars connect to | Accepted |
+| [7](0007-sidecar-returns-records-its-app-has-not-taken.md) | A sidecar returns records its application has not taken, without using an attempt | Accepted |
