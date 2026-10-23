@@ -1146,9 +1146,10 @@ public final class DispatchCore<R> {
   }
 
   /**
-   * A receiver gave records back unread. Each one it holds in flight is taken back as if it had
-   * left, and sent elsewhere when another receiver has credit; one it holds after the deadline
-   * passed has failed already and is only forgotten by it.
+   * A receiver gave records back unread. Each one it holds in flight under the attempt named is
+   * taken back as if it had left, and sent elsewhere when another receiver has credit. One it holds
+   * past its deadline has failed already and is only forgotten by it; if the receiver was sent the
+   * record again since, under the next attempt, that copy stays where it is.
    */
   private void givenBack(Returned<R> e) {
     Receiver<R> r = receivers.get(e.receiver());
@@ -1156,17 +1157,17 @@ public final class DispatchCore<R> {
     if (held == null) {
       return;
     }
-    for (long offset : e.offsets()) {
-      Rec<R> rec = held.get(offset);
+    for (DispatchEvent.GivenBack given : e.records()) {
+      Rec<R> rec = held.get(given.offset());
       if (rec == null) {
         continue;
       }
-      unhold(r, rec);
-      if (rec.holder == r) {
+      if (rec.holder == r && rec.attempts == given.attempt()) {
+        unhold(r, rec);
         rec.avoid = r;
         returned(rec, Cause.RETURNED);
-      } else {
-        rec.former.remove(r);
+      } else if (rec.former != null && rec.former.remove(r) && rec.holder != r) {
+        unhold(r, rec);
       }
     }
   }

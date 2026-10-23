@@ -17,6 +17,7 @@ import io.github.bpalermo.odradek.delivery.v1.PeerInfo;
 import io.github.bpalermo.odradek.delivery.v1.Record;
 import io.github.bpalermo.odradek.delivery.v1.Reject;
 import io.github.bpalermo.odradek.delivery.v1.Return;
+import io.github.bpalermo.odradek.delivery.v1.ReturnedRecord;
 import io.github.bpalermo.odradek.delivery.v1.Settings;
 import io.github.bpalermo.odradek.kafka.v1.Ack;
 import io.github.bpalermo.odradek.kafka.v1.Assigned;
@@ -255,10 +256,18 @@ final class ReceiveSession implements AppStream {
 
   /**
    * A record received and decoded, waiting for the app to have credit. {@code arrivedNanos} is when
-   * its batch arrived.
+   * its batch arrived; {@code attempt} is the one it was delivered with, and {@code giveBackNanos}
+   * how long it may wait here before it is given back: half the deadline its batch was sent under
+   * (ADR 7).
    */
   private record Pending(
-      Link link, int partition, ConsumedRecord record, boolean undecodable, long arrivedNanos) {}
+      Link link,
+      int partition,
+      ConsumedRecord record,
+      boolean undecodable,
+      long arrivedNanos,
+      int attempt,
+      long giveBackNanos) {}
 
   private final ServerCallStreamObserver<ConsumeResponse> call;
   private final Map<String, Topic> topics = new LinkedHashMap<>();
@@ -496,10 +505,8 @@ final class ReceiveSession implements AppStream {
   private long untilNextTimer(long now) {
     long wait = IDLE_NANOS;
     for (Pending waiting : pending) {
-      // The oldest record that can be given back: the others arrived after it.
       if (waiting.link().acceptsReturn) {
-        wait = Math.min(wait, waiting.arrivedNanos() + maxProcessingNanos / 2 - now);
-        break;
+        wait = Math.min(wait, waiting.arrivedNanos() + waiting.giveBackNanos() - now);
       }
     }
     for (Topic topic : topics.values()) {
@@ -636,29 +643,35 @@ final class ReceiveSession implements AppStream {
   /**
    * Gives back to their replicas, without using an attempt, the records waiting here that the app
    * cannot take in time (ADR 7): all of them while the app holds a record past its deadline, and
-   * otherwise those that have waited half of theirs. Their deadline runs at the replica from when
-   * it sent them, so behind an app that is stuck they would miss it, and use an attempt, without
-   * the app ever seeing them. Elsewhere they are delivered at once. Only to replicas that said they
-   * understand it; the credit the records used is not given back, so a stuck app is not sent more.
+   * otherwise those that have waited half of the deadline they were sent under. Their deadline runs
+   * at the replica from when it sent them, so behind an app that is stuck they would miss it, and
+   * use an attempt, without the app ever seeing them. Elsewhere they are delivered at once. Only to
+   * replicas that said they understand it; the credit the records used is not given back, so a
+   * stuck app is not sent more.
    */
   private void giveBack(long now) {
     if (pending.isEmpty()) {
       return;
     }
-    long half = maxProcessingNanos / 2;
     // Per stream and partition, in the order they arrived.
-    Map<Link, Map<Integer, List<Long>>> back = new LinkedHashMap<>();
+    Map<Link, Map<Integer, List<ReturnedRecord>>> back = new LinkedHashMap<>();
     int count = 0;
     for (Iterator<Pending> all = pending.iterator(); all.hasNext(); ) {
       Pending waiting = all.next();
       Link link = waiting.link();
-      if (!link.acceptsReturn || link.closed || (!stalled && now - waiting.arrivedNanos() < half)) {
+      if (!link.acceptsReturn
+          || link.closed
+          || (!stalled && now - waiting.arrivedNanos() < waiting.giveBackNanos())) {
         continue;
       }
       all.remove();
       back.computeIfAbsent(link, l -> new LinkedHashMap<>())
           .computeIfAbsent(waiting.partition(), p -> new ArrayList<>())
-          .add(waiting.record().getOffset());
+          .add(
+              ReturnedRecord.newBuilder()
+                  .setOffset(waiting.record().getOffset())
+                  .setAttempt(waiting.attempt())
+                  .build());
       count++;
     }
     if (count == 0) {
@@ -668,13 +681,13 @@ final class ReceiveSession implements AppStream {
     back.forEach(
         (link, partitions) -> {
           int records = 0;
-          for (Map.Entry<Integer, List<Long>> partition : partitions.entrySet()) {
+          for (Map.Entry<Integer, List<ReturnedRecord>> partition : partitions.entrySet()) {
             link.send(
                 DeliverRequest.newBuilder()
                     .setReturned(
                         Return.newBuilder()
                             .setPartition(partition.getKey())
-                            .addAllOffsets(partition.getValue())));
+                            .addAllRecords(partition.getValue())));
             records += partition.getValue().size();
           }
           Topic topic = link.topic;
@@ -687,7 +700,7 @@ final class ReceiveSession implements AppStream {
                 topic.name,
                 stalled
                     ? "has held a record past its processing deadline"
-                    : "had not taken them within half their processing deadline");
+                    : "had not taken them within half the deadline they were sent under");
             topic.returns = 0;
             topic.returnLogged = true;
             topic.lastReturnLog = now;
@@ -705,6 +718,13 @@ final class ReceiveSession implements AppStream {
     Topic topic = link.topic;
     split.received(link.id, batch.getRecordsCount());
     topic.metrics.received(batch.getRecordsCount());
+    // The replica's deadline for these records, which is the app's unless another pod declared
+    // another one since; a replica that does not say has no Return either.
+    long giveBack =
+        (batch.getMaxProcessingMs() > 0
+                ? TimeUnit.MILLISECONDS.toNanos(batch.getMaxProcessingMs())
+                : maxProcessingNanos)
+            / 2;
     for (Record record : batch.getRecordsList()) {
       ConsumedRecord.Builder out =
           ConsumedRecord.newBuilder()
@@ -753,7 +773,15 @@ final class ReceiveSession implements AppStream {
         out.setDecodeError(e.getMessage());
         undecodable = true;
       }
-      pending.addLast(new Pending(link, batch.getPartition(), out.build(), undecodable, arrived));
+      pending.addLast(
+          new Pending(
+              link,
+              batch.getPartition(),
+              out.build(),
+              undecodable,
+              arrived,
+              record.getAttempt(),
+              giveBack));
     }
   }
 

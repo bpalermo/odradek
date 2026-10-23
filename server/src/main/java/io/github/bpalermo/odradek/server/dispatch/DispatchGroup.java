@@ -183,7 +183,8 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   record Reject(Stream stream, int partition, long offset, String reason) implements Command {}
 
   /** The sidecar gave records back unread (ADR 7). */
-  record GiveBack(Stream stream, int partition, List<Long> offsets) implements Command {}
+  record GiveBack(Stream stream, int partition, List<DispatchEvent.GivenBack> records)
+      implements Command {}
 
   /**
    * The stream ends: with {@code status} when the dispatcher is to end it, and with null when the
@@ -829,7 +830,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       on(
           topic,
           new DispatchEvent.Returned<>(
-              giveBack.stream().id, giveBack.partition(), giveBack.offsets()));
+              giveBack.stream().id, giveBack.partition(), giveBack.records()));
     }
   }
 
@@ -884,7 +885,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
               && releasing.contains(new TopicPartition(topic.name, deliver.partition()))) {
             sentWhileGivingUp++;
           }
-          topic.batches.deliver(deliver);
+          topic.batches.deliver(deliver, topic.settings.getMaxProcessingMs());
         }
         case Drop<Held> drop -> topic.batches.released(drop);
         case Commit<Held> commit -> {

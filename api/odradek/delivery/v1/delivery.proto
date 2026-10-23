@@ -288,15 +288,28 @@ message Reject {
 //
 // A sidecar returns what it holds unhanded when its application has held a
 // record longer than its processing deadline, and any record that has waited
-// for half of its own. It never returns a record the application was given.
-// Offsets this stream does not hold, or holds after their deadline passed,
-// are ignored: that attempt has failed already. Sent only when the stream's
-// Accepted set accepts_return.
+// for half of the deadline its batch was sent under. It never returns a record
+// the application was given, and returns each delivery at most once.
+//
+// A return counts only for a record this stream holds in flight under the
+// attempt it names: a record sent again to the same stream after a missed
+// deadline carries the next attempt, so a late return of the earlier copy is
+// told apart from it. A late return gives nothing back (that attempt has
+// failed already) and only makes the dispatcher forget the expired copy this
+// stream held. Sent only when the stream's Accepted set accepts_return.
 message Return {
   // Partition of the records.
   int32 partition = 1;
-  // Offsets of the records, each delivered on this stream.
-  repeated int64 offsets = 2;
+  // The records, each as it was delivered on this stream.
+  repeated ReturnedRecord records = 2;
+}
+
+// ReturnedRecord names one delivery given back.
+message ReturnedRecord {
+  // Offset of the record.
+  int64 offset = 1;
+  // The attempt number it was delivered with (Record.attempt).
+  uint32 attempt = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +397,11 @@ message RecordBatch {
   int32 partition = 1;
   // The records, in offset order.
   repeated Record records = 2;
+  // The processing deadline the records were sent under, in milliseconds:
+  // the dispatcher counts a failed attempt for each one not acknowledged
+  // within it. Set by a dispatcher that sets Accepted.accepts_return; a
+  // sidecar gives back a record that has waited half of it (see Return).
+  uint32 max_processing_ms = 3;
 }
 
 // Record is one record as stored in Kafka. The dispatcher applies no codec:

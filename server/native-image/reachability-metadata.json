@@ -926,6 +926,14 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.ReturnedRecord"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.ReturnedRecord$Builder"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.delivery.v1.Settings"
     },
     {

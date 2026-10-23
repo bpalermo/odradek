@@ -40,11 +40,22 @@ class BatchesTest {
         .getRecords()
         .getRecordsList()
         .forEach(record -> records.add(record.getOffset() + "/" + record.getAttempt()));
-    return "p" + response.getRecords().getPartition() + records;
+    return "p"
+        + response.getRecords().getPartition()
+        + records
+        + (response.getRecords().getMaxProcessingMs() == DEADLINE_MS
+            ? ""
+            : " " + response.getRecords().getMaxProcessingMs() + "ms");
   }
 
+  private static final int DEADLINE_MS = 30_000;
+
   private void deliver(String receiver, int partition, long offset, int attempt) {
-    batches.deliver(new Deliver<>(receiver, partition, offset, offset, attempt));
+    deliver(receiver, partition, offset, attempt, DEADLINE_MS);
+  }
+
+  private void deliver(String receiver, int partition, long offset, int attempt, int deadlineMs) {
+    batches.deliver(new Deliver<>(receiver, partition, offset, offset, attempt), deadlineMs);
   }
 
   private void deliver(String receiver, int partition, long offset) {
@@ -60,6 +71,15 @@ class BatchesTest {
     assertThat(sent).containsExactly("a p0[1/1, 2/1]");
     batches.flush();
     assertThat(sent).hasSize(1);
+  }
+
+  @Test
+  void aBatchCarriesTheDeadlineItsRecordsWereSentUnderAndAnotherOneStartsANewBatch() {
+    deliver("a", 0, 1);
+    deliver("a", 0, 2, 1, 2_000);
+    deliver("a", 0, 3, 1, 2_000);
+    batches.flush();
+    assertThat(sent).containsExactly("a p0[1/1]", "a p0[2/1, 3/1] 2000ms");
   }
 
   @Test

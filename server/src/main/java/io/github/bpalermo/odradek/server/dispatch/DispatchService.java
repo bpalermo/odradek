@@ -490,7 +490,9 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
                 new DispatchGroup.GiveBack(
                     stream,
                     request.getReturned().getPartition(),
-                    request.getReturned().getOffsetsList()));
+                    request.getReturned().getRecordsList().stream()
+                        .map(r -> new DispatchEvent.GivenBack(r.getOffset(), r.getAttempt()))
+                        .toList()));
         case DECLARE -> fail(Status.INVALID_ARGUMENT.withDescription("Declare was already sent"));
         case MSG_NOT_SET -> fail(Status.INVALID_ARGUMENT.withDescription("empty DeliverRequest"));
       }
