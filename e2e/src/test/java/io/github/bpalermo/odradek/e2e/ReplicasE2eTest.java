@@ -37,6 +37,7 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -142,8 +143,16 @@ class ReplicasE2eTest {
 
     private final List<Ack> held = new ArrayList<>();
 
+    /** Takes one record and never finishes it: it acknowledges nothing and asks for nothing. */
+    private final boolean stuck;
+
     App(ServerHarness sidecar) {
+      this(sidecar, 120_000, false);
+    }
+
+    App(ServerHarness sidecar, int maxProcessingMs, boolean stuck) {
       this.sidecar = sidecar;
+      this.stuck = stuck;
       requests =
           OdradekServiceGrpc.newStub(sidecar.channel)
               .consume(
@@ -170,7 +179,8 @@ class ReplicasE2eTest {
                   });
       send(
           ConsumeRequest.newBuilder()
-              .setSubscribe(Subscribe.newBuilder().addTopics(topic).setMaxProcessingMs(120_000)));
+              .setSubscribe(
+                  Subscribe.newBuilder().addTopics(topic).setMaxProcessingMs(maxProcessingMs)));
     }
 
     /** Handles each record as it arrives: notes it, acknowledges it, asks for one more. */
@@ -180,6 +190,10 @@ class ReplicasE2eTest {
           return;
         }
         String value = record.getValue().toStringUtf8();
+        if (stuck) {
+          received.add(value);
+          continue;
+        }
         Long committed = lastCommitted.get("" + batch.getPartition());
         if (!handedOnce.add(value) && committed != null && committed > record.getOffset()) {
           handedOutAfterCommit.add(
@@ -248,7 +262,7 @@ class ReplicasE2eTest {
 
     App start() throws Exception {
       subscribed.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
-      send(ConsumeRequest.newBuilder().setCredits(Credits.newBuilder().setRecords(16)));
+      send(ConsumeRequest.newBuilder().setCredits(Credits.newBuilder().setRecords(stuck ? 1 : 16)));
       return this;
     }
 
@@ -431,6 +445,34 @@ class ReplicasE2eTest {
             service.port(), topic, group, ordering);
     sidecars.add(sidecar);
     return new App(sidecar).start();
+  }
+
+  /**
+   * Starts a sidecar whose entry gives a record up after its first failed attempt, to this
+   * dead-letter topic, and its app.
+   */
+  private App deadLettering(String deadLetters, int maxProcessingMs, boolean stuck)
+      throws Exception {
+    ServerHarness sidecar =
+        ServerHarness.start(
+            """
+            listener:
+              socketPath: %s/kafka.sock
+            dispatcher:
+              address: localhost:%s
+            consumers:
+              %s:
+                source: CONSUMER_SOURCE_DISPATCHER
+                cluster: a
+                groupId: %s
+                ordering: ORDERING_KEY
+                maxAttempts: 1
+                onExhausted: ON_EXHAUSTED_DEAD_LETTER
+                deadLetterTopic: %s
+            """,
+            service.port(), topic, group, deadLetters);
+    sidecars.add(sidecar);
+    return new App(sidecar, maxProcessingMs, stuck).start();
   }
 
   private static void await(String what, BooleanSupplier condition) throws InterruptedException {
@@ -966,6 +1008,47 @@ class ReplicasE2eTest {
         .isEqualTo(connections);
     assertThat(one.closed).isNotDone();
     assertThat(two.closed).isNotDone();
+  }
+
+  @Test
+  void anAppStuckOnARecordCostsAnAttemptOfThatRecordAndOfNoOther() throws Exception {
+    // ADR 7. A sidecar holds a spare credit on each replica's stream, so the replicas that did not
+    // send the stuck app its record see its pod as idle and send it theirs. With one attempt each,
+    // a record that waited there past its deadline would be dead-lettered; given back unread, it
+    // goes to the other app with its attempt intact.
+    String deadLetters = topic + "-dead-letters";
+    ServerHarness.createTopic(ServerHarness.KAFKA_A, deadLetters, 1);
+    try {
+      replicas(3);
+      deadLettering(deadLetters, 120_000, false);
+      App stuck = deadLettering(deadLetters, 2_000, true);
+      awaitMembers(3);
+
+      List<String> produced = new ArrayList<>();
+      for (int round = 0; stuck.received.isEmpty(); round++) {
+        assertThat(round).as("rounds until the stuck app is handed a record").isLessThan(400);
+        produced.addAll(produce("a" + round + "-", 1));
+        Thread.sleep(50);
+      }
+      // Records keep coming for well past the stuck app's deadline.
+      for (int round = 0; round < 25; round++) {
+        produced.addAll(produce("b" + round + "-", 1));
+        Thread.sleep(200);
+      }
+      String held = stuck.received.get(0);
+      List<String> others = produced.stream().filter(value -> !value.equals(held)).toList();
+      awaitHandled("every record but the one the stuck app holds", others);
+
+      // Its record missed its deadline, its one attempt: that one, and only that one, is given up.
+      List<ConsumerRecord<String, String>> letters =
+          ServerHarness.read(ServerHarness.KAFKA_A, deadLetters, 1, 1);
+      Thread.sleep(3_000);
+      letters = ServerHarness.read(ServerHarness.KAFKA_A, deadLetters, 1, letters.size());
+      assertThat(letters.stream().map(ConsumerRecord::value)).containsExactly(held);
+      assertThat(stuck.received).containsExactly(held);
+    } finally {
+      ServerHarness.deleteTopics(ServerHarness.KAFKA_A, List.of(deadLetters));
+    }
   }
 
   @Test

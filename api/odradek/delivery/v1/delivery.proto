@@ -30,8 +30,8 @@ service DeliveryService {
   // The first message from the sidecar must be Declare; the dispatcher
   // answers with Accepted before anything else. Records are then delivered
   // only against credits granted by the sidecar. A record stays with the
-  // sidecar until it is acknowledged, rejected or released, or until the
-  // stream ends; a record that is unacknowledged when the stream ends, or
+  // sidecar until it is acknowledged, rejected, returned or released, or until
+  // the stream ends; a record that is unacknowledged when the stream ends, or
   // when its processing deadline passes, is delivered again, possibly to
   // another sidecar. Only the second counts as a failed attempt: see
   // Settings.max_attempts.
@@ -205,6 +205,9 @@ message DeliverRequest {
     Ack ack = 3;
     // Returns one record the sidecar could not hand to its application.
     Reject reject = 4;
+    // Gives back records the application has not taken, without using an
+    // attempt. Only on a stream whose Accepted set accepts_return.
+    Return returned = 5;
   }
 }
 
@@ -276,6 +279,26 @@ message Reject {
   string reason = 3;
 }
 
+// Return gives back records of one partition that the sidecar holds and has
+// not written to its application: they wait behind records the application
+// has not finished, and would otherwise spend their processing deadline
+// there (ADR 7). It is not a failed attempt. Each record is delivered again
+// at once, under the same attempt number, to another sidecar when one has
+// credit. The credit the records used is not given back.
+//
+// A sidecar returns what it holds unhanded when its application has held a
+// record longer than its processing deadline, and any record that has waited
+// for half of its own. It never returns a record the application was given.
+// Offsets this stream does not hold, or holds after their deadline passed,
+// are ignored: that attempt has failed already. Sent only when the stream's
+// Accepted set accepts_return.
+message Return {
+  // Partition of the records.
+  int32 partition = 1;
+  // Offsets of the records, each delivered on this stream.
+  repeated int64 offsets = 2;
+}
+
 // ---------------------------------------------------------------------------
 // Dispatcher to sidecar
 // ---------------------------------------------------------------------------
@@ -314,6 +337,10 @@ message Accepted {
   // is unset, or names a replica that is not listed, the sidecar opens a
   // stream to every listed replica and closes this one.
   string address = 4;
+  // Whether this replica understands Return. A sidecar sends Return only on
+  // a stream whose Accepted says so; to an older dispatcher it sends none,
+  // and records wait for its application as before.
+  bool accepts_return = 5;
 }
 
 // ReplicaList is every replica of the dispatcher, whatever each of them

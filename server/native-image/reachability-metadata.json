@@ -918,6 +918,14 @@
     },
     {
       "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Return"
+    },
+    {
+      "allPublicMethods": true,
+      "type": "io.github.bpalermo.odradek.delivery.v1.Return$Builder"
+    },
+    {
+      "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.delivery.v1.Settings"
     },
     {

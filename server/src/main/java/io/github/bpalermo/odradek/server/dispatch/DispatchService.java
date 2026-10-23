@@ -266,6 +266,7 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
               .setReplicas(list)
               .setDispatcher(PeerInfo.newBuilder().setVersion(Version.VERSION))
               .setAddress(advertised)
+              .setAcceptsReturn(true)
               .build();
       // After `accepted`, under the lock declarations are queued under: a stream that joins a
       // group before this is queued there is sent the list; one that joins after is answered
@@ -484,6 +485,12 @@ public final class DispatchService extends DeliveryServiceGrpc.DeliveryServiceIm
                     request.getReject().getPartition(),
                     request.getReject().getOffset(),
                     request.getReject().getReason()));
+        case RETURNED ->
+            group.submit(
+                new DispatchGroup.GiveBack(
+                    stream,
+                    request.getReturned().getPartition(),
+                    request.getReturned().getOffsetsList()));
         case DECLARE -> fail(Status.INVALID_ARGUMENT.withDescription("Declare was already sent"));
         case MSG_NOT_SET -> fail(Status.INVALID_ARGUMENT.withDescription("empty DeliverRequest"));
       }

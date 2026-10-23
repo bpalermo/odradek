@@ -16,6 +16,7 @@ import io.github.bpalermo.odradek.delivery.v1.Ordering;
 import io.github.bpalermo.odradek.delivery.v1.PeerInfo;
 import io.github.bpalermo.odradek.delivery.v1.Record;
 import io.github.bpalermo.odradek.delivery.v1.Reject;
+import io.github.bpalermo.odradek.delivery.v1.Return;
 import io.github.bpalermo.odradek.delivery.v1.Settings;
 import io.github.bpalermo.odradek.kafka.v1.Ack;
 import io.github.bpalermo.odradek.kafka.v1.Assigned;
@@ -37,6 +38,7 @@ import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -169,6 +171,9 @@ final class ReceiveSession implements AppStream {
     StreamObserver<DeliverRequest> requests;
     boolean accepted;
 
+    /** The replica said in {@code Accepted} that it understands {@code Return} (ADR 7). */
+    boolean acceptsReturn;
+
     /** Ended, by either side. Nothing is sent on it and nothing from it is acted on. */
     boolean closed;
 
@@ -226,6 +231,10 @@ final class ReceiveSession implements AppStream {
     long rejects;
     boolean rejectLogged;
     long lastRejectLog;
+
+    long returns;
+    boolean returnLogged;
+    long lastReturnLog;
 
     /** The streams wanted for it, as last reported. */
     int reportedWanted;
@@ -486,6 +495,13 @@ final class ReceiveSession implements AppStream {
   /** How long until something has to be done whatever arrives. */
   private long untilNextTimer(long now) {
     long wait = IDLE_NANOS;
+    for (Pending waiting : pending) {
+      // The oldest record that can be given back: the others arrived after it.
+      if (waiting.link().acceptsReturn) {
+        wait = Math.min(wait, waiting.arrivedNanos() + maxProcessingNanos / 2 - now);
+        break;
+      }
+    }
     for (Topic topic : topics.values()) {
       if (topic.bootstrapWaiting) {
         wait = Math.min(wait, topic.bootstrapDue - now);
@@ -598,6 +614,7 @@ final class ReceiveSession implements AppStream {
         LOG.info("the app of group {} acknowledges again: granting credit again", group);
       }
     }
+    giveBack(now);
     if (stalled) {
       return;
     }
@@ -614,6 +631,68 @@ final class ReceiveSession implements AppStream {
                             .setCredits(
                                 io.github.bpalermo.odradek.delivery.v1.Credits.newBuilder()
                                     .setRecords((int) Math.min(Integer.MAX_VALUE, records)))));
+  }
+
+  /**
+   * Gives back to their replicas, without using an attempt, the records waiting here that the app
+   * cannot take in time (ADR 7): all of them while the app holds a record past its deadline, and
+   * otherwise those that have waited half of theirs. Their deadline runs at the replica from when
+   * it sent them, so behind an app that is stuck they would miss it, and use an attempt, without
+   * the app ever seeing them. Elsewhere they are delivered at once. Only to replicas that said they
+   * understand it; the credit the records used is not given back, so a stuck app is not sent more.
+   */
+  private void giveBack(long now) {
+    if (pending.isEmpty()) {
+      return;
+    }
+    long half = maxProcessingNanos / 2;
+    // Per stream and partition, in the order they arrived.
+    Map<Link, Map<Integer, List<Long>>> back = new LinkedHashMap<>();
+    int count = 0;
+    for (Iterator<Pending> all = pending.iterator(); all.hasNext(); ) {
+      Pending waiting = all.next();
+      Link link = waiting.link();
+      if (!link.acceptsReturn || link.closed || (!stalled && now - waiting.arrivedNanos() < half)) {
+        continue;
+      }
+      all.remove();
+      back.computeIfAbsent(link, l -> new LinkedHashMap<>())
+          .computeIfAbsent(waiting.partition(), p -> new ArrayList<>())
+          .add(waiting.record().getOffset());
+      count++;
+    }
+    if (count == 0) {
+      return;
+    }
+    split.dropped(count);
+    back.forEach(
+        (link, partitions) -> {
+          int records = 0;
+          for (Map.Entry<Integer, List<Long>> partition : partitions.entrySet()) {
+            link.send(
+                DeliverRequest.newBuilder()
+                    .setReturned(
+                        Return.newBuilder()
+                            .setPartition(partition.getKey())
+                            .addAllOffsets(partition.getValue())));
+            records += partition.getValue().size();
+          }
+          Topic topic = link.topic;
+          topic.metrics.returned(records);
+          topic.returns += records;
+          if (!topic.returnLogged || now - topic.lastReturnLog >= REJECT_LOG_NANOS) {
+            LOG.info(
+                "{} record(s) of topic {} given back to the dispatcher unread: the app {}",
+                topic.returns,
+                topic.name,
+                stalled
+                    ? "has held a record past its processing deadline"
+                    : "had not taken them within half their processing deadline");
+            topic.returns = 0;
+            topic.returnLogged = true;
+            topic.lastReturnLog = now;
+          }
+        });
   }
 
   /**
@@ -859,6 +938,7 @@ final class ReceiveSession implements AppStream {
   private void accepted(Link link, Accepted accepted) {
     Topic topic = link.topic;
     link.accepted = true;
+    link.acceptsReturn = accepted.getAcceptsReturn();
     split.opened(link.id);
     topic.metrics.streams(1);
     boolean changed = replicas.offer(accepted.getReplicas());

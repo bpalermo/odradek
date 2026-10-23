@@ -26,6 +26,7 @@ import io.github.bpalermo.odradek.delivery.v1.Record;
 import io.github.bpalermo.odradek.delivery.v1.Released;
 import io.github.bpalermo.odradek.delivery.v1.Replica;
 import io.github.bpalermo.odradek.delivery.v1.ReplicaList;
+import io.github.bpalermo.odradek.delivery.v1.Return;
 import io.github.bpalermo.odradek.kafka.v1.Ack;
 import io.github.bpalermo.odradek.kafka.v1.ConsumeRequest;
 import io.github.bpalermo.odradek.kafka.v1.ConsumeResponse;
@@ -129,6 +130,12 @@ class ReceiveServiceTest {
       return request.getAck();
     }
 
+    Return returned() throws InterruptedException {
+      DeliverRequest request = next();
+      assertThat(request.hasReturned()).as("%s", request).isTrue();
+      return request.getReturned();
+    }
+
     void nothing() throws InterruptedException {
       assertThat(requests.poll(300, TimeUnit.MILLISECONDS)).isNull();
     }
@@ -183,6 +190,9 @@ class ReceiveServiceTest {
     /** What it says its address is; null says nothing. */
     volatile String says;
 
+    /** Whether it says it understands Return (ADR 7). */
+    volatile boolean acceptsReturn;
+
     FakeReplica(String address) {
       this.address = address;
       this.says = address;
@@ -208,7 +218,8 @@ class ReceiveServiceTest {
                   Accepted.newBuilder()
                       .setSettings(request.getDeclare().getSettings())
                       .setReplicas(listed)
-                      .setDispatcher(PeerInfo.newBuilder().setVersion("test"));
+                      .setDispatcher(PeerInfo.newBuilder().setVersion("test"))
+                      .setAcceptsReturn(acceptsReturn);
               if (says != null) {
                 accepted.setAddress(says);
               }
@@ -1553,6 +1564,100 @@ class ReceiveServiceTest {
     app.ack("orders", 0, epoch, 0, 0);
     assertThat(range(stream.ack())).isEqualTo(List.of(0, 0L, 0L));
     assertThat(stream.credits()).isEqualTo(5);
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Records given back unread (ADR 7)
+  // -------------------------------------------------------------------------------------------
+
+  /** Two replicas that understand Return, or not; the app takes one record at a time. */
+  private Stream[] twoReplicasOneCredit(App app, boolean acceptsReturn) throws Exception {
+    FakeReplica one = new FakeReplica(r1);
+    FakeReplica two = new FakeReplica(r2);
+    one.acceptsReturn = acceptsReturn;
+    two.acceptsReturn = acceptsReturn;
+    serve(service, one);
+    serve(r1, one);
+    serve(r2, two);
+    listed = list(1, r1, r2);
+    Stream first = one.accepted();
+    Stream second = two.accepted();
+    app.credits(1);
+    // The app's one credit goes to one replica, and the other still gets one: it has none.
+    assertThat(first.credits()).isEqualTo(1);
+    assertThat(second.credits()).isEqualTo(1);
+    return new Stream[] {first, second};
+  }
+
+  @Test
+  void aRecordWaitingBehindAStuckAppIsGivenBackUnread() throws Exception {
+    start(config());
+    App app = app();
+    app.subscribe(400, "orders");
+    assertThat(app.next().hasSubscribed()).isTrue();
+    Stream[] streams = twoReplicasOneCredit(app, true);
+    streams[0].records(0, 0, "a");
+    long epoch = app.assigned().getAssignmentEpoch();
+    app.batch();
+    // The app holds a and has no credit: b waits here, on the deadline of the replica that sent it.
+    streams[1].records(1, 9, "b");
+    Return returned = streams[1].returned();
+    assertThat(returned.getPartition()).isEqualTo(1);
+    assertThat(returned.getOffsetsList()).containsExactly(9L);
+    assertThat(metric("odradek.receive.returned", "topic", "orders")).isEqualTo(1);
+    // What the app was given is never given back; b never reaches it, and its credit is spent.
+    streams[0].nothing();
+    streams[1].nothing();
+    app.nothing();
+
+    app.ack("orders", 0, epoch, 0, 0);
+    assertThat(range(streams[0].ack())).isEqualTo(List.of(0, 0L, 0L));
+    app.credits(1);
+    assertThat(streams[0].credits()).isEqualTo(1);
+    assertThat(streams[1].credits()).isEqualTo(1);
+  }
+
+  @Test
+  void aRecordThatHasWaitedHalfItsDeadlineIsGivenBackBeforeTheAppStalls() throws Exception {
+    start(config());
+    App app = app();
+    app.subscribe(2000, "orders");
+    assertThat(app.next().hasSubscribed()).isTrue();
+    Stream[] streams = twoReplicasOneCredit(app, true);
+    streams[0].records(0, 0, "a");
+    long epoch = app.assigned().getAssignmentEpoch();
+    app.batch();
+    long sent = System.nanoTime();
+    streams[1].records(1, 9, "b");
+    assertThat(streams[1].returned().getOffsetsList()).containsExactly(9L);
+    long waited = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - sent);
+    // Half of 2 s, well before a passes its deadline.
+    assertThat(waited).isBetween(900L, 1800L);
+    app.ack("orders", 0, epoch, 0, 0);
+    assertThat(range(streams[0].ack())).isEqualTo(List.of(0, 0L, 0L));
+  }
+
+  @Test
+  void aReplicaThatDoesNotSayItUnderstandsReturnIsSentNone() throws Exception {
+    start(config());
+    App app = app();
+    app.subscribe(400, "orders");
+    assertThat(app.next().hasSubscribed()).isTrue();
+    Stream[] streams = twoReplicasOneCredit(app, false);
+    streams[0].records(0, 0, "a");
+    long epoch = app.assigned().getAssignmentEpoch();
+    app.batch();
+    streams[1].records(1, 9, "b");
+    Thread.sleep(600);
+    streams[1].nothing();
+    assertThat(metric("odradek.receive.returned", "topic", "orders")).isZero();
+
+    // As before ADR 7: b waits for the app.
+    app.ack("orders", 0, epoch, 0, 0);
+    assertThat(range(streams[0].ack())).isEqualTo(List.of(0, 0L, 0L));
+    app.credits(1);
+    app.assigned();
+    assertThat(values(app.batch())).containsExactly("b");
   }
 
   // -------------------------------------------------------------------------------------------

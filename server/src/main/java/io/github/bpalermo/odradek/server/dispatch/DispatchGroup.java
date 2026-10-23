@@ -170,7 +170,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
 
   /** Something a stream, or the dispatcher, asks of the group's thread. */
   sealed interface Command
-      permits Join, Credit, Acked, Reject, Leave, Announce, DeadLettered, Shutdown {}
+      permits Join, Credit, Acked, Reject, GiveBack, Leave, Announce, DeadLettered, Shutdown {}
 
   /** A declaration that is well formed and names this group. */
   record Join(Stream stream) implements Command {}
@@ -181,6 +181,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       implements Command {}
 
   record Reject(Stream stream, int partition, long offset, String reason) implements Command {}
+
+  /** The sidecar gave records back unread (ADR 7). */
+  record GiveBack(Stream stream, int partition, List<Long> offsets) implements Command {}
 
   /**
    * The stream ends: with {@code status} when the dispatcher is to end it, and with null when the
@@ -673,6 +676,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         }
       }
       case Reject reject -> rejected(reject);
+      case GiveBack giveBack -> givenBack(giveBack);
       case Leave leave -> {
         left(leave.stream());
         end(leave.stream(), leave.status());
@@ -819,6 +823,16 @@ final class DispatchGroup implements ConsumerRebalanceListener {
             reject.stream().id, reject.partition(), reject.offset(), reject.reason()));
   }
 
+  private void givenBack(GiveBack giveBack) {
+    Topic topic = giveBack.stream().topic;
+    if (topic != null) {
+      on(
+          topic,
+          new DispatchEvent.Returned<>(
+              giveBack.stream().id, giveBack.partition(), giveBack.offsets()));
+    }
+  }
+
   private void send(Stream stream, DeliverResponse response) {
     if (!stream.cancelled && !stream.ended) {
       stream.call.onNext(response);
@@ -864,6 +878,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
                 case DEADLINE -> ServerMetrics.Redelivery.DEADLINE;
                 case REJECTED -> ServerMetrics.Redelivery.REJECTED;
                 case RECEIVER_LEFT -> ServerMetrics.Redelivery.RECEIVER_GONE;
+                case RETURNED -> ServerMetrics.Redelivery.RETURNED;
               });
           if (!releasing.isEmpty()
               && releasing.contains(new TopicPartition(topic.name, deliver.partition()))) {

@@ -23,6 +23,7 @@ import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.ReceiverJoined;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.ReceiverLeft;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.RecordsFetched;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.Rejected;
+import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.Returned;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.TimePassed;
 import io.github.bpalermo.odradek.server.dispatch.DispatchSettings.OnExhausted;
 import io.github.bpalermo.odradek.server.dispatch.DispatchSettings.Ordering;
@@ -78,6 +79,10 @@ import java.util.TreeSet;
  *       about the record, and rolling the application must not use up the attempts of whatever
  *       happened to be in flight (with a limit and {@link OnExhausted#BLOCK} it would block
  *       partitions).
+ *   <li><b>A record given back unread</b> ({@link Returned}, ADR 7) fails nothing either: its
+ *       receiver's application had not taken it. It is delivered again at once, under the same
+ *       attempt number, to a different receiver if one has credit. The credit it used is not given
+ *       back, which is what keeps a receiver stuck on another record from being sent more.
  *   <li><b>Exhaustion.</b> A record whose attempts are used up is either dead-lettered (it stays
  *       unacknowledged until {@link DeadLetterWritten}; a failed write is asked for again, after
  *       {@link DispatchSettings#deadLetterRetry} doubled for each failure, for as long as the core
@@ -536,6 +541,7 @@ public final class DispatchCore<R> {
       case CreditsGranted<R> e -> credits(e);
       case Acknowledged<R> e -> acknowledged(e, out);
       case Rejected<R> e -> rejected(e, out);
+      case Returned<R> e -> givenBack(e);
       case DeadLetterWritten<R> e -> deadLetterWritten(e, out);
       case DeadLetterFailed<R> e -> deadLetterFailed(e, out);
       case TimePassed<R> _ -> expire(out);
@@ -1130,7 +1136,7 @@ public final class DispatchCore<R> {
     for (TreeMap<Long, Rec<R>> records : r.held.values()) {
       for (Rec<R> rec : records.values()) {
         if (rec.holder == r) {
-          returned(rec);
+          returned(rec, Cause.RECEIVER_LEFT);
         } else {
           rec.former.remove(r);
         }
@@ -1140,10 +1146,36 @@ public final class DispatchCore<R> {
   }
 
   /**
-   * The receiver a record was in flight to left. The delivery is taken back: the record is sent
-   * again under the same attempt number.
+   * A receiver gave records back unread. Each one it holds in flight is taken back as if it had
+   * left, and sent elsewhere when another receiver has credit; one it holds after the deadline
+   * passed has failed already and is only forgotten by it.
    */
-  private void returned(Rec<R> rec) {
+  private void givenBack(Returned<R> e) {
+    Receiver<R> r = receivers.get(e.receiver());
+    TreeMap<Long, Rec<R>> held = r == null ? null : r.held.get(e.partition());
+    if (held == null) {
+      return;
+    }
+    for (long offset : e.offsets()) {
+      Rec<R> rec = held.get(offset);
+      if (rec == null) {
+        continue;
+      }
+      unhold(r, rec);
+      if (rec.holder == r) {
+        rec.avoid = r;
+        returned(rec, Cause.RETURNED);
+      } else {
+        rec.former.remove(r);
+      }
+    }
+  }
+
+  /**
+   * The receiver a record was in flight to left, or gave it back unread. The delivery is taken
+   * back: the record is sent again under the same attempt number.
+   */
+  private void returned(Rec<R> rec, Cause cause) {
     Part<R> p = rec.part;
     land(rec);
     p.inFlight--;
@@ -1156,7 +1188,7 @@ public final class DispatchCore<R> {
       return;
     }
     rec.attempts--;
-    rec.cause = Cause.RECEIVER_LEFT;
+    rec.cause = cause;
     ready(rec);
     refresh(p);
   }

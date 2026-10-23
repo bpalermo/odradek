@@ -25,6 +25,7 @@ import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.ReceiverJoined;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.ReceiverLeft;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.RecordsFetched;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.Rejected;
+import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.Returned;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.TimePassed;
 import io.github.bpalermo.odradek.server.dispatch.DispatchSettings.OnExhausted;
 import io.github.bpalermo.odradek.server.dispatch.DispatchSettings.Ordering;
@@ -637,6 +638,77 @@ class DispatchCoreTest {
     // Giving the late record back frees a without failing the attempt b has.
     assertThat(reject("a", 0, 0)).isEmpty();
     assertThat(ack("b", 0, 0)).containsExactly(commit(0, 1));
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Records given back unread (ADR 7)
+  // -------------------------------------------------------------------------------------------
+
+  @Test
+  void aRecordGivenBackUnreadGoesToAnotherReceiverAtOnceUnderTheSameAttempt() {
+    backoff = 50;
+    backoffMax = 50;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0:x", "1:x")).containsExactly(deliver("a", 0, 0));
+    // No wait, the same attempt, and the next record of its key still waits behind it.
+    assertThat(raw(new Returned<>("a", 0, List.of(0L))))
+        .containsExactly(new Deliver<>("b", 0, 0, "0/0", 1, Cause.RETURNED));
+    // a gave it back: it can neither give it back again nor acknowledge it any more.
+    assertThat(on(new Returned<>("a", 0, List.of(0L)))).isEmpty();
+    assertThat(ack("a", 0, 0)).isEmpty();
+    assertThat(ack("b", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+  }
+
+  @Test
+  void aRecordGivenBackDoesNotGiveItsCreditBack() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 1);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    // a spent its one credit on the record: nothing goes back to it until it grants more.
+    assertThat(on(new Returned<>("a", 0, List.of(0L)))).isEmpty();
+    assertThat(core.inFlight()).isZero();
+    assertThat(credits("a", 1)).containsExactly(deliver("a", 0, 0, 1));
+  }
+
+  @Test
+  void givingBackWhatIsNotHeldOrIsPastItsDeadlineChangesNothing() {
+    maxAttempts = 2;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    assertThat(on(new Returned<>("b", 0, List.of(0L)))).isEmpty();
+    assertThat(on(new Returned<>("a", 0, List.of(7L)))).isEmpty();
+    assertThat(on(new Returned<>("a", 1, List.of(0L)))).isEmpty();
+    // The deadline failed the first attempt; giving the expired copy back does not take it back.
+    assertThat(after(DEADLINE)).containsExactly(deliver("b", 0, 0, 2));
+    assertThat(on(new Returned<>("a", 0, List.of(0L)))).isEmpty();
+    assertThat(after(DEADLINE))
+        .containsExactly(new DeadLetter<>(0, 0, "0/0", 2, Cause.DEADLINE, null, 0));
+  }
+
+  @Test
+  void recordsGivenBackNeverExhaustARecord() {
+    maxAttempts = 1;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 100);
+    receiver("b", 100);
+    assertThat(fetch(0, "0", "1")).containsExactly(deliver("a", 0, 0), deliver("b", 0, 1));
+    for (int i = 0; i < 10; i++) {
+      assertThat(on(new Returned<>("a", 0, List.of(0L)))).containsExactly(deliver("b", 0, 0, 1));
+      assertThat(on(new Returned<>("b", 0, List.of(0L, 1L))))
+          .containsExactly(deliver("a", 0, 0, 1), deliver("a", 0, 1, 1));
+      assertThat(on(new Returned<>("a", 0, List.of(1L)))).containsExactly(deliver("b", 0, 1, 1));
+    }
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+    assertThat(ack("b", 0, 1)).containsExactly(commit(0, 2));
   }
 
   // -------------------------------------------------------------------------------------------

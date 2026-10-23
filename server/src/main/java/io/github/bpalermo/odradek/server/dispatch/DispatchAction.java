@@ -19,7 +19,9 @@ public sealed interface DispatchAction<R> {
     /** Its processing deadline passed. */
     DEADLINE,
     /** The receiver that had it left. Not a failed attempt. */
-    RECEIVER_LEFT
+    RECEIVER_LEFT,
+    /** The receiver that had it gave it back unread (ADR 7). Not a failed attempt. */
+    RETURNED
   }
 
   /**
@@ -29,7 +31,8 @@ public sealed interface DispatchAction<R> {
    * offsets increase.
    *
    * @param attempt which attempt at the record this is, from 1: one more than the attempts that
-   *     failed. A record sent again because its receiver left is sent under the same number
+   *     failed. A record sent again because its receiver left, or gave it back unread, is sent
+   *     under the same number
    * @param cause why it is sent again; {@link Cause#NONE} when this core never sent it before
    */
   record Deliver<R>(
