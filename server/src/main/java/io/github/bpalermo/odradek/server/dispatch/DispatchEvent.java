@@ -88,6 +88,24 @@ public sealed interface DispatchEvent<R> {
   record Rejected<R>(String receiver, int partition, long offset, String reason)
       implements DispatchEvent<R> {}
 
+  /**
+   * A receiver gave records of one partition back unread: its application had not taken them (ADR
+   * 7). Not a failed attempt: each that the receiver holds in flight under the attempt named is
+   * sent again at once, under that attempt number, to another receiver when one has credit. The
+   * credit it used is not given back. One the receiver holds past its deadline, or under another
+   * attempt, is only forgotten by it: that attempt failed already, and a newer copy stays where it
+   * is.
+   */
+  record Returned<R>(String receiver, int partition, List<GivenBack> records)
+      implements DispatchEvent<R> {
+    public Returned {
+      records = List.copyOf(records);
+    }
+  }
+
+  /** One delivery given back: the record's offset and the attempt it was delivered with. */
+  record GivenBack(long offset, int attempt) {}
+
   /** The dead letter asked for by {@link DispatchAction.DeadLetter} is written. */
   record DeadLetterWritten<R>(int partition, long offset) implements DispatchEvent<R> {}
 

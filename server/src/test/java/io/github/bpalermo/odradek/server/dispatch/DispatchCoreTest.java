@@ -18,6 +18,7 @@ import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.CreditsGranted;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.DeadLetterFailed;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.DeadLetterWritten;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.Fetched;
+import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.GivenBack;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.PartitionAssigned;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.PartitionsLost;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.PartitionsRevoked;
@@ -25,6 +26,7 @@ import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.ReceiverJoined;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.ReceiverLeft;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.RecordsFetched;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.Rejected;
+import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.Returned;
 import io.github.bpalermo.odradek.server.dispatch.DispatchEvent.TimePassed;
 import io.github.bpalermo.odradek.server.dispatch.DispatchSettings.OnExhausted;
 import io.github.bpalermo.odradek.server.dispatch.DispatchSettings.Ordering;
@@ -178,6 +180,15 @@ class DispatchCoreTest {
 
   private static Deliver<String> deliver(String receiver, int partition, long offset, int attempt) {
     return new Deliver<>(receiver, partition, offset, payload(partition, offset), attempt);
+  }
+
+  /** Deliveries given back, each under the first attempt. */
+  private static List<GivenBack> given(long... offsets) {
+    List<GivenBack> given = new ArrayList<>();
+    for (long offset : offsets) {
+      given.add(new GivenBack(offset, 1));
+    }
+    return given;
   }
 
   private static Commit<String> commit(int partition, long offset) {
@@ -637,6 +648,149 @@ class DispatchCoreTest {
     // Giving the late record back frees a without failing the attempt b has.
     assertThat(reject("a", 0, 0)).isEmpty();
     assertThat(ack("b", 0, 0)).containsExactly(commit(0, 1));
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Records given back unread (ADR 7)
+  // -------------------------------------------------------------------------------------------
+
+  @Test
+  void aRecordGivenBackUnreadGoesToAnotherReceiverAtOnceUnderTheSameAttempt() {
+    backoff = 50;
+    backoffMax = 50;
+    start(Ordering.KEY);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0:x", "1:x")).containsExactly(deliver("a", 0, 0));
+    // No wait, the same attempt, and the next record of its key still waits behind it.
+    assertThat(raw(new Returned<>("a", 0, given(0))))
+        .containsExactly(new Deliver<>("b", 0, 0, "0/0", 1, Cause.RETURNED));
+    // a gave it back: it can neither give it back again nor acknowledge it any more.
+    assertThat(on(new Returned<>("a", 0, given(0)))).isEmpty();
+    assertThat(ack("a", 0, 0)).isEmpty();
+    assertThat(ack("b", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
+  }
+
+  @Test
+  void aRecordGivenBackDoesNotGiveItsCreditBack() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 1);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    // a spent its one credit on the record: nothing goes back to it until it grants more.
+    assertThat(on(new Returned<>("a", 0, given(0)))).isEmpty();
+    assertThat(core.inFlight()).isZero();
+    assertThat(credits("a", 1)).containsExactly(deliver("a", 0, 0, 1));
+  }
+
+  @Test
+  void givingBackWhatIsNotHeldOrIsPastItsDeadlineChangesNothing() {
+    maxAttempts = 2;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    assertThat(on(new Returned<>("b", 0, given(0)))).isEmpty();
+    assertThat(on(new Returned<>("a", 0, given(7)))).isEmpty();
+    assertThat(on(new Returned<>("a", 1, given(0)))).isEmpty();
+    // The deadline failed the first attempt; giving the expired copy back does not take it back.
+    assertThat(after(DEADLINE)).containsExactly(deliver("b", 0, 0, 2));
+    assertThat(on(new Returned<>("a", 0, given(0)))).isEmpty();
+    assertThat(after(DEADLINE))
+        .containsExactly(new DeadLetter<>(0, 0, "0/0", 2, Cause.DEADLINE, null, 0));
+  }
+
+  @Test
+  void aLateReturnOfACopyThatMissedItsDeadlineLeavesTheNewCopyOnTheSameStreamAlone() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    // Only a has credit, so the record goes back to it, under the next attempt.
+    assertThat(after(DEADLINE)).containsExactly(deliver("a", 0, 0, 2));
+    // The return of the first copy arrives now: it names attempt 1, and a holds attempt 2.
+    assertThat(on(new Returned<>("a", 0, List.of(new GivenBack(0, 1))))).isEmpty();
+    assertThat(core.inFlight()).isEqualTo(1);
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+  }
+
+  @Test
+  void aLateReturnForgetsTheExpiredCopyWithoutGivingTheAttemptBack() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    assertThat(after(DEADLINE)).containsExactly(deliver("b", 0, 0, 2));
+    // a still holds the expired copy, and its acknowledgement would count. Given back, the copy is
+    // forgotten: nothing is sent again, and b keeps attempt 2.
+    assertThat(on(new Returned<>("a", 0, given(0)))).isEmpty();
+    assertThat(ack("a", 0, 0)).isEmpty();
+    assertThat(ack("b", 0, 0)).containsExactly(commit(0, 1));
+  }
+
+  @Test
+  void aReturnHandledAfterTheDeadlineOfWhatItNamesIsTooLateToKeepTheAttempt() {
+    maxAttempts = 1;
+    onExhausted = OnExhausted.DEAD_LETTER;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 10);
+    receiver("b", 10);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    // The deadline passes, and the return is handled before the time is passed to the core.
+    now += DEADLINE;
+    assertThat(on(new Returned<>("a", 0, given(0))))
+        .containsExactly(new DeadLetter<>(0, 0, "0/0", 1, Cause.DEADLINE, null, 0));
+  }
+
+  @Test
+  void givingBackTheNewCopyLeavesTheExpiredOneOnTheSameStreamAcknowledgeable() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 2);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    assertThat(after(DEADLINE)).containsExactly(deliver("a", 0, 0, 2));
+    // a's app is still on attempt 1, and its sidecar gives attempt 2 back unread.
+    assertThat(on(new Returned<>("a", 0, List.of(new GivenBack(0, 2))))).isEmpty();
+    assertThat(core.inFlight()).isZero();
+    // The app finishes attempt 1: that acknowledgement counts.
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+  }
+
+  @Test
+  void aLateReturnOfTheFirstOfTwoExpiredCopiesLeavesTheSecondAcknowledgeable() {
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 2);
+    assertThat(fetch(0, "0")).containsExactly(deliver("a", 0, 0));
+    assertThat(after(DEADLINE)).containsExactly(deliver("a", 0, 0, 2));
+    // Attempt 2 misses its deadline too, and nobody has credit for attempt 3.
+    assertThat(after(DEADLINE)).isEmpty();
+    // Attempt 1 comes back unread, late; a's app is on attempt 2 and acknowledges it.
+    assertThat(on(new Returned<>("a", 0, List.of(new GivenBack(0, 1))))).isEmpty();
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+  }
+
+  @Test
+  void recordsGivenBackNeverExhaustARecord() {
+    maxAttempts = 1;
+    start(Ordering.NONE);
+    assign(0, 0);
+    receiver("a", 100);
+    receiver("b", 100);
+    assertThat(fetch(0, "0", "1")).containsExactly(deliver("a", 0, 0), deliver("b", 0, 1));
+    for (int i = 0; i < 10; i++) {
+      assertThat(on(new Returned<>("a", 0, given(0)))).containsExactly(deliver("b", 0, 0, 1));
+      assertThat(on(new Returned<>("b", 0, given(0, 1))))
+          .containsExactly(deliver("a", 0, 0, 1), deliver("a", 0, 1, 1));
+      assertThat(on(new Returned<>("a", 0, given(1)))).containsExactly(deliver("b", 0, 1, 1));
+    }
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1));
+    assertThat(ack("b", 0, 1)).containsExactly(commit(0, 2));
   }
 
   // -------------------------------------------------------------------------------------------

@@ -20,6 +20,9 @@ import java.util.function.BiFunction;
  * newer one) starts a new batch. What goes to one receiver keeps the order the core gave it, a
  * {@code Released} included; receivers are independent of each other.
  *
+ * <p>A batch carries the processing deadline its records were sent under, so a delivery under
+ * another one starts a new batch too.
+ *
  * <p>A batch is also closed when it has {@code maxRecords} records, or when one more would take it
  * past {@code maxBytes}: a message must stay well under the size a gRPC peer accepts (4 MiB by
  * default). A record larger than that goes alone, in a message of its own size.
@@ -60,13 +63,18 @@ final class Batches<R> {
     this.maxBytes = maxBytes;
   }
 
-  /** Adds one delivery to its receiver's batch, sending the batch before it if it cannot join. */
-  void deliver(Deliver<R> delivery) {
+  /**
+   * Adds one delivery to its receiver's batch, sending the batch before it if it cannot join.
+   *
+   * @param maxProcessingMs the processing deadline it is sent under
+   */
+  void deliver(Deliver<R> delivery, int maxProcessingMs) {
     Record record = toRecord.apply(delivery.payload(), delivery.attempt());
     long size = record.getSerializedSize();
     Open batch = open.get(delivery.receiver());
     if (batch != null
         && (batch.batch.getPartition() != delivery.partition()
+            || batch.batch.getMaxProcessingMs() != maxProcessingMs
             || delivery.offset() <= batch.lastOffset
             || batch.batch.getRecordsCount() >= maxRecords
             || batch.bytes + size > maxBytes)) {
@@ -75,6 +83,7 @@ final class Batches<R> {
     }
     if (batch == null) {
       batch = new Open(delivery.partition());
+      batch.batch.setMaxProcessingMs(maxProcessingMs);
       open.put(delivery.receiver(), batch);
     }
     batch.batch.addRecords(record);

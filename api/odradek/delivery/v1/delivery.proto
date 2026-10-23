@@ -30,8 +30,8 @@ service DeliveryService {
   // The first message from the sidecar must be Declare; the dispatcher
   // answers with Accepted before anything else. Records are then delivered
   // only against credits granted by the sidecar. A record stays with the
-  // sidecar until it is acknowledged, rejected or released, or until the
-  // stream ends; a record that is unacknowledged when the stream ends, or
+  // sidecar until it is acknowledged, rejected, returned or released, or until
+  // the stream ends; a record that is unacknowledged when the stream ends, or
   // when its processing deadline passes, is delivered again, possibly to
   // another sidecar. Only the second counts as a failed attempt: see
   // Settings.max_attempts.
@@ -205,6 +205,9 @@ message DeliverRequest {
     Ack ack = 3;
     // Returns one record the sidecar could not hand to its application.
     Reject reject = 4;
+    // Gives back records the application has not taken, without using an
+    // attempt. Only on a stream whose Accepted set accepts_return.
+    Return returned = 5;
   }
 }
 
@@ -276,6 +279,39 @@ message Reject {
   string reason = 3;
 }
 
+// Return gives back records of one partition that the sidecar holds and has
+// not written to its application: they wait behind records the application
+// has not finished, and would otherwise spend their processing deadline
+// there (ADR 7). It is not a failed attempt. Each record is delivered again
+// at once, under the same attempt number, to another sidecar when one has
+// credit. The credit the records used is not given back.
+//
+// A sidecar returns what it holds unhanded when its application has held a
+// record longer than its processing deadline, and any record that has waited
+// for half of the deadline its batch was sent under. It never returns a record
+// the application was given, and returns each delivery at most once.
+//
+// A return counts only for a record this stream holds in flight under the
+// attempt it names: a record sent again to the same stream after a missed
+// deadline carries the next attempt, so a late return of the earlier copy is
+// told apart from it. A late return gives nothing back (that attempt has
+// failed already) and only makes the dispatcher forget the expired copy this
+// stream held. Sent only when the stream's Accepted set accepts_return.
+message Return {
+  // Partition of the records.
+  int32 partition = 1;
+  // The records, each as it was delivered on this stream.
+  repeated ReturnedRecord records = 2;
+}
+
+// ReturnedRecord names one delivery given back.
+message ReturnedRecord {
+  // Offset of the record.
+  int64 offset = 1;
+  // The attempt number it was delivered with (Record.attempt).
+  uint32 attempt = 2;
+}
+
 // ---------------------------------------------------------------------------
 // Dispatcher to sidecar
 // ---------------------------------------------------------------------------
@@ -314,6 +350,10 @@ message Accepted {
   // is unset, or names a replica that is not listed, the sidecar opens a
   // stream to every listed replica and closes this one.
   string address = 4;
+  // Whether this replica understands Return. A sidecar sends Return only on
+  // a stream whose Accepted says so; to an older dispatcher it sends none,
+  // and records wait for its application as before.
+  bool accepts_return = 5;
 }
 
 // ReplicaList is every replica of the dispatcher, whatever each of them
@@ -357,6 +397,11 @@ message RecordBatch {
   int32 partition = 1;
   // The records, in offset order.
   repeated Record records = 2;
+  // The processing deadline the records were sent under, in milliseconds:
+  // the dispatcher counts a failed attempt for each one not acknowledged
+  // within it. Set by a dispatcher that sets Accepted.accepts_return; a
+  // sidecar gives back a record that has waited half of it (see Return).
+  uint32 max_processing_ms = 3;
 }
 
 // Record is one record as stored in Kafka. The dispatcher applies no codec:

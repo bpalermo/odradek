@@ -85,6 +85,7 @@ public final class ServerMetrics {
   private final LongUpDownCounter receiveStreamsWanted;
   private final LongCounter receiveRecords;
   private final LongCounter receiveRejects;
+  private final LongCounter receiveReturned;
   private final LongCounter receiveReconnects;
   private final DoubleHistogram dispatchFetchLag;
   private final DoubleHistogram dispatchQueueDuration;
@@ -277,6 +278,14 @@ public final class ServerMetrics {
                     + " them.")
             .setUnit("{record}")
             .build();
+    receiveReturned =
+        meter
+            .counterBuilder("odradek.receive.returned")
+            .setDescription(
+                "Records given back to the dispatcher unread, without using an attempt: the app had"
+                    + " not taken them (ADR 7).")
+            .setUnit("{record}")
+            .build();
     receiveReconnects =
         meter
             .counterBuilder("odradek.receive.reconnects")
@@ -433,7 +442,8 @@ public final class ServerMetrics {
   public enum Redelivery {
     DEADLINE("deadline"),
     REJECTED("rejected"),
-    RECEIVER_GONE("receiver_gone");
+    RECEIVER_GONE("receiver_gone"),
+    RETURNED("returned");
 
     private final String reason;
 
@@ -631,6 +641,11 @@ public final class ServerMetrics {
     /** A record could not be decoded and goes back to the dispatcher. */
     public void rejected() {
       receiveRejects.add(1, attributes);
+    }
+
+    /** Records the app had not taken go back to the dispatcher, without using an attempt. */
+    public void returned(long records) {
+      receiveReturned.add(records, attributes);
     }
 
     /** A stream is opened again after one was lost or refused for the time being. */
