@@ -293,9 +293,10 @@ class ReceiveServiceTest {
   /** One replica, reached through the Service address as well as its own. */
   private FakeReplica single() throws IOException {
     FakeReplica replica = new FakeReplica(r1);
+    // Listed before it is served: a session already running reaches it at once.
+    listed = list(1, r1);
     serve(service, replica);
     serve(r1, replica);
-    listed = list(1, r1);
     return replica;
   }
 
@@ -1587,10 +1588,11 @@ class ReceiveServiceTest {
     FakeReplica two = new FakeReplica(r2);
     one.acceptsReturn = acceptsReturn;
     two.acceptsReturn = acceptsReturn;
+    // Listed before they are served: the session is already running, and reaches them at once.
+    listed = list(1, r1, r2);
     serve(service, one);
     serve(r1, one);
     serve(r2, two);
-    listed = list(1, r1, r2);
     Stream first = one.accepted();
     Stream second = two.accepted();
     app.credits(1);
@@ -1616,7 +1618,8 @@ class ReceiveServiceTest {
     assertThat(returned.getPartition()).isEqualTo(1);
     assertThat(returned.getRecordsList())
         .containsExactly(ReturnedRecord.newBuilder().setOffset(9).setAttempt(1).build());
-    assertThat(metric("odradek.receive.returned", "topic", "orders")).isEqualTo(1);
+    // Counted once sent: the replica can have it first.
+    waitFor("b counted", () -> metric("odradek.receive.returned", "topic", "orders") == 1);
     // What the app was given is never given back; b never reaches it, and its credit is spent.
     streams[0].nothing();
     streams[1].nothing();
@@ -1660,6 +1663,8 @@ class ReceiveServiceTest {
     long epoch = app.assigned().getAssignmentEpoch();
     app.batch();
     streams[1].records(1, 9, "b");
+    // Arrived (and stamped) before the clock jumps: it comes on another stream than the ack.
+    waitFor("b arrived", () -> metric("odradek.receive.records", "topic", "orders") == 2);
     app.ack("orders", 0, epoch, 0, 0);
     assertThat(range(streams[0].ack())).isEqualTo(List.of(0, 0L, 0L));
     // Half of b's deadline passes before the session looks again, which credit makes it do: b
