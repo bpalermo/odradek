@@ -1662,9 +1662,12 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     if (offsets.isEmpty()) {
       return false;
     }
+    // Whether these offsets carry their metadata. Read before committing: the synchronous commit
+    // completes earlier asynchronous ones, whose refusal says nothing of this one.
+    boolean named = !metadataRefused;
     try {
       commitNow(offsets);
-      return !metadataRefused;
+      return named;
     } catch (RuntimeException e) {
       if (!refusedMetadata(e)) {
         LOG.warn(

@@ -1183,13 +1183,28 @@ class DispatchCoreTest {
   }
 
   @Test
-  void recordsTheLastOwnerAcknowledgedAtThePositionMoveTheCommitAsTheyArrive() {
+  void recordsTheLastOwnerAcknowledgedAtThePositionMoveTheCommitBeforeTheyArrive() {
     start(Ordering.KEY);
     assertThat(on(new PartitionAssigned<>(0, 4, acked(4, 5)))).isEmpty();
     receiver("a", 10);
     assertThat(fetch(0, "4:x")).containsExactly(deliver("a", 0, 4));
-    assertThat(ack("a", 0, 4)).containsExactly(commit(0, 5));
-    assertThat(fetch(0, "5:x", "6:x")).containsExactly(commit(0, 6), deliver("a", 0, 6));
+    // 5 is not fetched yet, and the commit passes it: a commit at 5 could not name it.
+    assertThat(ack("a", 0, 4)).containsExactly(commit(0, 6));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(CommitMetadata.NONE);
+    assertThat(fetch(0, "5:x", "6:x")).containsExactly(deliver("a", 0, 6));
+    assertThat(core.skipped()).isEqualTo(1);
+  }
+
+  @Test
+  void aCommitBetweenFetchesNamesWhatTheLastOwnerAcknowledgedPastAGap() {
+    start(Ordering.KEY);
+    assertThat(on(new PartitionAssigned<>(0, 4, acked(4, 5, 7)))).isEmpty();
+    receiver("a", 10);
+    assertThat(fetch(0, "4:x")).containsExactly(deliver("a", 0, 4));
+    assertThat(ack("a", 0, 4)).containsExactly(commit(0, 6));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(acked(6, 7));
+    assertThat(on(new PartitionsRevoked<>(List.of(0))))
+        .containsExactly(released(0, true, 0, 0, 6, 7));
   }
 
   @Test

@@ -421,7 +421,16 @@ public final class DispatchCore<R> {
 
     long commit() {
       Rec<R> oldest = log.peekFirst();
-      return oldest == null ? end : oldest.offset;
+      if (oldest != null) {
+        return oldest.offset;
+      }
+      // Past what the last owner acknowledged just above what was fetched: those records are
+      // passed over when they arrive, and a commit at one of them could not name it.
+      long position = end;
+      while (skip.acknowledged(position)) {
+        position++;
+      }
+      return position;
     }
 
     /** Whether a record of it may be sent now. Handed over: {@link #ready} is what is below. */
@@ -639,7 +648,8 @@ public final class DispatchCore<R> {
   }
 
   private static <R> CommitMetadata.Builder acknowledgedAbove(Part<R> p) {
-    CommitMetadata.Builder above = CommitMetadata.above(p.commit());
+    long commit = p.commit();
+    CommitMetadata.Builder above = CommitMetadata.above(commit);
     if (p.acknowledged > 0) {
       for (Rec<R> rec : p.log) {
         if (rec.state == State.ACKED) {
@@ -647,9 +657,9 @@ public final class DispatchCore<R> {
         }
       }
     }
-    // What the last owner acknowledged and has not been fetched yet: a commit before it arrives
-    // names it too, or the next owner would deliver it again.
-    p.skip.forEachFrom(p.end, above::add);
+    // What the last owner acknowledged above the commit position and has not been fetched yet: a
+    // commit before it arrives names it too, or the next owner would deliver it again.
+    p.skip.forEachFrom(Math.max(p.end, commit + 1), above::add);
     return above;
   }
 
