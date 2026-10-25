@@ -3,6 +3,8 @@ package io.github.bpalermo.odradek.server.tls;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.bpalermo.kafka.spiffe.kafka.SpiffeConfig;
+import io.github.bpalermo.kafka.spiffe.kafka.SpiffeSslEngineFactory;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
 import io.github.bpalermo.odradek.config.v1.SpiffeSource;
@@ -12,10 +14,12 @@ import java.nio.file.Path;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.BooleanSupplier;
 import javax.net.ssl.SSLException;
+import org.apache.kafka.common.config.SslConfigs;
+import org.apache.kafka.common.security.auth.SslEngineFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -154,20 +158,34 @@ class SpiffeCredentialSourceTest {
   @Test
   void brokerIsVerifiedAgainstTheBundleOfItsOwnTrustDomain() throws Exception {
     agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of("partner.test", partnerCa));
-    SpiffeCredentialSource watch = connect();
-    assertThat(watch.current().bundles()).containsOnlyKeys("example.org", "partner.test");
-    ReloadingSslEngineFactory factory =
-        factory(watch, new PeerPolicy(Set.of(PARTNER_BROKER_ID), "example.org"));
-
-    assertThat(TlsTest.handshake(factory, "10.0.0.1", broker, ca)).isEqualTo("CN=app");
-    assertThat(TlsTest.handshake(factory, "10.0.0.1", partnerBroker, ca)).isEqualTo("CN=app");
-    // The partner's authority is trusted, but only for the partner's own identities.
-    assertThatThrownBy(() -> TlsTest.handshake(factory, "10.0.0.1", impostor, ca))
-        .isInstanceOf(SSLException.class);
+    Tls tls =
+        Tls.newBuilder()
+            .setSpiffe(SpiffeSource.getDefaultInstance())
+            .addAcceptedSpiffeIds(PARTNER_BROKER_ID)
+            .setAcceptedTrustDomain("example.org")
+            .build();
+    ServerConfig config =
+        ServerConfig.newBuilder()
+            .putClusters("a", Cluster.newBuilder().setTls(tls).build())
+            .build();
+    try (TlsSources sources = TlsSources.create(config, "unix://" + socket, WAIT)) {
+      assertThat(sources.sources().get("a").current().bundles())
+          .containsOnlyKeys("example.org", "partner.test");
+      SslEngineFactory factory = factory(sources, "a");
+      try {
+        assertThat(TlsTest.handshake(factory, "10.0.0.1", broker, ca)).isEqualTo("CN=app");
+        assertThat(TlsTest.handshake(factory, "10.0.0.1", partnerBroker, ca)).isEqualTo("CN=app");
+        // The partner's authority is trusted, but only for the partner's own identities.
+        assertThatThrownBy(() -> TlsTest.handshake(factory, "10.0.0.1", impostor, ca))
+            .isInstanceOf(SSLException.class);
+      } finally {
+        factory.close();
+      }
+    }
   }
 
   @Test
-  void clustersOnOneSocketShareOneWatch() throws Exception {
+  void clustersOnOneSocketShareOneStreamWithTheirKafkaClients() throws Exception {
     agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of());
     Cluster cluster =
         Cluster.newBuilder()
@@ -179,14 +197,72 @@ class SpiffeCredentialSourceTest {
     ServerConfig config =
         ServerConfig.newBuilder().putClusters("a", cluster).putClusters("b", cluster).build();
     try (TlsSources tls = TlsSources.create(config, "unix://" + socket, WAIT)) {
+      assertThat(tls.sources().get("a")).isSameAs(tls.sources().get("b"));
       Map<String, Object> a = new HashMap<>();
-      Map<String, Object> b = new HashMap<>();
       tls.apply("a", a);
-      tls.apply("b", b);
-      TlsBinding first = (TlsBinding) a.get(ReloadingSslEngineFactory.BINDING_CONFIG);
-      TlsBinding second = (TlsBinding) b.get(ReloadingSslEngineFactory.BINDING_CONFIG);
-      assertThat(first.source()).isSameAs(second.source());
-      assertThat(agent.streamsOpened()).isEqualTo(1);
+      assertThat(a)
+          .containsEntry(
+              SslConfigs.SSL_ENGINE_FACTORY_CLASS_CONFIG, SpiffeSslEngineFactory.class.getName())
+          .containsEntry(SpiffeConfig.ENDPOINT_SOCKET, "unix://" + socket)
+          .containsEntry(SpiffeConfig.PEER_ALLOWED_TRUST_DOMAINS, List.of("example.org"))
+          .containsEntry(SpiffeConfig.METRICS_JMX_ENABLED, false)
+          .doesNotContainKey(ReloadingSslEngineFactory.BINDING_CONFIG);
+      SslEngineFactory first = factory(tls, "a");
+      SslEngineFactory second = factory(tls, "b");
+      try {
+        assertThat(TlsTest.handshake(first, "10.0.0.1", broker, ca)).isEqualTo("CN=app");
+        assertThat(TlsTest.handshake(second, "10.0.0.1", broker, ca)).isEqualTo("CN=app");
+        // The server's source and both factories read one stream.
+        assertThat(agent.streamsOpened()).isEqualTo(1);
+
+        // A rotation reaches the factories through the same source.
+        agent.publish(APP_ID, appNext.certPem(), appNext.keyPem(), ca, Map.of());
+        await(() -> subject(tls.sources().get("a").current()).equals("CN=app-next"));
+        assertThat(TlsTest.handshake(first, "10.0.0.1", broker, ca)).isEqualTo("CN=app-next");
+        assertThat(agent.streamsOpened()).isEqualTo(1);
+      } finally {
+        first.close();
+        second.close();
+      }
+    }
+  }
+
+  @Test
+  void spiffeKeysInAClustersPropertiesAreRefused() throws Exception {
+    Cluster cluster =
+        Cluster.newBuilder()
+            .setTls(
+                Tls.newBuilder()
+                    .setSpiffe(SpiffeSource.getDefaultInstance())
+                    .addAcceptedSpiffeIds(BROKER_ID))
+            .putConsumerProperties(SpiffeConfig.PEER_ALLOWED_TRUST_DOMAINS, "partner.test")
+            .build();
+    ServerConfig config = ServerConfig.newBuilder().putClusters("a", cluster).build();
+    assertThatThrownBy(() -> TlsSources.create(config, "unix://" + socket, WAIT))
+        .isInstanceOf(CredentialException.class)
+        .hasMessageContaining("clusters.a")
+        .hasMessageContaining(SpiffeConfig.PEER_ALLOWED_TRUST_DOMAINS);
+  }
+
+  @Test
+  void onlyTheServersSpiffeKeysReachTheLibrary() throws Exception {
+    agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of());
+    Cluster cluster =
+        Cluster.newBuilder()
+            .setTls(
+                Tls.newBuilder()
+                    .setSpiffe(SpiffeSource.getDefaultInstance())
+                    .addAcceptedSpiffeIds(BROKER_ID))
+            .build();
+    ServerConfig config = ServerConfig.newBuilder().putClusters("a", cluster).build();
+    try (TlsSources tls = TlsSources.create(config, "unix://" + socket, WAIT)) {
+      Map<String, Object> properties = new HashMap<>();
+      properties.put(SpiffeConfig.PEER_ALLOWED_ID_PATTERNS, List.of("spiffe://partner.test/**"));
+      tls.apply("a", properties);
+      assertThat(properties)
+          .doesNotContainKey(SpiffeConfig.PEER_ALLOWED_ID_PATTERNS)
+          .doesNotContainKey(SpiffeConfig.PEER_ALLOWED_TRUST_DOMAINS)
+          .containsEntry(SpiffeConfig.PEER_ALLOWED_IDS, List.of(BROKER_ID));
     }
   }
 
@@ -220,10 +296,16 @@ class SpiffeCredentialSourceTest {
         .hasMessageContaining("SPIFFE_ENDPOINT_SOCKET");
   }
 
-  private static ReloadingSslEngineFactory factory(CredentialSource source, PeerPolicy policy) {
-    ReloadingSslEngineFactory factory = new ReloadingSslEngineFactory();
-    factory.configure(
-        Map.of(ReloadingSslEngineFactory.BINDING_CONFIG, new TlsBinding(source, policy)));
+  /** The engine factory a cluster's Kafka clients get, configured as Kafka would. */
+  private static SslEngineFactory factory(TlsSources sources, String cluster) throws Exception {
+    Map<String, Object> properties = new HashMap<>();
+    sources.apply(cluster, properties);
+    SslEngineFactory factory =
+        (SslEngineFactory)
+            Class.forName((String) properties.get(SslConfigs.SSL_ENGINE_FACTORY_CLASS_CONFIG))
+                .getConstructor()
+                .newInstance();
+    factory.configure(properties);
     return factory;
   }
 

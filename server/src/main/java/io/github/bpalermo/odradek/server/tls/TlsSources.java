@@ -1,5 +1,7 @@
 package io.github.bpalermo.odradek.server.tls;
 
+import io.github.bpalermo.kafka.spiffe.kafka.SpiffeConfig;
+import io.github.bpalermo.kafka.spiffe.kafka.SpiffeSslEngineFactory;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.ListenerTls;
@@ -17,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -136,6 +139,20 @@ public final class TlsSources implements Closeable {
               cluster.getPropertiesMap(),
               cluster.getProducerPropertiesMap(),
               cluster.getConsumerPropertiesMap())) {
+        if (tls.hasSpiffe()) {
+          for (String key : properties.keySet()) {
+            if (key.startsWith(SpiffeConfig.PREFIX)) {
+              // The library would combine them with what tls says, and so widen it.
+              throw new CredentialException(
+                  "clusters."
+                      + name
+                      + ": "
+                      + key
+                      + " is set, but the server sets the spiffe.* keys of a cluster whose tls has"
+                      + " a spiffe source from tls itself; remove it");
+            }
+          }
+        }
         String protocol = properties.get(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG);
         if (protocol != null && !TLS_PROTOCOLS.contains(protocol)) {
           throw new CredentialException(
@@ -242,6 +259,11 @@ public final class TlsSources implements Closeable {
   /**
    * Adds to a Kafka client's properties what makes it use the cluster's credentials. Does nothing
    * for a cluster without {@code tls}.
+   *
+   * <p>A {@code spiffe} source gets kafka-spiffe's engine factory (ADR 9), with the keys under
+   * which it reads the same shared source as the server: the socket, no SVID selection, the
+   * library's MBeans off. A {@code files} source gets the server's own {@link
+   * ReloadingSslEngineFactory}.
    */
   public void apply(String cluster, Map<String, Object> properties) {
     TlsBinding binding = bindings.get(cluster);
@@ -249,9 +271,31 @@ public final class TlsSources implements Closeable {
       return;
     }
     properties.putIfAbsent(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, "SSL");
+    if (binding.source() instanceof SpiffeCredentialSource spiffe) {
+      properties.put(
+          SslConfigs.SSL_ENGINE_FACTORY_CLASS_CONFIG, SpiffeSslEngineFactory.class.getName());
+      // Only the server's: tls is what the library is told, whatever else the map holds.
+      properties.keySet().removeIf(key -> key.startsWith(SpiffeConfig.PREFIX));
+      properties.putAll(spiffeKeys(spiffe.socket(), binding.policy()));
+      return;
+    }
     properties.put(
         SslConfigs.SSL_ENGINE_FACTORY_CLASS_CONFIG, ReloadingSslEngineFactory.class.getName());
     properties.put(ReloadingSslEngineFactory.BINDING_CONFIG, binding);
+  }
+
+  /** The library's keys for a socket's shared source and the identities accepted of brokers. */
+  static Map<String, Object> spiffeKeys(String socket, PeerPolicy policy) {
+    Map<String, Object> keys = new HashMap<>();
+    keys.put(SpiffeConfig.ENDPOINT_SOCKET, UNIX + socket);
+    keys.put(SpiffeConfig.METRICS_JMX_ENABLED, false);
+    if (!policy.spiffeIds().isEmpty()) {
+      keys.put(SpiffeConfig.PEER_ALLOWED_IDS, List.copyOf(new TreeSet<>(policy.spiffeIds())));
+    }
+    if (!policy.trustDomain().isEmpty()) {
+      keys.put(SpiffeConfig.PEER_ALLOWED_TRUST_DOMAINS, List.of(policy.trustDomain()));
+    }
+    return keys;
   }
 
   /** The credential source of every cluster with {@code tls}, by cluster name. */
