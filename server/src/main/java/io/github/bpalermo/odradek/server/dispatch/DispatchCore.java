@@ -161,6 +161,15 @@ import java.util.TreeSet;
  *
  * <p>{@link PartitionsLost} emits the {@link Drop}s and nothing else.
  *
+ * <h2>What a commit names (ADR 8)</h2>
+ *
+ * <p>What cannot be finished leaves acknowledged records above the commit position all the same.
+ * {@link #acknowledgedAbove} reports them, for the commit's metadata, and {@link PartitionReleased}
+ * carries them as they stood when the partition was released. The next owner is assigned the
+ * partition with them ({@link PartitionAssigned#acknowledged}): a record fetched at one of those
+ * offsets is acknowledged on arrival, is not delivered, holds back nothing, and is reported again
+ * for as long as it lies above the commit position.
+ *
  * <h2>Time</h2>
  *
  * <p>Times are nanoseconds of a monotonic clock, compared as {@link System#nanoTime} values are. A
@@ -397,10 +406,17 @@ public final class DispatchCore<R> {
     /** The records this core sent that are still at or above the commit position. */
     int sent;
 
-    Part(int id, long position) {
+    /** The records of {@link #log} that are acknowledged: all of them above the commit position. */
+    int acknowledged;
+
+    /** What the partition's last owner acknowledged above the position it was assigned at. */
+    final CommitMetadata skip;
+
+    Part(int id, long position, CommitMetadata skip) {
       this.id = id;
       this.end = position;
       this.emitted = position;
+      this.skip = skip;
     }
 
     long commit() {
@@ -474,6 +490,7 @@ public final class DispatchCore<R> {
   private long timerSeq;
   private int atWindow;
   private long windowPauses;
+  private long skipped;
 
   private final TreeMap<Integer, Part<R>> partitions = new TreeMap<>();
 
@@ -541,7 +558,7 @@ public final class DispatchCore<R> {
       case PartitionAssigned<R> e -> assigned(e, out);
       case PartitionsRevoked<R> e -> revoked(e, out);
       case PartitionsLost<R> e -> lost(e, out);
-      case RecordsFetched<R> e -> fetched(e);
+      case RecordsFetched<R> e -> fetched(e, out);
       case ReceiverJoined<R> e -> joined(e);
       case ReceiverLeft<R> e -> left(e);
       case CreditsGranted<R> e -> credits(e);
@@ -604,6 +621,36 @@ public final class DispatchCore<R> {
   }
 
   /**
+   * How many fetched records were taken as acknowledged without being delivered, because the
+   * partition's last owner had acknowledged them (ADR 8), since the core exists.
+   */
+  public long skipped() {
+    return skipped;
+  }
+
+  /**
+   * The offsets above a partition's commit position that are acknowledged, as far as a commit can
+   * carry them (ADR 8): what a commit made now should carry besides {@link #committable}. Nothing
+   * for a partition the core does not have.
+   */
+  public CommitMetadata acknowledgedAbove(int partition) {
+    Part<R> p = partitions.get(partition);
+    return p == null ? CommitMetadata.NONE : acknowledgedAbove(p).build();
+  }
+
+  private static <R> CommitMetadata.Builder acknowledgedAbove(Part<R> p) {
+    CommitMetadata.Builder above = CommitMetadata.above(p.commit());
+    if (p.acknowledged > 0) {
+      for (Rec<R> rec : p.log) {
+        if (rec.state == State.ACKED) {
+          above.add(rec.offset);
+        }
+      }
+    }
+    return above;
+  }
+
+  /**
    * Changes the processing deadline, for the records sent from now on: it comes from the
    * application, and so changes with its versions while the other settings stay. What is in flight
    * keeps the deadline it was sent under.
@@ -660,7 +707,7 @@ public final class DispatchCore<R> {
     if (previous != null) {
       release(List.of(previous), false, out);
     }
-    partitions.put(e.partition(), new Part<>(e.partition(), e.position()));
+    partitions.put(e.partition(), new Part<>(e.partition(), e.position(), e.acknowledged()));
   }
 
   private void revoked(PartitionsRevoked<R> e, List<DispatchAction<R>> out) {
@@ -815,6 +862,21 @@ public final class DispatchCore<R> {
     release(done, true, out);
   }
 
+  /** How many records this core sent and leaves above the commit position, that a commit names. */
+  private static <R> int carried(Part<R> p) {
+    if (p.acknowledged == 0) {
+      return 0;
+    }
+    CommitMetadata.Builder above = CommitMetadata.above(p.commit());
+    int carried = 0;
+    for (Rec<R> rec : p.log) {
+      if (rec.state == State.ACKED && above.add(rec.offset) && rec.delivered) {
+        carried++;
+      }
+    }
+    return carried;
+  }
+
   /** Whether nothing of the partition is in flight or being written as a dead letter. */
   private static <R> boolean answered(Part<R> p) {
     return p.inFlight == 0 && p.deadLettering.isEmpty();
@@ -829,7 +891,9 @@ public final class DispatchCore<R> {
     for (Part<R> p : gone) {
       if (handOver) {
         commit(p, out);
-        released.add(new PartitionReleased<>(p.id, answered(p), p.sent));
+        released.add(
+            new PartitionReleased<>(
+                p.id, answered(p), p.sent, carried(p), acknowledgedAbove(p).build()));
       }
       partitions.remove(p.id);
       sendable.remove(p);
@@ -865,15 +929,26 @@ public final class DispatchCore<R> {
   // Records
   // ---------------------------------------------------------------------------------------------
 
-  private void fetched(RecordsFetched<R> e) {
+  private void fetched(RecordsFetched<R> e, List<DispatchAction<R>> out) {
     Part<R> p = partitions.get(e.partition());
     if (p == null || p.draining) {
       return;
     }
     boolean keyed = settings.ordering() == Ordering.KEY;
+    long skippedBefore = skipped;
     for (Fetched<R> fetched : e.records()) {
       if (fetched.offset() < p.end) {
         // Not after what was fetched before: the core has it, or is past it.
+        continue;
+      }
+      if (p.skip.acknowledged(fetched.offset())) {
+        // The last owner had it acknowledged: it holds back nothing, and the commit passes it.
+        Rec<R> rec = new Rec<>(p, fetched.offset(), fetched.sizeBytes(), null, null);
+        rec.state = State.ACKED;
+        p.log.addLast(rec);
+        p.acknowledged++;
+        p.end = rec.offset + 1;
+        skipped++;
         continue;
       }
       Rec<R> rec =
@@ -891,8 +966,12 @@ public final class DispatchCore<R> {
       p.buffered++;
       p.bufferedBytes += rec.size;
     }
-    admit(p);
-    refresh(p);
+    if (skippedBefore != skipped) {
+      settle(p, out);
+    } else {
+      admit(p);
+      refresh(p);
+    }
     fetchedInto = p;
   }
 
@@ -1494,6 +1573,7 @@ public final class DispatchCore<R> {
     rec.payload = null;
     rec.detail = null;
     rec.state = State.ACKED;
+    p.acknowledged++;
     if (rec.key != null) {
       // The next record of the key takes its turn; while the partition is handed over, only if
       // it lies below the limit. The records that wait behind one that does not, do not either.
@@ -1514,8 +1594,11 @@ public final class DispatchCore<R> {
         oldest != null && oldest.state == State.ACKED;
         oldest = p.log.peekFirst()) {
       p.log.pollFirst();
-      // Only a record that was sent is ever acknowledged.
-      p.sent--;
+      p.acknowledged--;
+      // A record that was not sent was acknowledged by the partition's last owner.
+      if (oldest.delivered) {
+        p.sent--;
+      }
     }
     admit(p);
     refresh(p);

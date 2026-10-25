@@ -244,6 +244,11 @@ class ReplicasE2eTest {
       holding = true;
     }
 
+    /** Where the records kept unacknowledged are, as "partition/offset". */
+    synchronized List<String> heldAt() {
+      return held.stream().map(ack -> ack.getPartition() + "/" + ack.getFirstOffset()).toList();
+    }
+
     /** The slow handlers are done: what was kept is acknowledged, and nothing is kept any more. */
     void release() {
       List<Ack> kept;
@@ -945,6 +950,54 @@ class ReplicasE2eTest {
     assertThat(one.closed).as("the first app's stream").isNotDone();
     assertThat(two.closed).as("the second app's stream").isNotDone();
     await("the replica that is left lists itself alone", () -> replicas.get(0).replicaCount() == 1);
+  }
+
+  @Test
+  void aReplicaThatCannotFinishWhatItHeldBackLeavesNothingAcknowledgedToBeHandledTwice()
+      throws Exception {
+    replicas(2);
+    // As above, but the slow handlers do not finish before the hand-over's wait is over. The
+    // commit stops at the first record of a slow key, and names what was acknowledged above it
+    // (ADR 8): the next owner hands out again only what an app still held.
+    App one = app();
+    App two = app();
+    awaitMembers(2);
+    watchCommits();
+    flow = new Flow();
+    await("records flow", () -> handled.size() >= 10 * KEYS);
+
+    one.hold();
+    two.hold();
+    await(
+        "every partition has records held back below a record that is acknowledged",
+        () -> heldBack().values().stream().allMatch(values -> values.size() >= 3));
+
+    DispatcherHarness stopped = replicas.get(1);
+    stopped.stopDispatcher();
+    // Only now do the slow handlers finish: what they held was never acknowledged in time.
+    Set<String> unanswered = new HashSet<>();
+    unanswered.addAll(one.heldAt());
+    unanswered.addAll(two.heldAt());
+    one.release();
+    two.release();
+    int stoppedAt = flow.count();
+    Map<String, Set<Integer>> left = awaitMembers(1);
+    assertThat(left.values().iterator().next()).as("the replica that is left").hasSize(PARTITIONS);
+    await("records flow after the hand-over", () -> flow.count() >= stoppedAt + 10 * KEYS);
+
+    List<String> produced = flow.finish();
+    awaitHandled("everything is handled", produced);
+    awaitCommitted();
+    List<String> twice = handledTwice();
+    assertThat(twice)
+        .as("handled twice, of what no app held when the replica stopped: held %s", unanswered)
+        .allMatch(value -> unanswered.contains(flow.placed.get(value)));
+    assertThat(replicas.get(0).logged("were acknowledged by its last owner"))
+        .as("partitions taken with acknowledged records above their committed offsets")
+        .isNotEmpty();
+    assertOrderPerKey(produced);
+    assertThat(one.closed).as("the first app's stream").isNotDone();
+    assertThat(two.closed).as("the second app's stream").isNotDone();
   }
 
   @Test

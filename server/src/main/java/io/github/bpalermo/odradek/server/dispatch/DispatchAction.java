@@ -101,9 +101,20 @@ public sealed interface DispatchAction<R> {
    *     next owner then sends again while a receiver may still be working on them. It says nothing
    *     of records that were held back and could not be sent in the time there was: nobody has
    *     those
-   * @param resent how many records this core had sent and leaves at or above the commit position:
-   *     what the next owner sends again, whether they were acknowledged here or not
+   * @param resent how many records this core had sent and leaves at or above the commit position,
+   *     acknowledged here or not
+   * @param carried how many of those are acknowledged and in {@code acknowledged}: {@code resent -
+   *     carried} is what the next owner sends again, when the last commit carries it
+   * @param acknowledged the offsets above the last {@link Commit} that are acknowledged, which the
+   *     last commit carries (ADR 8)
    */
-  record PartitionReleased<R>(int partition, boolean inTime, int resent)
-      implements DispatchAction<R> {}
+  record PartitionReleased<R>(
+      int partition, boolean inTime, int resent, int carried, CommitMetadata acknowledged)
+      implements DispatchAction<R> {
+
+    /** A partition released with nothing acknowledged above its commit position. */
+    public PartitionReleased(int partition, boolean inTime, int resent) {
+      this(partition, inTime, resent, 0, CommitMetadata.NONE);
+    }
+  }
 }

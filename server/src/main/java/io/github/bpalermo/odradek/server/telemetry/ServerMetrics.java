@@ -80,6 +80,7 @@ public final class ServerMetrics {
   private final LongUpDownCounter dispatchAtWindow;
   private final LongCounter dispatchHandOvers;
   private final LongCounter dispatchHandOverRecords;
+  private final LongCounter dispatchHandOverSkipped;
   private final LongCounter dispatchDeclarationsRefused;
   private final LongUpDownCounter receiveStreams;
   private final LongUpDownCounter receiveStreamsWanted;
@@ -239,6 +240,14 @@ public final class ServerMetrics {
             .setDescription(
                 "Records this replica had sent and left above the committed offset of a partition"
                     + " it gave up: what the next owner sends again.")
+            .setUnit("{record}")
+            .build();
+    dispatchHandOverSkipped =
+        meter
+            .counterBuilder("odradek.dispatch.handover.skipped")
+            .setDescription(
+                "Records of a partition this replica took that its last owner had acknowledged"
+                    + " above the committed offset, and that are not delivered again (ADR 8).")
             .setUnit("{record}")
             .build();
     dispatchDeclarationsRefused =
@@ -582,6 +591,14 @@ public final class ServerMetrics {
       if (resent > 0) {
         dispatchHandOverRecords.add(resent, attributes);
       }
+    }
+
+    /**
+     * Records fetched from partitions this replica took were not delivered, {@code records} of
+     * them: their last owner had acknowledged them.
+     */
+    public void skipped(long records) {
+      dispatchHandOverSkipped.add(records, attributes);
     }
   }
 

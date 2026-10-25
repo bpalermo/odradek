@@ -58,6 +58,7 @@ import org.apache.kafka.clients.consumer.InvalidOffsetException;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.OffsetMetadataTooLarge;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.record.TimestampType;
 import org.slf4j.Logger;
@@ -262,6 +263,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     int reportedInFlight;
     int reportedAtWindow;
     long reportedWindowPauses;
+    long reportedSkipped;
     final Throttled rejects;
     final Throttled exhausted;
     final Throttled deadLetterFailures;
@@ -306,6 +308,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       adopt = true;
       incarnation = ++incarnations;
       reportedWindowPauses = 0;
+      reportedSkipped = 0;
     }
 
     @Override
@@ -334,9 +337,16 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     /** The last position handed to a commit; -1 when the group has none, or a commit failed. */
     long committed;
 
-    Owned(long toCommit, long committed) {
+    /** The offsets above {@link #toCommit} known to be acknowledged (ADR 8). */
+    CommitMetadata above = CommitMetadata.NONE;
+
+    /** The metadata handed to the last commit; null when a commit failed. */
+    String metadata;
+
+    Owned(long toCommit, long committed, String metadata) {
       this.toCommit = toCommit;
       this.committed = committed;
+      this.metadata = metadata;
     }
   }
 
@@ -392,6 +402,9 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   private boolean pausesChanged;
   private boolean stopping;
   private long lastCommitNanos;
+
+  /** Whether the brokers refused the acknowledged offsets in a commit's metadata (ADR 8). */
+  private boolean metadataRefused;
 
   /**
    * @param factory creates the group's Kafka consumer, on the group's thread
@@ -930,8 +943,22 @@ final class DispatchGroup implements ConsumerRebalanceListener {
               key.group());
         }
         case PartitionReleased<Held> released -> {
-          if (releasing.remove(new TopicPartition(topic.name, released.partition()))) {
-            topic.metrics.handedOver(released.inTime(), released.resent());
+          TopicPartition partition = new TopicPartition(topic.name, released.partition());
+          Owned state = owned.get(partition);
+          if (state != null) {
+            state.above = released.acknowledged();
+          }
+          if (releasing.remove(partition)) {
+            int resent = released.resent() - (metadataRefused ? 0 : released.carried());
+            topic.metrics.handedOver(released.inTime(), resent);
+            LOG.info(
+                "{} of group {} is given up at offset {}: {} record(s) it sent are left above it,"
+                    + " {} of them acknowledged and named in the commit",
+                partition,
+                key.group(),
+                state == null ? -1 : state.toCommit,
+                released.resent(),
+                released.resent() - resent);
             if (!released.inTime()) {
               LOG.warn(
                   "{}-{} of group {} is given up with records still unanswered after {}: its next"
@@ -1106,6 +1133,11 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       topic.metrics.windowPauses(pauses - topic.reportedWindowPauses);
       topic.reportedWindowPauses = pauses;
     }
+    long skipped = topic.core.skipped();
+    if (skipped != topic.reportedSkipped) {
+      topic.metrics.skipped(skipped - topic.reportedSkipped);
+      topic.reportedSkipped = skipped;
+    }
   }
 
   /** The topic is no longer dispatched: its gauges go back to nothing. */
@@ -1225,6 +1257,24 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         positions.put(partition, offset.offset());
       }
     }
+    Map<TopicPartition, CommitMetadata> acknowledged = new HashMap<>();
+    committed.forEach(
+        (partition, offset) -> {
+          CommitMetadata above =
+              offset == null
+                  ? CommitMetadata.NONE
+                  : CommitMetadata.decode(offset.offset(), offset.metadata());
+          if (above.count() > 0) {
+            acknowledged.put(partition, above);
+            LOG.info(
+                "{} of group {}: {} record(s) above offset {} were acknowledged by its last owner"
+                    + " and are not delivered again",
+                partition,
+                key.group(),
+                above.count(),
+                offset.offset());
+          }
+        });
     positions.putAll(startPositions(uncommitted, true));
     for (TopicPartition partition : known) {
       long position = positions.get(partition);
@@ -1236,8 +1286,15 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       }
       // Without a committed offset the position found is committed at the next interval, so
       // that a restart does not look for it again and, under LATEST, skip what arrived since.
-      owned.put(partition, new Owned(position, uncommitted.contains(partition) ? -1 : position));
-      on(topic, new PartitionAssigned<>(partition.partition(), position));
+      OffsetAndMetadata offset = committed.get(partition);
+      CommitMetadata above = acknowledged.getOrDefault(partition, CommitMetadata.NONE);
+      Owned state =
+          offset == null
+              ? new Owned(position, -1, null)
+              : new Owned(position, position, offset.metadata());
+      state.above = above;
+      owned.put(partition, state);
+      on(topic, new PartitionAssigned<>(partition.partition(), position, above));
     }
     LOG.info("group {} on cluster {} dispatches {}", key.group(), key.cluster(), positions);
   }
@@ -1310,7 +1367,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     if (topic.blocked.remove(partition.partition())) {
       topic.metrics.blocked(-1);
     }
-    owned.put(partition, new Owned(position, -1));
+    owned.put(partition, new Owned(position, -1, null));
     // The core drops what it had of the partition and starts from here.
     on(topic, new PartitionAssigned<>(partition.partition(), position));
   }
@@ -1472,24 +1529,65 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   private long position(TopicPartition partition, Owned state) {
     Topic topic = topics.get(partition.topic());
     if (topic != null) {
-      // Empty once the core has released the partition: its last Commit said where it stood.
+      // Empty once the core has released the partition: its last Commit said where it stood, and
+      // its PartitionReleased what was acknowledged above.
       OptionalLong committable = topic.core.committable(partition.partition());
       if (committable.isPresent()) {
         state.toCommit = Math.max(state.toCommit, committable.getAsLong());
+        state.above = topic.core.acknowledgedAbove(partition.partition());
       }
     }
     return state.toCommit;
   }
 
-  /** Commits the positions that moved since the last commit, without waiting for the answer. */
+  /**
+   * What a commit of an owned partition carries now: its position and, unless the brokers refused
+   * it, the offsets acknowledged above it (ADR 8).
+   */
+  private OffsetAndMetadata toCommit(TopicPartition partition, Owned state) {
+    long position = position(partition, state);
+    String metadata = metadataRefused ? "" : state.above.rebased(position).encode();
+    return new OffsetAndMetadata(position, metadata);
+  }
+
+  /**
+   * After a commit failed because of its metadata: the brokers' {@code offset.metadata.max.bytes}
+   * is less than it, and the group commits without it from now on.
+   */
+  private boolean refusedMetadata(Throwable failure) {
+    for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+      if (cause instanceof OffsetMetadataTooLarge) {
+        if (!metadataRefused) {
+          metadataRefused = true;
+          LOG.warn(
+              "the brokers of cluster {} refuse the acknowledged offsets in the commits of group {}"
+                  + " (offset.metadata.max.bytes); it commits without them, and a change of replica"
+                  + " delivers again what was acknowledged above the committed offsets: {}",
+              key.cluster(),
+              key.group(),
+              cause.toString());
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Commits the positions that moved since the last commit, and those whose acknowledged offsets
+   * above changed, without waiting for the answer.
+   */
   private void commitAsync() {
     Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
     owned.forEach(
         (partition, state) -> {
-          long position = position(partition, state);
-          if (position > state.committed) {
-            offsets.put(partition, new OffsetAndMetadata(position));
-            state.committed = position;
+          OffsetAndMetadata offset = toCommit(partition, state);
+          // A partition whose position is held is committed again when what is acknowledged
+          // above it changes.
+          if (offset.offset() > state.committed || !offset.metadata().equals(state.metadata)) {
+            offsets.put(partition, offset);
+            state.committed = offset.offset();
+            state.metadata = offset.metadata();
           }
         });
     if (offsets.isEmpty()) {
@@ -1501,16 +1599,19 @@ final class DispatchGroup implements ConsumerRebalanceListener {
           if (failure == null) {
             return;
           }
-          // Expected while the group rebalances, as it does when a topic is declared.
-          LOG.warn(
-              "asynchronous commit of {} failed; it is tried again: {}",
-              committed,
-              failure.toString());
+          if (!refusedMetadata(failure)) {
+            // Expected while the group rebalances, as it does when a topic is declared.
+            LOG.warn(
+                "asynchronous commit of {} failed; it is tried again: {}",
+                committed,
+                failure.toString());
+          }
           committed.forEach(
               (partition, offset) -> {
                 Owned state = owned.get(partition);
                 if (state != null && state.committed == offset.offset()) {
                   state.committed = -1;
+                  state.metadata = null;
                 }
               });
         });
@@ -1525,26 +1626,51 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     for (TopicPartition partition : partitions) {
       Owned state = owned.get(partition);
       if (state != null) {
-        long position = position(partition, state);
-        offsets.put(partition, new OffsetAndMetadata(position));
-        state.committed = position;
+        OffsetAndMetadata offset = toCommit(partition, state);
+        offsets.put(partition, offset);
+        state.committed = offset.offset();
+        state.metadata = offset.metadata();
       }
     }
     if (offsets.isEmpty()) {
       return;
     }
     try {
-      blocking(
-          () -> {
-            consumer.commitSync(offsets);
-            return null;
-          });
+      commitNow(offsets);
     } catch (RuntimeException e) {
-      LOG.warn(
-          "commit of {} failed; what was acknowledged above the last commit is delivered again",
-          offsets,
-          e);
+      if (!refusedMetadata(e)) {
+        LOG.warn(
+            "commit of {} failed; what was acknowledged above the last commit is delivered again",
+            offsets,
+            e);
+        return;
+      }
+      Map<TopicPartition, OffsetAndMetadata> bare = new HashMap<>();
+      offsets.forEach(
+          (partition, offset) -> {
+            bare.put(partition, new OffsetAndMetadata(offset.offset()));
+            Owned state = owned.get(partition);
+            if (state != null) {
+              state.metadata = "";
+            }
+          });
+      try {
+        commitNow(bare);
+      } catch (RuntimeException again) {
+        LOG.warn(
+            "commit of {} failed; what was acknowledged above the last commit is delivered again",
+            bare,
+            again);
+      }
     }
+  }
+
+  private void commitNow(Map<TopicPartition, OffsetAndMetadata> offsets) {
+    blocking(
+        () -> {
+          consumer.commitSync(offsets);
+          return null;
+        });
   }
 
   // ---------------------------------------------------------------------------------------------
