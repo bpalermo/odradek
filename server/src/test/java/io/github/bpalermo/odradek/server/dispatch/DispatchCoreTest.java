@@ -1234,6 +1234,24 @@ class DispatchCoreTest {
   }
 
   @Test
+  void whatTheLastOwnerAcknowledgedIsNamedBeforeItIsFetched() {
+    start(Ordering.KEY);
+    assertThat(on(new PartitionAssigned<>(0, 0, acked(0, 2, 5)))).isEmpty();
+    // Nothing is fetched yet: a commit made now names all of it, or the next owner would
+    // deliver it again.
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(acked(0, 2, 5));
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:y", "2:z"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 1));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(acked(0, 2, 5));
+    assertThat(ack("a", 0, 1)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    // 0 is not answered in time; 5 was never fetched, and is named all the same.
+    assertThat(after(GRACE))
+        .containsExactly(new Drop<>("a", List.of(0)), released(0, false, 2, 1, 0, 1, 2, 5));
+  }
+
+  @Test
   void theNewestRecordSentIsNotSentAgainDuringAHandOver() {
     start(Ordering.NONE);
     assign(0, 0);

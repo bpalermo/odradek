@@ -647,6 +647,9 @@ public final class DispatchCore<R> {
         }
       }
     }
+    // What the last owner acknowledged and has not been fetched yet: a commit before it arrives
+    // names it too, or the next owner would deliver it again.
+    p.skip.forEachFrom(p.end, above::add);
     return above;
   }
 

@@ -372,6 +372,12 @@ final class DispatchGroup implements ConsumerRebalanceListener {
   /** The partitions being handed over that their cores have not released yet. */
   private final Set<TopicPartition> releasing = new HashSet<>();
 
+  /**
+   * The partitions being handed over that their cores have released, until their last commit says
+   * whether it named what was acknowledged above them.
+   */
+  private final Map<TopicPartition, PartitionReleased<Held>> awaitingLastCommit = new HashMap<>();
+
   /** Records sent of partitions that were being handed over, since the group exists. */
   private long sentWhileGivingUp;
 
@@ -949,16 +955,8 @@ final class DispatchGroup implements ConsumerRebalanceListener {
             state.above = released.acknowledged();
           }
           if (releasing.remove(partition)) {
-            int resent = released.resent() - (metadataRefused ? 0 : released.carried());
-            topic.metrics.handedOver(released.inTime(), resent);
-            LOG.info(
-                "{} of group {} is given up at offset {}: {} record(s) it sent are left above it,"
-                    + " {} of them acknowledged and named in the commit",
-                partition,
-                key.group(),
-                state == null ? -1 : state.toCommit,
-                released.resent(),
-                released.resent() - resent);
+            // Counted once the last commit says whether it named what was acknowledged above.
+            awaitingLastCommit.put(partition, released);
             if (!released.inTime()) {
               LOG.warn(
                   "{}-{} of group {} is given up with records still unanswered after {}: its next"
@@ -1444,6 +1442,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
     owned.remove(partition);
     full.remove(partition);
     releasing.remove(partition);
+    awaitingLastCommit.remove(partition);
     Topic topic = topics.get(partition.topic());
     if (topic != null && topic.blocked.remove(partition.partition())) {
       topic.metrics.blocked(-1);
@@ -1502,7 +1501,14 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       }
       passTime(now());
     }
-    commitSync(mine);
+    boolean named = commitSync(mine);
+    for (TopicPartition partition : mine) {
+      PartitionReleased<Held> done = awaitingLastCommit.remove(partition);
+      Topic topic = topics.get(partition.topic());
+      if (done != null && topic != null) {
+        handedOver(topic, partition, done, named);
+      }
+    }
     mine.forEach(this::forget);
     LOG.info(
         "group {} on cluster {} gave up {}, having sent {} record(s) it had held back",
@@ -1510,6 +1516,25 @@ final class DispatchGroup implements ConsumerRebalanceListener {
         key.cluster(),
         mine,
         sentWhileGivingUp - sentBefore);
+  }
+
+  /**
+   * Counts a released partition's hand-over: the records it sent that are left above its commit
+   * position, less those the last commit named as acknowledged when it carried its metadata.
+   */
+  private void handedOver(
+      Topic topic, TopicPartition partition, PartitionReleased<Held> done, boolean named) {
+    int resent = done.resent() - (named ? done.carried() : 0);
+    topic.metrics.handedOver(done.inTime(), resent);
+    Owned state = owned.get(partition);
+    LOG.info(
+        "{} of group {} is given up at offset {}: {} record(s) it sent are left above it,"
+            + " {} of them acknowledged and named in the commit",
+        partition,
+        key.group(),
+        state == null ? -1 : state.toCommit,
+        done.resent(),
+        done.resent() - resent);
   }
 
   private boolean waitingFor(List<TopicPartition> partitions) {
@@ -1619,9 +1644,11 @@ final class DispatchGroup implements ConsumerRebalanceListener {
 
   /**
    * Commits where these partitions stand and waits for the answer: everything acknowledged so far,
-   * not only what moved since the last asynchronous commit, which may have failed.
+   * not only what moved since the last asynchronous commit, which may have failed. Says whether the
+   * commit carried the offsets acknowledged above them: not when it failed, or the brokers refused
+   * its metadata.
    */
-  private void commitSync(Collection<TopicPartition> partitions) {
+  private boolean commitSync(Collection<TopicPartition> partitions) {
     Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
     for (TopicPartition partition : partitions) {
       Owned state = owned.get(partition);
@@ -1633,17 +1660,18 @@ final class DispatchGroup implements ConsumerRebalanceListener {
       }
     }
     if (offsets.isEmpty()) {
-      return;
+      return false;
     }
     try {
       commitNow(offsets);
+      return !metadataRefused;
     } catch (RuntimeException e) {
       if (!refusedMetadata(e)) {
         LOG.warn(
             "commit of {} failed; what was acknowledged above the last commit is delivered again",
             offsets,
             e);
-        return;
+        return false;
       }
       Map<TopicPartition, OffsetAndMetadata> bare = new HashMap<>();
       offsets.forEach(
@@ -1662,6 +1690,7 @@ final class DispatchGroup implements ConsumerRebalanceListener {
             bare,
             again);
       }
+      return false;
     }
   }
 

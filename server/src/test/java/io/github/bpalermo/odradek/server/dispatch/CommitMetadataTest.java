@@ -3,6 +3,8 @@ package io.github.bpalermo.odradek.server.dispatch;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class CommitMetadataTest {
@@ -45,6 +47,20 @@ class CommitMetadataTest {
       above.add(offset);
     }
     assertThat(above.build().encode()).hasSizeLessThan(200);
+  }
+
+  @Test
+  void theOffsetsFromOneOnAreGivenInOrder() {
+    List<Long> offsets = new ArrayList<>();
+    acked(10, 11, 13, 20).forEachFrom(13, offsets::add);
+    assertThat(offsets).containsExactly(13L, 20L);
+    offsets.clear();
+    acked(10, 11, 13, 20).forEachFrom(0, offsets::add);
+    assertThat(offsets).containsExactly(11L, 13L, 20L);
+    offsets.clear();
+    acked(10, 11, 13, 20).forEachFrom(21, offsets::add);
+    CommitMetadata.NONE.forEachFrom(0, offsets::add);
+    assertThat(offsets).isEmpty();
   }
 
   @Test

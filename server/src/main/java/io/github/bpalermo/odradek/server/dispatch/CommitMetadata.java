@@ -3,6 +3,7 @@ package io.github.bpalermo.odradek.server.dispatch;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.BitSet;
+import java.util.function.LongConsumer;
 
 /**
  * The offsets above a partition's committed offset that are acknowledged, as a commit carries them
@@ -88,6 +89,20 @@ public final class CommitMetadata {
   public boolean acknowledged(long offset) {
     long index = offset - committed - 1;
     return !bits.isEmpty() && index >= 0 && index < (long) MAX_BYTES * 8 && bits.get((int) index);
+  }
+
+  /** Gives {@code action} each acknowledged offset at or above {@code from}, lowest first. */
+  public void forEachFrom(long from, LongConsumer action) {
+    if (bits.isEmpty()) {
+      return;
+    }
+    long start = Math.max(0, from - committed - 1);
+    if (start >= bits.length()) {
+      return;
+    }
+    for (int i = bits.nextSetBit((int) start); i >= 0; i = bits.nextSetBit(i + 1)) {
+      action.accept(committed + 1 + i);
+    }
   }
 
   /** How many offsets are acknowledged. */
