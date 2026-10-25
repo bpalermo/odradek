@@ -1,5 +1,6 @@
 package io.github.bpalermo.odradek.server.dispatch;
 
+import io.github.bpalermo.kafka.spiffe.x509.SpiffeTrustManager;
 import io.github.bpalermo.odradek.config.v1.Dispatch;
 import io.github.bpalermo.odradek.server.tls.CredentialException;
 import io.github.bpalermo.odradek.server.tls.CredentialSource;
@@ -72,14 +73,19 @@ public final class DeliveryServer implements Closeable {
    */
   public static DeliveryServer start(Dispatch dispatch, DispatchService service, TlsSources tls)
       throws IOException, CredentialException {
-    return start(dispatch, service, tls.listener(), System.getenv(HOST_VARIABLE));
+    return start(
+        dispatch,
+        service,
+        tls.listener(),
+        tls.verifications(TlsSources.LISTENER),
+        System.getenv(HOST_VARIABLE));
   }
 
   /** As above, with the listener's credentials themselves; null for a plaintext port. */
   static DeliveryServer start(
       Dispatch dispatch, DispatchService service, CredentialSource credentials)
       throws IOException, CredentialException {
-    return start(dispatch, service, credentials, null);
+    return start(dispatch, service, credentials, SpiffeTrustManager.Observer.NONE, null);
   }
 
   /**
@@ -88,6 +94,17 @@ public final class DeliveryServer implements Closeable {
    */
   static DeliveryServer start(
       Dispatch dispatch, DispatchService service, CredentialSource credentials, String host)
+      throws IOException, CredentialException {
+    return start(dispatch, service, credentials, SpiffeTrustManager.Observer.NONE, host);
+  }
+
+  /** As above, telling {@code observer} what a {@code spiffe} source's verification came to. */
+  static DeliveryServer start(
+      Dispatch dispatch,
+      DispatchService service,
+      CredentialSource credentials,
+      SpiffeTrustManager.Observer observer,
+      String host)
       throws IOException, CredentialException {
     if (dispatch.hasAdvertisedAddress() && host != null && !host.isBlank()) {
       // Before anything is bound. The variable is this replica's own and the configuration is
@@ -102,7 +119,8 @@ public final class DeliveryServer implements Closeable {
       // One configuration made all three; a listener must never be less safe than its service.
       throw new IllegalStateException("dispatch.tls and the credentials loaded for it disagree");
     }
-    SslContext context = credentials == null ? null : ReloadingSslContext.forListener(credentials);
+    SslContext context =
+        credentials == null ? null : ReloadingSslContext.forListener(credentials, observer);
     EventLoopGroup acceptors = new MultiThreadIoEventLoopGroup(1, EpollIoHandler.newFactory());
     EventLoopGroup workers = new MultiThreadIoEventLoopGroup(EpollIoHandler.newFactory());
     NettyServerBuilder builder =

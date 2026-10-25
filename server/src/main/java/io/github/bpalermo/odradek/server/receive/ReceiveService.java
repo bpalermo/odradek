@@ -205,7 +205,10 @@ public final class ReceiveService implements DispatcherSource, Closeable {
       // One configuration made both; a connection must never be less safe than it asks for.
       throw new IllegalStateException("dispatcher.tls and the credentials loaded for it disagree");
     }
-    SslContext context = binding == null ? null : ReloadingSslContext.forDispatcher(binding);
+    SslContext context =
+        binding == null
+            ? null
+            : ReloadingSslContext.forDispatcher(binding, tls.verifications(TlsSources.DISPATCHER));
     if (context == null) {
       LOG.warn(
           "THE CONNECTION TO THE DISPATCHER AT {} IS PLAINTEXT AND UNAUTHENTICATED (no"

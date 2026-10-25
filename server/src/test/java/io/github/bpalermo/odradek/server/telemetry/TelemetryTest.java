@@ -5,26 +5,36 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
 
 import com.google.protobuf.util.Durations;
+import io.github.bpalermo.kafka.spiffe.id.SpiffeId;
+import io.github.bpalermo.kafka.spiffe.x509.PeerRejectedException;
 import io.github.bpalermo.odradek.config.v1.Cluster;
 import io.github.bpalermo.odradek.config.v1.Dispatch;
 import io.github.bpalermo.odradek.config.v1.Dispatcher;
 import io.github.bpalermo.odradek.config.v1.FileSource;
 import io.github.bpalermo.odradek.config.v1.ListenerTls;
 import io.github.bpalermo.odradek.config.v1.ServerConfig;
+import io.github.bpalermo.odradek.config.v1.SpiffeSource;
 import io.github.bpalermo.odradek.config.v1.Tls;
 import io.github.bpalermo.odradek.server.admin.Readiness;
+import io.github.bpalermo.odradek.server.tls.FakeWorkloadApi;
+import io.github.bpalermo.odradek.server.tls.PeerVerifications;
 import io.github.bpalermo.odradek.server.tls.TestPki;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.assertj.LongPointAssert;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -386,6 +396,10 @@ class TelemetryTest {
                       point -> point.hasValue(1).hasAttributes(listener),
                       point -> point.hasValue(1).hasAttributes(dispatcher)));
 
+      // The server's own code verifies a files source's peers: the library counts nothing.
+      assertThat(reader.collectAllMetrics())
+          .noneMatch(m -> m.getName().equals("odradek.tls.peer.verifications"));
+
       // Ready with them, and not once either has expired.
       readiness.started(tls);
       assertThat(readiness.problems(Clock.systemUTC().instant())).isEmpty();
@@ -393,6 +407,104 @@ class TelemetryTest {
           .hasSize(2)
           .allMatch(problem -> problem.contains("the certificate expired at"));
     }
+  }
+
+  @Test
+  void peerVerificationsAreCountedWhereTheLibraryVerifies() throws Exception {
+    TestPki pki = new TestPki(dir, "ca");
+    TestPki.Issued app = pki.issue("app", "uri:spiffe://example.org/app");
+    Path socket = Files.createTempDirectory(Path.of("/tmp"), "tm").resolve("agent.sock");
+    FakeWorkloadApi agent = FakeWorkloadApi.start(socket);
+    try {
+      agent.publish("spiffe://example.org/app", app.certPem(), app.keyPem(), pki.caPem(), Map.of());
+      SpiffeSource spiffe =
+          SpiffeSource.newBuilder().setWorkloadApiSocket("unix://" + socket).build();
+      ServerConfig config =
+          ServerConfig.newBuilder()
+              .putClusters(
+                  "orders",
+                  Cluster.newBuilder()
+                      .setTls(
+                          Tls.newBuilder().setSpiffe(spiffe).setAcceptedTrustDomain("example.org"))
+                      .build())
+              .setDispatch(Dispatch.newBuilder().setTls(ListenerTls.newBuilder().setSpiffe(spiffe)))
+              .build();
+      try (TlsSources tls = TlsSources.create(config)) {
+        metrics.observe(tls, new Readiness(), Clock.systemUTC());
+        PeerVerifications listener = tls.verifications(TlsSources.LISTENER);
+        listener.accepted(false, SpiffeId.parse("spiffe://example.org/ns/billing/sa/billing"));
+        listener.rejected(
+            false, new PeerRejectedException(PeerRejectedException.Reason.CHAIN, "test"));
+        Attributes delivery = Attributes.of(ServerMetrics.DELIVERY, "dispatch.tls");
+
+        MetricData verifications = metric("odradek.tls.peer.verifications");
+        assertThat(verifications)
+            .hasLongSumSatisfying(
+                sum ->
+                    sum.isMonotonic()
+                        .hasPointsSatisfying(
+                            points(
+                                delivery,
+                                "server",
+                                1,
+                                Map.of("chain", 1L),
+                                // The Kafka clients' counts are the process's: whatever ran before.
+                                Attributes.empty())));
+      }
+    } finally {
+      agent.close();
+      Files.deleteIfExists(socket);
+      Files.deleteIfExists(socket.getParent());
+    }
+  }
+
+  private static final List<String> REASONS =
+      List.of("malformed-svid", "unknown-trust-domain", "chain", "id-not-allowed");
+
+  /**
+   * The points of one delivery section's counts, exactly, and of the Kafka clients' counts on the
+   * client side, whatever their values.
+   */
+  @SuppressWarnings("unchecked")
+  private static Consumer<LongPointAssert>[] points(
+      Attributes delivery,
+      String side,
+      long accepted,
+      Map<String, Long> rejected,
+      Attributes kafka) {
+    List<Consumer<LongPointAssert>> points = new ArrayList<>();
+    Attributes acceptedHere =
+        delivery.toBuilder()
+            .put(ServerMetrics.SIDE, side)
+            .put(ServerMetrics.RESULT, "accepted")
+            .build();
+    points.add(point -> point.hasValue(accepted).hasAttributes(acceptedHere));
+    for (String reason : REASONS) {
+      Attributes refused =
+          delivery.toBuilder()
+              .put(ServerMetrics.SIDE, side)
+              .put(ServerMetrics.RESULT, "rejected")
+              .put(ServerMetrics.REASON, reason)
+              .build();
+      long count = rejected.getOrDefault(reason, 0L);
+      points.add(point -> point.hasValue(count).hasAttributes(refused));
+    }
+    Attributes acceptedByKafka =
+        kafka.toBuilder()
+            .put(ServerMetrics.SIDE, "client")
+            .put(ServerMetrics.RESULT, "accepted")
+            .build();
+    points.add(point -> point.hasAttributes(acceptedByKafka));
+    for (String reason : REASONS) {
+      Attributes refused =
+          kafka.toBuilder()
+              .put(ServerMetrics.SIDE, "client")
+              .put(ServerMetrics.RESULT, "rejected")
+              .put(ServerMetrics.REASON, reason)
+              .build();
+      points.add(point -> point.hasAttributes(refused));
+    }
+    return points.toArray(Consumer[]::new);
   }
 
   @Test

@@ -32,7 +32,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 | `api/odradek/config/v1/` | The server's configuration schema, validated with protovalidate |
 | `api/odradek/delivery/v1/` | The gRPC protocol between a sidecar and a dispatcher (ADR 6). The server serves it when it has a `dispatch` section, and is its client for the consumers whose `source` is the dispatcher |
 | `api/odradek/client/v1/` | The client protocol as data: events, actions, conformance scenarios |
-| `server/` | The server: `config`, `codec`, `produce`, `consume`, `dispatch` (the dispatcher of ADR 6), `receive` (the sidecar's side of it), `tls`, `admin` (health) and `telemetry` (metrics) packages under `io.github.bpalermo.odradek.server` |
+| `server/` | The server: `config`, `codec`, `produce`, `consume`, `dispatch` (the dispatcher of ADR 6), `receive` (the sidecar's side of it), `tls` (SPIFFE credentials and verification from kafka-spiffe, ADR 9; `files` sources its own), `admin` (health) and `telemetry` (metrics) packages under `io.github.bpalermo.odradek.server` |
 | `client/core/` | The client protocol with no I/O: `handle(event) -> actions`, shared by the JVM clients |
 | `client/java/`, `client/clojure/`, `client/python/` | The client libraries; Python has its own port of the core |
 | `conformance/scenarios/` | YAML scenarios that every core must pass |
@@ -47,7 +47,7 @@ Everything goes through Bazel (pinned in `.bazelversion`; the JDK, Python and pr
 - **Protos.** Declare a `.proto` with `odradek_proto_library` (`//bazel/proto:defs.bzl`); it generates the Java, Python and Clojure libraries. Nothing generated is checked in. `//api:breaking_test` compares against `api/baseline.binpb`; update the baseline only for a release or a deliberate break (`bazel run //api:update_baseline`).
 - **Client behaviour.** Protocol logic belongs in the core, not in a language binding. A change to it needs a scenario in `conformance/scenarios/`, and both cores must pass: `//client/core:conformance_test` and `//client/python:conformance_test`.
 - **New message types.** The native image needs reflection metadata for them in `server/native-image/reachability-metadata.json`; `NativeMetadataTest` fails until it is there.
-- **Dependencies.** After editing `maven.install` in `MODULE.bazel`, run `REPIN=1 bazel run @maven//:pin`. gRPC, Netty and protobuf-java have one pin each, in `MODULE.bazel`; the Clojure and Python clients must not bring their own copies (`//client/clojure:classpath_test` checks).
+- **Dependencies.** After editing `maven.install` in `MODULE.bazel`, run `REPIN=1 bazel run @maven//:pin`. kafka-spiffe (`io.github.bpalermo:kafka-spiffe`) is taken only as released on Maven Central: a change the server needs from it is made and released there first (ADR 9). gRPC, Netty and protobuf-java have one pin each, in `MODULE.bazel`; the Clojure and Python clients must not bring their own copies (`//client/clojure:classpath_test` checks).
 - **Metrics.** Every metric is declared in `ServerMetrics`, or in `KafkaClientMetrics` when it is one of the Kafka clients' own, and listed in `docs/design.md`. Names and attributes are a contract with dashboards: add, do not rename.
 - **Version.** One version for everything, in `bazel/version.bzl`. Do not edit it by hand; the release workflow sets it from the tag with `scripts/set-version.sh`.
 - **Tests that create topics** must wait for partition leaders before producing (see `ServerHarness.createTopic`); producing sooner can wedge Kafka's idempotent producer for minutes.
