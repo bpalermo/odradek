@@ -299,6 +299,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.telemetry.TelemetryTest",
         "io.github.bpalermo.odradek.server.tls.ReloadingSslContextTest",
         "io.github.bpalermo.odradek.server.tls.SpiffeCredentialSourceTest",
+        "io.github.bpalermo.odradek.server.tls.SpiffeDeliveryTlsTest",
         "io.github.bpalermo.odradek.server.tls.TlsTest",
     ],
     runtime_deps = [
