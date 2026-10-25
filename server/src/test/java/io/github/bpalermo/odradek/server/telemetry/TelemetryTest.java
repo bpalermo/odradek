@@ -17,11 +17,14 @@ import io.github.bpalermo.odradek.config.v1.SpiffeSource;
 import io.github.bpalermo.odradek.config.v1.Tls;
 import io.github.bpalermo.odradek.server.admin.Readiness;
 import io.github.bpalermo.odradek.server.tls.FakeWorkloadApi;
+import io.github.bpalermo.odradek.server.tls.Handshakes;
 import io.github.bpalermo.odradek.server.tls.PeerVerifications;
 import io.github.bpalermo.odradek.server.tls.TestPki;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributesBuilder;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.LongPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.testing.assertj.LongPointAssert;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
@@ -31,10 +34,14 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Consumer;
+import javax.net.ssl.SSLException;
+import org.apache.kafka.common.config.SslConfigs;
+import org.apache.kafka.common.security.auth.SslEngineFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -456,6 +463,78 @@ class TelemetryTest {
       Files.deleteIfExists(socket);
       Files.deleteIfExists(socket.getParent());
     }
+  }
+
+  @Test
+  void theKafkaClientsCountIsWhatTheirEngineFactoryCounted() throws Exception {
+    TestPki pki = new TestPki(dir, "ca");
+    TestPki.Issued app = pki.issue("app", "uri:spiffe://example.org/app");
+    TestPki.Issued broker = pki.issue("broker", "uri:spiffe://example.org/kafka/broker");
+    TestPki.Issued other = pki.issue("other", "uri:spiffe://example.org/kafka/other");
+    Path socket = Files.createTempDirectory(Path.of("/tmp"), "tm").resolve("agent.sock");
+    FakeWorkloadApi agent = FakeWorkloadApi.start(socket);
+    try {
+      agent.publish("spiffe://example.org/app", app.certPem(), app.keyPem(), pki.caPem(), Map.of());
+      ServerConfig config =
+          ServerConfig.newBuilder()
+              .putClusters(
+                  "orders",
+                  Cluster.newBuilder()
+                      .setTls(
+                          Tls.newBuilder()
+                              .setSpiffe(
+                                  SpiffeSource.newBuilder()
+                                      .setWorkloadApiSocket("unix://" + socket))
+                              .addAcceptedSpiffeIds("spiffe://example.org/kafka/broker"))
+                      .build())
+              .build();
+      try (TlsSources tls = TlsSources.create(config)) {
+        metrics.observe(tls, new Readiness(), Clock.systemUTC());
+        // The factory Kafka makes from the cluster's properties, as a client of the cluster does.
+        Map<String, Object> properties = new HashMap<>();
+        tls.apply("orders", properties);
+        SslEngineFactory factory =
+            (SslEngineFactory)
+                Class.forName((String) properties.get(SslConfigs.SSL_ENGINE_FACTORY_CLASS_CONFIG))
+                    .getConstructor()
+                    .newInstance();
+        factory.configure(properties);
+        try {
+          // The counts are the process's: other tests may have moved them.
+          long accepted = kafkaCount("accepted", null);
+          long notAllowed = kafkaCount("rejected", "id-not-allowed");
+
+          Handshakes.withBroker(factory, "10.0.0.1", broker, pki.caPem());
+          assertThatThrownBy(() -> Handshakes.withBroker(factory, "10.0.0.1", other, pki.caPem()))
+              .isInstanceOf(SSLException.class);
+
+          assertThat(kafkaCount("accepted", null)).isEqualTo(accepted + 1);
+          assertThat(kafkaCount("rejected", "id-not-allowed")).isEqualTo(notAllowed + 1);
+        } finally {
+          factory.close();
+        }
+      }
+    } finally {
+      agent.close();
+      Files.deleteIfExists(socket);
+      Files.deleteIfExists(socket.getParent());
+    }
+  }
+
+  /** The Kafka clients' series of {@code odradek.tls.peer.verifications} with this result. */
+  private long kafkaCount(String result, String reason) {
+    AttributesBuilder attributes =
+        Attributes.builder().put(ServerMetrics.SIDE, "client").put(ServerMetrics.RESULT, result);
+    if (reason != null) {
+      attributes.put(ServerMetrics.REASON, reason);
+    }
+    Attributes wanted = attributes.build();
+    MetricData verifications = metric("odradek.tls.peer.verifications");
+    return verifications.getLongSumData().getPoints().stream()
+        .filter(point -> point.getAttributes().equals(wanted))
+        .mapToLong(LongPointData::getValue)
+        .findFirst()
+        .orElseThrow(() -> new AssertionError(wanted + " not among " + verifications));
   }
 
   private static final List<String> REASONS =

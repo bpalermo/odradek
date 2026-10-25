@@ -44,7 +44,7 @@ We will take SPIFFE credentials and peer verification from kafka-spiffe, from ve
 ### The delivery port
 
 - With a `spiffe` source, the port's `JdkSslContext` wraps the library's `SnapshotSslContext` of each snapshot, and its peers are verified by the library's `SpiffeTrustManager`: the chain against the bundle of the peer's trust domain, the ID against what the section accepts (`Tls.accepted_spiffe_ids` and `accepted_trust_domain` on `dispatcher.tls`; on `dispatch.tls`, any SPIFFE ID of a trust domain with a bundle, `SpiffeIdMatcher.none().withTrustDomains(...)` of the snapshot's bundles, since what a sidecar may do is decided after the handshake). An observer (`SpiffeTrustManager.Observer`, public in 0.2.0) counts what it accepts and refuses.
-- `PeerTrust` stays for `files` sources only, with its rule that a certificate without a SPIFFE ID completes the handshake and is then refused everything.
+- `PeerTrust` stays for `files` sources only, with its rule that a certificate without a SPIFFE ID completes the handshake and is then refused everything. With a `spiffe` source that rule goes: the library refuses such a certificate (`malformed-svid`), so a sidecar whose certificate carries no SPIFFE ID now fails the handshake with the dispatcher, where it used to connect and be answered `UNAUTHENTICATED`. (A sidecar always required the dispatcher's certificate to carry an accepted SPIFFE ID.)
 - The sidecar rules of `Dispatch.policy`, which authorize by SPIFFE ID after the handshake, are not touched.
 
 ### Metrics
@@ -57,7 +57,7 @@ We will take SPIFFE credentials and peer verification from kafka-spiffe, from ve
 
 The server loses its Workload API client and its SPIFFE checks, and with them a hand-written wire format, a stream per socket that is not shared with Kafka's, and a verification path that only the server's tests exercise. What the library fixes or adds, the server has on its next version bump.
 
-The configuration does not change, nor the example manifests. A `files` source behaves as before.
+The configuration does not change, nor the example manifests. A `files` source behaves as before. A `spiffe` source changes one thing a peer can see: on the delivery port, a sidecar certificate without a SPIFFE ID fails the handshake instead of completing it and being refused everything (`UNAUTHENTICATED`). Such a peer was refused either way; it now learns it at the handshake, and is counted as a `malformed-svid` refusal.
 
 The library's choices become the server's for `spiffe` sources: TLS sessions time out a second after they are made, the shortest the JDK allows (both session caches; zero would mean no limit), which is not the same as never resuming: a connection made again within that second can resume a session and skip the certificate checks, so a certificate that expired in that second can still be used for one more connection. Kafka's connections are long-lived and the window is a second, so the server accepts it; preventing resumption outright would be a change in the library first. And an expired SVID is still presented until a new one arrives (`spiffe.svid.expired=present`, the library's default), which leaves the refusal to the peer.
 
