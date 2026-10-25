@@ -14,3 +14,4 @@ Decisions that shape Odradek, one per file, in the format described by Michael N
 | [6](0006-standalone-dispatcher-for-consumption.md) | Consume through a standalone dispatcher that sidecars connect to | Accepted |
 | [7](0007-sidecar-returns-records-its-app-has-not-taken.md) | A sidecar returns records its application has not taken, without using an attempt | Accepted |
 | [8](0008-acknowledged-offsets-in-commit-metadata.md) | A dispatcher commits the offsets it has acknowledged above its commit position | Accepted |
+| [9](0009-spiffe-credentials-from-kafka-spiffe.md) | Take SPIFFE credentials and peer verification from kafka-spiffe | Accepted |
