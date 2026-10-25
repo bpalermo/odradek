@@ -1073,8 +1073,10 @@ The server keeps the current key, certificate chain and trust bundle in memory a
 
 ### Mechanism
 
-- Kafka clients accept a custom TLS engine factory through `ssl.engine.factory.class` (KIP-519). The server sets it to its own `ReloadingSslEngineFactory` on every client of a cluster with `tls`, and `security.protocol` to `SSL` unless the properties say `SASL_SSL`.
-- The factory reads from a `CredentialSource` that always holds the current `{private key, certificate chain, trust bundle}` as one immutable snapshot.
+- Kafka clients accept a custom TLS engine factory through `ssl.engine.factory.class` (KIP-519). On every client of a cluster with `tls` the server sets `security.protocol` to `SSL` unless the properties say `SASL_SSL`, and the factory by source:
+  - `spiffe`: kafka-spiffe's `SpiffeSslEngineFactory` (ADR 9), given `spiffe.endpoint.socket` (the source's socket), `spiffe.peer.allowed.ids` and `spiffe.peer.allowed.trust.domains` (from `acceptedSpiffeIds` and `acceptedTrustDomain`) and `spiffe.metrics.jmx.enabled=false`. Under those keys the library's factory reads the same shared source as the server, so the clients, the server's readiness and its metrics see one stream.
+  - `files`: the server's own `ReloadingSslEngineFactory`, which reads from a `CredentialSource` that always holds the current `{private key, certificate chain, trust bundle}` as one immutable snapshot.
+- The native image registers both factories, which Kafka creates by class name.
 - Each new TLS handshake builds its engine from the current snapshot. Established connections are left alone; TLS does not re-validate a certificate on a live connection, and connections pick up the new certificate as they are naturally re-established.
 - The Kafka clients are never rebuilt for a rotation, so there is no flush, no rebalance, and nothing visible to the app.
 
@@ -1099,7 +1101,7 @@ Each cluster's `tls` block selects one source.
 
 ### Peer verification
 
-- With `acceptedSpiffeIds` or `acceptedTrustDomain` set, the broker is identified by SPIFFE ID. X.509-SVIDs carry the identity in a URI SAN and usually no DNS SAN, so hostname verification is disabled and replaced in the factory's trust manager: the broker certificate must chain to the trust bundle, carry exactly one URI SAN, and that SPIFFE ID must be listed or belong to the accepted trust domain.
+- With `acceptedSpiffeIds` or `acceptedTrustDomain` set, the broker is identified by SPIFFE ID. X.509-SVIDs carry the identity in a URI SAN and usually no DNS SAN, so hostname verification is disabled and replaced in the factory's trust manager: the broker certificate must chain to the bundle of the trust domain its SPIFFE ID names, carry exactly one URI SAN, and that SPIFFE ID must be listed or belong to the accepted trust domain. For a `spiffe` source this is the library's `SpiffeTrustManager`, which also refuses a CA or a leaf whose extended key usage does not allow `serverAuth`; for `files`, the server's own.
 - With neither set (allowed for `files` only), the broker is verified the usual way: chain to the trust bundle, and a certificate that names the host connected to.
 - Broker side, outside this repo: brokers need a `principal.builder.class` that maps the client's SPIFFE ID to a Kafka principal for ACLs.
 

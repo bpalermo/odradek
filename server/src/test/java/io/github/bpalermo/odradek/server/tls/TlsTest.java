@@ -35,6 +35,7 @@ import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManagerFactory;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.config.SslConfigs;
+import org.apache.kafka.common.security.auth.SslEngineFactory;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -395,7 +396,7 @@ class TlsTest {
 
   /** As above, with the broker's certificate and the authorities it accepts clients of. */
   static String handshake(
-      ReloadingSslEngineFactory factory, String host, TestPki.Issued broker, String clientCa)
+      SslEngineFactory factory, String host, TestPki.Issued broker, String clientCa)
       throws Exception {
     SSLEngine clientEngine = factory.createClientSslEngine(host, 9093, "https");
     SSLEngine brokerEngine = brokerContext(broker, clientCa).createSSLEngine();

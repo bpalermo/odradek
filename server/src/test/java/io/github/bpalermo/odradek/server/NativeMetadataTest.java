@@ -119,6 +119,7 @@ class NativeMetadataTest {
     // reflection: the assignor of the coordination group among them.
     assertThat(TYPES)
         .contains(
+            "io.github.bpalermo.kafka.spiffe.kafka.SpiffeSslEngineFactory",
             "io.github.bpalermo.odradek.server.dispatch.ReplicaAssignor",
             "io.github.bpalermo.odradek.server.telemetry.KafkaMetricsReporter",
             "io.github.bpalermo.odradek.server.tls.ReloadingSslEngineFactory",

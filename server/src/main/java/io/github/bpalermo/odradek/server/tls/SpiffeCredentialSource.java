@@ -26,13 +26,15 @@ import java.util.concurrent.TimeoutException;
  * stream.
  */
 public final class SpiffeCredentialSource implements CredentialSource, Closeable {
+  private final String socket;
   private final X509MaterialSource source;
   private volatile Converted converted;
 
   /** A snapshot and the credentials made of it. */
   private record Converted(X509Context snapshot, Credentials credentials) {}
 
-  private SpiffeCredentialSource(X509MaterialSource source) {
+  private SpiffeCredentialSource(String socket, X509MaterialSource source) {
+    this.socket = socket;
     this.source = source;
   }
 
@@ -68,7 +70,12 @@ public final class SpiffeCredentialSource implements CredentialSource, Closeable
       handle.close();
       throw e;
     }
-    return new SpiffeCredentialSource(handle);
+    return new SpiffeCredentialSource(socket, handle);
+  }
+
+  /** The path of the Workload API's Unix socket. */
+  public String socket() {
+    return socket;
   }
 
   /** The newest snapshot, as the library has it. */

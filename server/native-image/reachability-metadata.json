@@ -537,6 +537,15 @@
       "type": "int[]"
     },
     {
+      "methods": [
+        {
+          "name": "<init>",
+          "parameterTypes": []
+        }
+      ],
+      "type": "io.github.bpalermo.kafka.spiffe.kafka.SpiffeSslEngineFactory"
+    },
+    {
       "allPublicMethods": true,
       "type": "io.github.bpalermo.odradek.config.v1.Admin"
     },
