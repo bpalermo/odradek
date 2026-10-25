@@ -56,14 +56,14 @@ public final class TlsSources implements Closeable {
   private final CredentialSource listener;
   private final TlsBinding dispatcher;
   private final List<FileCredentialSource> files;
-  private final List<WorkloadApiSource> watches;
+  private final List<SpiffeCredentialSource> watches;
   private final ScheduledExecutorService poller;
 
   /** What {@link #load} fills in. */
   private static final class Loading {
     final Map<String, TlsBinding> bindings = new HashMap<>();
     final List<FileCredentialSource> files = new ArrayList<>();
-    final Map<String, WorkloadApiSource> watches = new TreeMap<>();
+    final Map<String, SpiffeCredentialSource> watches = new TreeMap<>();
     CredentialSource listener;
     TlsBinding dispatcher;
   }
@@ -98,7 +98,8 @@ public final class TlsSources implements Closeable {
    * Loads the credentials of every cluster with {@code tls}, of {@code dispatch.tls} and of {@code
    * dispatcher.tls}.
    *
-   * <p>Whatever names the same Workload API socket shares one watch and so one SVID.
+   * <p>Whatever names the same Workload API socket shares one source and so one SVID: the library's
+   * shared source of the socket, which the clusters' Kafka clients read as well (ADR 9).
    *
    * @throws CredentialException if some credentials cannot be loaded or a cluster's properties ask
    *     for a connection without TLS
@@ -114,7 +115,7 @@ public final class TlsSources implements Closeable {
     try {
       load(config, defaultSocket, firstSvidTimeout, loading);
     } catch (CredentialException | InterruptedException | RuntimeException e) {
-      loading.watches.values().forEach(WorkloadApiSource::close);
+      loading.watches.values().forEach(SpiffeCredentialSource::close);
       throw e;
     }
     return new TlsSources(loading);
@@ -210,10 +211,10 @@ public final class TlsSources implements Closeable {
                 + " to unix:///path");
       }
       String socket = address.substring(UNIX.length());
-      WorkloadApiSource watch = loading.watches.get(socket);
+      SpiffeCredentialSource watch = loading.watches.get(socket);
       if (watch == null) {
         try {
-          watch = new WorkloadApiSource(socket, Clock.systemUTC(), firstSvidTimeout);
+          watch = SpiffeCredentialSource.open(socket, firstSvidTimeout);
         } catch (CredentialException e) {
           throw new CredentialException(path + ": " + e.getMessage(), e);
         }
@@ -331,6 +332,6 @@ public final class TlsSources implements Closeable {
     if (poller != null) {
       poller.shutdownNow();
     }
-    watches.forEach(WorkloadApiSource::close);
+    watches.forEach(SpiffeCredentialSource::close);
   }
 }
