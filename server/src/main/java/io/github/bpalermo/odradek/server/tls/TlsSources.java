@@ -139,6 +139,20 @@ public final class TlsSources implements Closeable {
               cluster.getPropertiesMap(),
               cluster.getProducerPropertiesMap(),
               cluster.getConsumerPropertiesMap())) {
+        if (tls.hasSpiffe()) {
+          for (String key : properties.keySet()) {
+            if (key.startsWith(SpiffeConfig.PREFIX)) {
+              // The library would combine them with what tls says, and so widen it.
+              throw new CredentialException(
+                  "clusters."
+                      + name
+                      + ": "
+                      + key
+                      + " is set, but the server sets the spiffe.* keys of a cluster whose tls has"
+                      + " a spiffe source from tls itself; remove it");
+            }
+          }
+        }
         String protocol = properties.get(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG);
         if (protocol != null && !TLS_PROTOCOLS.contains(protocol)) {
           throw new CredentialException(
@@ -260,6 +274,8 @@ public final class TlsSources implements Closeable {
     if (binding.source() instanceof SpiffeCredentialSource spiffe) {
       properties.put(
           SslConfigs.SSL_ENGINE_FACTORY_CLASS_CONFIG, SpiffeSslEngineFactory.class.getName());
+      // Only the server's: tls is what the library is told, whatever else the map holds.
+      properties.keySet().removeIf(key -> key.startsWith(SpiffeConfig.PREFIX));
       properties.putAll(spiffeKeys(spiffe.socket(), binding.policy()));
       return;
     }

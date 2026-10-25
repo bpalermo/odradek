@@ -228,6 +228,45 @@ class SpiffeCredentialSourceTest {
   }
 
   @Test
+  void spiffeKeysInAClustersPropertiesAreRefused() throws Exception {
+    Cluster cluster =
+        Cluster.newBuilder()
+            .setTls(
+                Tls.newBuilder()
+                    .setSpiffe(SpiffeSource.getDefaultInstance())
+                    .addAcceptedSpiffeIds(BROKER_ID))
+            .putConsumerProperties(SpiffeConfig.PEER_ALLOWED_TRUST_DOMAINS, "partner.test")
+            .build();
+    ServerConfig config = ServerConfig.newBuilder().putClusters("a", cluster).build();
+    assertThatThrownBy(() -> TlsSources.create(config, "unix://" + socket, WAIT))
+        .isInstanceOf(CredentialException.class)
+        .hasMessageContaining("clusters.a")
+        .hasMessageContaining(SpiffeConfig.PEER_ALLOWED_TRUST_DOMAINS);
+  }
+
+  @Test
+  void onlyTheServersSpiffeKeysReachTheLibrary() throws Exception {
+    agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of());
+    Cluster cluster =
+        Cluster.newBuilder()
+            .setTls(
+                Tls.newBuilder()
+                    .setSpiffe(SpiffeSource.getDefaultInstance())
+                    .addAcceptedSpiffeIds(BROKER_ID))
+            .build();
+    ServerConfig config = ServerConfig.newBuilder().putClusters("a", cluster).build();
+    try (TlsSources tls = TlsSources.create(config, "unix://" + socket, WAIT)) {
+      Map<String, Object> properties = new HashMap<>();
+      properties.put(SpiffeConfig.PEER_ALLOWED_ID_PATTERNS, List.of("spiffe://partner.test/**"));
+      tls.apply("a", properties);
+      assertThat(properties)
+          .doesNotContainKey(SpiffeConfig.PEER_ALLOWED_ID_PATTERNS)
+          .doesNotContainKey(SpiffeConfig.PEER_ALLOWED_TRUST_DOMAINS)
+          .containsEntry(SpiffeConfig.PEER_ALLOWED_IDS, List.of(BROKER_ID));
+    }
+  }
+
+  @Test
   void handlesOnOneSocketShareTheLibrarysSource() throws Exception {
     agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of());
     SpiffeCredentialSource first = connect();
