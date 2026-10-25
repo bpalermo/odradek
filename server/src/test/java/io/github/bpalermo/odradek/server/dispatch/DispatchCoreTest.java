@@ -165,6 +165,23 @@ class DispatchCoreTest {
     return new PartitionReleased<>(partition, true, 0);
   }
 
+  /**
+   * A partition released leaving {@code resent} records it sent above {@code committed}, {@code
+   * carried} of them among the acknowledged {@code offsets} its last commit names.
+   */
+  private static PartitionReleased<String> released(
+      int partition, boolean inTime, int resent, int carried, long committed, long... offsets) {
+    return new PartitionReleased<>(partition, inTime, resent, carried, acked(committed, offsets));
+  }
+
+  private static CommitMetadata acked(long committed, long... offsets) {
+    CommitMetadata.Builder above = CommitMetadata.above(committed);
+    for (long offset : offsets) {
+      above.add(offset);
+    }
+    return above.build();
+  }
+
   private List<DispatchAction<String>> after(long nanos) {
     now += nanos;
     return on(new TimePassed<>());
@@ -1153,6 +1170,103 @@ class DispatchCoreTest {
   }
 
   @Test
+  void recordsTheLastOwnerAcknowledgedAreNotDeliveredAndHoldNothingBack() {
+    start(Ordering.KEY);
+    assertThat(on(new PartitionAssigned<>(0, 0, acked(0, 1, 2)))).isEmpty();
+    receiver("a", 10);
+    // 3 is y's next record, and y's 1 is done with: it does not wait.
+    assertThat(fetch(0, "0:x", "1:y", "2:x", "3:y"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 3));
+    assertThat(core.skipped()).isEqualTo(2);
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 3));
+    assertThat(ack("a", 0, 3)).containsExactly(commit(0, 4));
+  }
+
+  @Test
+  void recordsTheLastOwnerAcknowledgedAtThePositionMoveTheCommitBeforeTheyArrive() {
+    start(Ordering.KEY);
+    assertThat(on(new PartitionAssigned<>(0, 4, acked(4, 5)))).isEmpty();
+    receiver("a", 10);
+    assertThat(fetch(0, "4:x")).containsExactly(deliver("a", 0, 4));
+    // 5 is not fetched yet, and the commit passes it: a commit at 5 could not name it.
+    assertThat(ack("a", 0, 4)).containsExactly(commit(0, 6));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(CommitMetadata.NONE);
+    assertThat(fetch(0, "5:x", "6:x")).containsExactly(deliver("a", 0, 6));
+    assertThat(core.skipped()).isEqualTo(1);
+  }
+
+  @Test
+  void aCommitBetweenFetchesNamesWhatTheLastOwnerAcknowledgedPastAGap() {
+    start(Ordering.KEY);
+    assertThat(on(new PartitionAssigned<>(0, 4, acked(4, 5, 7)))).isEmpty();
+    receiver("a", 10);
+    assertThat(fetch(0, "4:x")).containsExactly(deliver("a", 0, 4));
+    assertThat(ack("a", 0, 4)).containsExactly(commit(0, 6));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(acked(6, 7));
+    assertThat(on(new PartitionsRevoked<>(List.of(0))))
+        .containsExactly(released(0, true, 0, 0, 6, 7));
+  }
+
+  @Test
+  void underPartitionOrderingARecordTheLastOwnerAcknowledgedIsPassedOver() {
+    start(Ordering.PARTITION);
+    assertThat(on(new PartitionAssigned<>(0, 0, acked(0, 1)))).isEmpty();
+    receiver("a", 10);
+    assertThat(fetch(0, "0", "1", "2")).containsExactly(deliver("a", 0, 0));
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 2), deliver("a", 0, 2));
+  }
+
+  @Test
+  void whatIsAcknowledgedAboveAHeldCommitPositionIsReportedForTheCommit() {
+    start(Ordering.KEY);
+    assertThat(on(new PartitionAssigned<>(0, 0, acked(0, 2)))).isEmpty();
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:y", "2:z", "3:y"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 1));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(acked(0, 2));
+    assertThat(ack("a", 0, 1)).containsExactly(deliver("a", 0, 3));
+    assertThat(ack("a", 0, 3)).isEmpty();
+    // What the last owner acknowledged is named again, for whoever comes next.
+    assertThat(core.committable(0)).isEqualTo(OptionalLong.of(0));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(acked(0, 1, 2, 3));
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 4));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(CommitMetadata.NONE);
+    assertThat(core.acknowledgedAbove(1)).isEqualTo(CommitMetadata.NONE);
+  }
+
+  @Test
+  void aHandOverThatCannotFinishAHeldRecordNamesWhatWasAcknowledgedAboveIt() {
+    start(Ordering.KEY);
+    assertThat(on(new PartitionAssigned<>(0, 0, acked(0, 1)))).isEmpty();
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:y", "2:y", "3:x"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 2));
+    assertThat(ack("a", 0, 2)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    // 0 is not answered in time; 1 was acknowledged by the last owner and 2 here.
+    assertThat(after(GRACE))
+        .containsExactly(new Drop<>("a", List.of(0)), released(0, false, 2, 1, 0, 1, 2));
+  }
+
+  @Test
+  void whatTheLastOwnerAcknowledgedIsNamedBeforeItIsFetched() {
+    start(Ordering.KEY);
+    assertThat(on(new PartitionAssigned<>(0, 0, acked(0, 2, 5)))).isEmpty();
+    // Nothing is fetched yet: a commit made now names all of it, or the next owner would
+    // deliver it again.
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(acked(0, 2, 5));
+    receiver("a", 10);
+    assertThat(fetch(0, "0:x", "1:y", "2:z"))
+        .containsExactly(deliver("a", 0, 0), deliver("a", 0, 1));
+    assertThat(core.acknowledgedAbove(0)).isEqualTo(acked(0, 2, 5));
+    assertThat(ack("a", 0, 1)).isEmpty();
+    assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
+    // 0 is not answered in time; 5 was never fetched, and is named all the same.
+    assertThat(after(GRACE))
+        .containsExactly(new Drop<>("a", List.of(0)), released(0, false, 2, 1, 0, 1, 2, 5));
+  }
+
+  @Test
   void theNewestRecordSentIsNotSentAgainDuringAHandOver() {
     start(Ordering.NONE);
     assign(0, 0);
@@ -1183,7 +1297,7 @@ class DispatchCoreTest {
     assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE));
     // 1 is not sent any more: a record sent now would have little time to be answered in. It
     // was never sent, so nobody has it; 2, acknowledged above it, is sent again by the next owner.
-    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), new PartitionReleased<>(0, true, 1));
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), released(0, true, 1, 1, 1, 2));
   }
 
   @Test
@@ -1198,7 +1312,7 @@ class DispatchCoreTest {
     assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), deliver("a", 0, 1));
     assertThat(after(GRACE / 2)).isEmpty();
     assertThat(after(1))
-        .containsExactly(new Drop<>("a", List.of(0)), new PartitionReleased<>(0, false, 2));
+        .containsExactly(new Drop<>("a", List.of(0)), released(0, false, 2, 1, 1, 2));
   }
 
   @Test
@@ -1233,7 +1347,7 @@ class DispatchCoreTest {
     // not sent again when it comes back: the next owner starts at 1 and sends 3 whatever is done.
     assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
     assertThat(reject("a", 0, 3)).isEmpty();
-    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), new PartitionReleased<>(0, true, 4));
+    assertThat(ack("a", 0, 0)).containsExactly(commit(0, 1), released(0, true, 4, 2, 1, 2, 4));
     assertThat(after(GRACE)).isEmpty();
   }
 
@@ -1251,7 +1365,7 @@ class DispatchCoreTest {
     // Its wait would end after sending does. Nothing is committed past it by this replica, so 2,
     // which waits behind 1, is not sent either: the next owner would send it again besides.
     assertThat(reject("a", 0, 0)).isEmpty();
-    assertThat(ack("a", 0, 1)).containsExactly(new PartitionReleased<>(0, true, 3));
+    assertThat(ack("a", 0, 1)).containsExactly(released(0, true, 3, 2, 0, 1, 3));
   }
 
   @Test
@@ -1268,7 +1382,7 @@ class DispatchCoreTest {
     assertThat(core.blockedOffset(0)).isEmpty();
     assertThat(core.nextDeadlineNanos()).isEqualTo(OptionalLong.of(GRACE));
     // 2 is not sent: the position stays at the blocked record whatever is done above it.
-    assertThat(ack("a", 0, 1)).containsExactly(new PartitionReleased<>(0, true, 3));
+    assertThat(ack("a", 0, 1)).containsExactly(released(0, true, 3, 2, 0, 1, 3));
   }
 
   @Test
@@ -1281,7 +1395,7 @@ class DispatchCoreTest {
     assertThat(ack("a", 0, 2)).isEmpty();
     assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
     // No PartitionBlocked: the partition is leaving, and its next owner counts the attempts anew.
-    assertThat(reject("a", 0, 0)).containsExactly(new PartitionReleased<>(0, true, 2));
+    assertThat(reject("a", 0, 0)).containsExactly(released(0, true, 2, 1, 0, 2));
   }
 
   @Test
@@ -1326,7 +1440,7 @@ class DispatchCoreTest {
     assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
     assertThat(on(new DeadLetterFailed<>(0, 0))).isEmpty();
     // 2 waited behind 1, above the record that is now the next owner's: it is not sent.
-    assertThat(ack("a", 0, 1)).containsExactly(new PartitionReleased<>(0, true, 3));
+    assertThat(ack("a", 0, 1)).containsExactly(released(0, true, 3, 2, 0, 1, 3));
   }
 
   @Test
@@ -1357,10 +1471,10 @@ class DispatchCoreTest {
     assertThat(ack("a", 1, 2)).isEmpty();
     assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
     // Nobody can be sent what was held back, in the partition being handed over...
-    assertThat(on(new ReceiverLeft<>("a"))).containsExactly(new PartitionReleased<>(0, true, 2));
+    assertThat(on(new ReceiverLeft<>("a"))).containsExactly(released(0, true, 2, 1, 0, 2));
     // ... nor in one that is handed over with nobody there.
     assertThat(on(new PartitionsRevoked<>(List.of(1))))
-        .containsExactly(new PartitionReleased<>(1, true, 2));
+        .containsExactly(released(1, true, 2, 1, 0, 2));
     assertThat(core.nextDeadlineNanos()).isEmpty();
   }
 
@@ -1497,8 +1611,7 @@ class DispatchCoreTest {
     assertThat(on(new PartitionsRevoked<>(List.of(0)))).isEmpty();
     // Not written again by a replica that is giving the partition up, and not committed past:
     // both records were sent, and both are the next owner's.
-    assertThat(on(new DeadLetterFailed<>(0, 0)))
-        .containsExactly(new PartitionReleased<>(0, true, 2));
+    assertThat(on(new DeadLetterFailed<>(0, 0))).containsExactly(released(0, true, 2, 1, 0, 1));
     assertThat(core.committable(0)).isEmpty();
     assertThat(on(new DeadLetterWritten<>(0, 0))).isEmpty();
   }

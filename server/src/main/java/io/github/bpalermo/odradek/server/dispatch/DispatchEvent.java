@@ -15,9 +15,18 @@ public sealed interface DispatchEvent<R> {
 
   /**
    * The replica owns a partition and will fetch it from {@code position}. Fetching is not paused. A
-   * partition the core already has is treated as lost first.
+   * partition the core already has is treated as lost first. The records fetched at the offsets
+   * {@code acknowledged} names were acknowledged by the partition's last owner (ADR 8): they are
+   * not delivered, and count as acknowledged.
    */
-  record PartitionAssigned<R>(int partition, long position) implements DispatchEvent<R> {}
+  record PartitionAssigned<R>(int partition, long position, CommitMetadata acknowledged)
+      implements DispatchEvent<R> {
+
+    /** The partition, with nothing known to be acknowledged above {@code position}. */
+    public PartitionAssigned(int partition, long position) {
+      this(partition, position, CommitMetadata.NONE);
+    }
+  }
 
   /**
    * The replica is giving partitions up and can still commit for them. The core sends nothing new

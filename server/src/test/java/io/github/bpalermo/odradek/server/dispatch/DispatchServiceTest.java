@@ -66,6 +66,7 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RoundRobinPartitioner;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.OffsetMetadataTooLarge;
 import org.apache.kafka.common.errors.RecordTooLargeException;
 import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.header.Header;
@@ -99,6 +100,34 @@ class DispatchServiceTest {
    */
   private static final class RecordingConsumer extends MockConsumer<byte[], byte[]> {
     final Map<TopicPartition, Long> commits = new ConcurrentHashMap<>();
+
+    /** Every commit that was taken, offsets with their metadata, in order. */
+    final List<Map<TopicPartition, OffsetAndMetadata>> commitLog = new CopyOnWriteArrayList<>();
+
+    /**
+     * Whether a commit that carries metadata is refused, as by brokers whose {@code
+     * offset.metadata.max.bytes} is less than it: synchronous ones throw, asynchronous ones fail in
+     * their callback.
+     */
+    volatile boolean refuseMetadataSync;
+
+    volatile boolean refuseMetadataAsync;
+
+    /** Commits refused for their metadata. */
+    final AtomicInteger refusedMetadata = new AtomicInteger();
+
+    /**
+     * Whether the callback of a refused asynchronous commit waits for the next synchronous commit,
+     * which completes it first, as a real consumer's does.
+     */
+    volatile boolean deferAsyncCallbacks;
+
+    /** Guarded by this. */
+    private final List<Runnable> pendingCallbacks = new ArrayList<>();
+
+    /** While the mock's commitSync runs, which commits through commitAsync. Guarded by this. */
+    private boolean syncing;
+
     final List<Set<String>> subscriptions = new CopyOnWriteArrayList<>();
 
     /** The timeouts of the last polls, and whether each had something to return: for failures. */
@@ -259,15 +288,78 @@ class DispatchServiceTest {
     @Override
     public synchronized void commitSync(Map<TopicPartition, OffsetAndMetadata> offsets) {
       wakeupPoint();
-      offsets.forEach((partition, offset) -> commits.put(partition, offset.offset()));
-      super.commitSync(offsets);
+      List<Runnable> callbacks = List.copyOf(pendingCallbacks);
+      pendingCallbacks.clear();
+      callbacks.forEach(Runnable::run);
+      if (refuseMetadataSync && carriesMetadata(offsets)) {
+        refusedMetadata.incrementAndGet();
+        throw new OffsetMetadataTooLarge("the metadata is larger than offset.metadata.max.bytes");
+      }
+      taken(offsets);
+      syncing = true;
+      try {
+        super.commitSync(offsets);
+      } finally {
+        syncing = false;
+      }
     }
 
     @Override
     public synchronized void commitAsync(
         Map<TopicPartition, OffsetAndMetadata> offsets, OffsetCommitCallback callback) {
-      offsets.forEach((partition, offset) -> commits.put(partition, offset.offset()));
+      if (syncing) {
+        super.commitAsync(offsets, callback);
+        return;
+      }
+      if (refuseMetadataAsync && carriesMetadata(offsets)) {
+        refusedMetadata.incrementAndGet();
+        Runnable refuse =
+            () ->
+                callback.onComplete(
+                    offsets,
+                    new OffsetMetadataTooLarge(
+                        "the metadata is larger than offset.metadata.max.bytes"));
+        if (deferAsyncCallbacks) {
+          pendingCallbacks.add(refuse);
+        } else {
+          refuse.run();
+        }
+        return;
+      }
+      taken(offsets);
       super.commitAsync(offsets, callback);
+    }
+
+    private void taken(Map<TopicPartition, OffsetAndMetadata> offsets) {
+      commitLog.add(Map.copyOf(offsets));
+      offsets.forEach((partition, offset) -> commits.put(partition, offset.offset()));
+    }
+
+    private static boolean carriesMetadata(Map<TopicPartition, OffsetAndMetadata> offsets) {
+      return offsets.values().stream().anyMatch(offset -> !offset.metadata().isEmpty());
+    }
+
+    /** The last commit taken of a partition. */
+    OffsetAndMetadata lastCommit(TopicPartition partition) {
+      for (int i = commitLog.size() - 1; i >= 0; i--) {
+        OffsetAndMetadata offset = commitLog.get(i).get(partition);
+        if (offset != null) {
+          return offset;
+        }
+      }
+      return null;
+    }
+
+    /** The commits taken of a partition, in order. */
+    List<OffsetAndMetadata> commitsOf(TopicPartition partition) {
+      List<OffsetAndMetadata> taken = new ArrayList<>();
+      for (Map<TopicPartition, OffsetAndMetadata> commit : commitLog) {
+        OffsetAndMetadata offset = commit.get(partition);
+        if (offset != null) {
+          taken.add(offset);
+        }
+      }
+      return taken;
     }
   }
 
@@ -1313,6 +1405,93 @@ class DispatchServiceTest {
     // The wait ran out, with one record sent that the next owner sends again.
     assertThat(metric("odradek.dispatch.handovers", "outcome", "deadline")).isEqualTo(1);
     assertThat(metric("odradek.dispatch.handovers")).isEqualTo(1);
+    assertThat(metric("odradek.dispatch.handover.records", "topic", "orders")).isEqualTo(1);
+  }
+
+  /**
+   * Offset 0 sent and never answered, 1 of another key sent and acknowledged above it; then the
+   * partition is revoked, and the hand-over runs out of time with 0 unanswered.
+   */
+  private RecordingConsumer heldAndAcknowledgedAboveThenRevoked(Consumer<RecordingConsumer> brokers)
+      throws Exception {
+    start(config());
+    Sidecar sidecar = declared(declare("orders"));
+    RecordingConsumer kafka = kafka();
+    brokers.accept(kafka);
+    assign(P0, P1);
+    add(P0, 0, "a");
+    add(P0, 1, "b");
+    sidecar.credits(10);
+    assertThat(sidecar.records(2)).containsExactly("0/0/1", "0/1/1");
+    sidecar.ack(0, 1, 1);
+    // The commit position stays at 0, and the interval commits what is acknowledged above it.
+    eventually(
+        "1 is committed as acknowledged, or refused",
+        () ->
+            kafka.refusedMetadata.get() > 0
+                || new OffsetAndMetadata(0, "odradek.acked/1:AQ").equals(kafka.lastCommit(P0)));
+    assign(P1);
+    DeliverResponse response = sidecar.next();
+    assertThat(response.hasReleased()).as("%s", response).isTrue();
+    eventually("the hand-over is counted", () -> metric("odradek.dispatch.handovers") == 1);
+    return kafka;
+  }
+
+  @Test
+  void aHandOverThatCannotFinishNamesWhatWasAcknowledgedAboveItsCommit() throws Exception {
+    RecordingConsumer kafka = heldAndAcknowledgedAboveThenRevoked(brokers -> {});
+    // The last commit names 1, which the next owner does not send again; 0 it does.
+    assertThat(kafka.lastCommit(P0)).isEqualTo(new OffsetAndMetadata(0, "odradek.acked/1:AQ"));
+    assertThat(metric("odradek.dispatch.handover.records", "topic", "orders")).isEqualTo(1);
+  }
+
+  @Test
+  void aHandOverWhoseCommitIsRefusedItsMetadataCommitsTheOffsetAndCountsBothAsSentAgain()
+      throws Exception {
+    RecordingConsumer kafka =
+        heldAndAcknowledgedAboveThenRevoked(brokers -> brokers.refuseMetadataSync = true);
+    // Refused with the metadata, the offset is committed without it: the next owner sends 0 and
+    // 1 again, and the hand-over says so.
+    assertThat(kafka.refusedMetadata.get()).isEqualTo(1);
+    assertThat(kafka.lastCommit(P0)).isEqualTo(new OffsetAndMetadata(0, ""));
+    assertThat(metric("odradek.dispatch.handover.records", "topic", "orders")).isEqualTo(2);
+  }
+
+  @Test
+  void anAsynchronousCommitRefusedItsMetadataIsMadeAgainWithoutAndSoAreTheNext() throws Exception {
+    start(config());
+    Sidecar sidecar = declared(declare("orders"));
+    RecordingConsumer kafka = kafka();
+    kafka.refuseMetadataAsync = true;
+    assign(P0);
+    add(P0, 0, "a");
+    add(P0, 1, "b");
+    add(P0, 2, "c");
+    sidecar.credits(10);
+    assertThat(sidecar.records(3)).containsExactly("0/0/1", "0/1/1", "0/2/1");
+    sidecar.ack(0, 1, 1);
+    eventually("the metadata is refused", () -> kafka.refusedMetadata.get() == 1);
+    sidecar.ack(0, 2, 2);
+    sidecar.ack(0, 0, 0);
+    eventually("offsets 0 to 2 are committed", () -> committedNow(P0) == 3);
+    // Asked once: every commit after the refusal goes without metadata, and is taken.
+    assertThat(kafka.refusedMetadata.get()).isEqualTo(1);
+    assertThat(kafka.commitsOf(P0)).allMatch(offset -> offset.metadata().isEmpty());
+  }
+
+  @Test
+  void anEarlierRefusalCompletedByTheHandOversCommitDoesNotChangeWhatThatCommitCarried()
+      throws Exception {
+    RecordingConsumer kafka =
+        heldAndAcknowledgedAboveThenRevoked(
+            brokers -> {
+              brokers.refuseMetadataAsync = true;
+              brokers.deferAsyncCallbacks = true;
+            });
+    // The interval's commit was refused, but its callback ran only within the hand-over's
+    // commit, which had been made with the metadata and was taken: 1 is named, and not counted.
+    assertThat(kafka.refusedMetadata.get()).isEqualTo(1);
+    assertThat(kafka.lastCommit(P0)).isEqualTo(new OffsetAndMetadata(0, "odradek.acked/1:AQ"));
     assertThat(metric("odradek.dispatch.handover.records", "topic", "orders")).isEqualTo(1);
   }
 

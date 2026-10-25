@@ -281,6 +281,7 @@ java_junit_test(
         "io.github.bpalermo.odradek.server.consume.ConsumeServiceTest",
         "io.github.bpalermo.odradek.server.consume.PartitionStateTest",
         "io.github.bpalermo.odradek.server.dispatch.BatchesTest",
+        "io.github.bpalermo.odradek.server.dispatch.CommitMetadataTest",
         "io.github.bpalermo.odradek.server.dispatch.DeadLettersTest",
         "io.github.bpalermo.odradek.server.dispatch.DeclarationsTest",
         "io.github.bpalermo.odradek.server.dispatch.DeliveryServerTest",
