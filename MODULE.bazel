@@ -112,6 +112,10 @@ maven.install(
     artifacts = [
         # Kafka client (4.x line; Java 17+).
         "org.apache.kafka:kafka-clients:4.3.1",
+        # SPIFFE: the Workload API source, peer verification and Kafka's engine
+        # factory (ADR 9). It has no dependency of its own; kafka-clients and
+        # slf4j-api, which it declares provided, come from the lines here.
+        "io.github.bpalermo:kafka-spiffe:0.2.0",
         # Netty is pinned to 4.2.16.Final, the version grpc-java 1.84.0 is built
         # against (IO_GRPC_GRPC_JAVA_ARTIFACTS in its MODULE.bazel). grpc-netty-shaded
         # is deliberately NOT used. Unix domain sockets for grpc-netty need netty's epoll transport, and its

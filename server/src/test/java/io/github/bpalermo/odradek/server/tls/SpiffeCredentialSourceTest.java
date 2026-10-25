@@ -10,7 +10,6 @@ import io.github.bpalermo.odradek.config.v1.Tls;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.cert.X509Certificate;
-import java.time.Clock;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
@@ -23,7 +22,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-class WorkloadApiTest {
+/** The {@code spiffe} source: a handle on kafka-spiffe's shared source of a socket (ADR 9). */
+class SpiffeCredentialSourceTest {
   private static final String APP_ID = "spiffe://example.org/app";
   private static final String BROKER_ID = "spiffe://example.org/kafka/broker";
   private static final String PARTNER_BROKER_ID = "spiffe://partner.test/kafka/broker";
@@ -43,7 +43,7 @@ class WorkloadApiTest {
 
   private Path socket;
   private FakeWorkloadApi agent;
-  private WorkloadApiSource source;
+  private SpiffeCredentialSource source;
 
   @BeforeAll
   static void issue() throws Exception {
@@ -75,8 +75,8 @@ class WorkloadApiTest {
     Files.deleteIfExists(socket.getParent());
   }
 
-  private WorkloadApiSource connect() throws Exception {
-    source = new WorkloadApiSource(socket.toString(), Clock.systemUTC(), WAIT);
+  private SpiffeCredentialSource connect() throws Exception {
+    source = SpiffeCredentialSource.open(socket.toString(), WAIT);
     return source;
   }
 
@@ -109,18 +109,16 @@ class WorkloadApiTest {
   @Test
   void noAgentIsReportedWithTheReason() {
     Path nowhere = socket.resolveSibling("nobody.sock");
-    assertThatThrownBy(
-            () ->
-                new WorkloadApiSource(nowhere.toString(), Clock.systemUTC(), Duration.ofSeconds(2)))
+    assertThatThrownBy(() -> SpiffeCredentialSource.open(nowhere.toString(), Duration.ofSeconds(2)))
         .isInstanceOf(CredentialException.class)
         .hasMessageContaining("nobody.sock")
-        .hasMessageContaining("UNAVAILABLE");
+        .hasMessageContaining("within PT2S");
   }
 
   @Test
   void rotatedSvidReplacesTheCurrentOne() throws Exception {
     agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of());
-    WorkloadApiSource watch = connect();
+    SpiffeCredentialSource watch = connect();
     agent.publish(APP_ID, appNext.certPem(), appNext.keyPem(), ca, Map.of());
     await(() -> subject(watch.current()).equals("CN=app-next"));
     assertThat(watch.reloads()).isEqualTo(2);
@@ -129,7 +127,7 @@ class WorkloadApiTest {
   @Test
   void unusableUpdateKeepsTheCurrentSvid() throws Exception {
     agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of());
-    WorkloadApiSource watch = connect();
+    SpiffeCredentialSource watch = connect();
     // A certificate with the key of another.
     agent.publish(APP_ID, appNext.certPem(), app.keyPem(), ca, Map.of());
     await(() -> watch.failures() == 1);
@@ -143,10 +141,11 @@ class WorkloadApiTest {
   @Test
   void endedStreamIsOpenedAgainAndTheSvidKept() throws Exception {
     agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of());
-    WorkloadApiSource watch = connect();
+    SpiffeCredentialSource watch = connect();
     agent.dropStreams();
     await(() -> agent.streamsOpened() == 2);
     assertThat(subject(watch.current())).isEqualTo("CN=app");
+    assertThat(watch.failures()).isEqualTo(1);
 
     agent.publish(APP_ID, appNext.certPem(), appNext.keyPem(), ca, Map.of());
     await(() -> subject(watch.current()).equals("CN=app-next"));
@@ -155,7 +154,7 @@ class WorkloadApiTest {
   @Test
   void brokerIsVerifiedAgainstTheBundleOfItsOwnTrustDomain() throws Exception {
     agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of("partner.test", partnerCa));
-    WorkloadApiSource watch = connect();
+    SpiffeCredentialSource watch = connect();
     assertThat(watch.current().bundles()).containsOnlyKeys("example.org", "partner.test");
     ReloadingSslEngineFactory factory =
         factory(watch, new PeerPolicy(Set.of(PARTNER_BROKER_ID), "example.org"));
@@ -189,6 +188,20 @@ class WorkloadApiTest {
       assertThat(first.source()).isSameAs(second.source());
       assertThat(agent.streamsOpened()).isEqualTo(1);
     }
+  }
+
+  @Test
+  void handlesOnOneSocketShareTheLibrarysSource() throws Exception {
+    agent.publish(APP_ID, app.certPem(), app.keyPem(), ca, Map.of());
+    SpiffeCredentialSource first = connect();
+    try (SpiffeCredentialSource second = SpiffeCredentialSource.open(socket.toString(), WAIT)) {
+      assertThat(second.snapshot()).isSameAs(first.snapshot());
+      assertThat(agent.streamsOpened()).isEqualTo(1);
+    }
+    // The first handle keeps the source.
+    agent.publish(APP_ID, appNext.certPem(), appNext.keyPem(), ca, Map.of());
+    await(() -> subject(first.current()).equals("CN=app-next"));
+    assertThat(first.stats().connected()).isTrue();
   }
 
   @Test

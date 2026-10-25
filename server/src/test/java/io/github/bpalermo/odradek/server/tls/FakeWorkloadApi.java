@@ -35,6 +35,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * streams. Like the real one, it refuses a request without the security header.
  */
 public final class FakeWorkloadApi {
+  /** Every request must carry this header, as SPIRE agents require. */
+  private static final Metadata.Key<String> SECURITY_HEADER =
+      Metadata.Key.of("workload.spiffe.io", Metadata.ASCII_STRING_MARSHALLER);
+
   private static final MethodDescriptor<byte[], byte[]> METHOD =
       MethodDescriptor.<byte[], byte[]>newBuilder()
           .setType(MethodDescriptor.MethodType.SERVER_STREAMING)
@@ -54,7 +58,7 @@ public final class FakeWorkloadApi {
     ServerCallHandler<byte[], byte[]> handler =
         (call, headers) -> {
           call.sendHeaders(new Metadata());
-          if (!"true".equals(headers.get(WorkloadApi.SECURITY_HEADER))) {
+          if (!"true".equals(headers.get(SECURITY_HEADER))) {
             call.close(
                 Status.INVALID_ARGUMENT.withDescription("security header missing from request"),
                 new Metadata());
