@@ -560,13 +560,13 @@ A sidecar hands the app the records of a partition from one stream at a time, so
 
 #### Security of the delivery port
 
-`Deliver` streams run over mutual TLS when both ends configure it: `dispatch.tls` on the dispatcher, `dispatcher.tls` on the server that receives. The credentials come from the sources of section 9, `files` or `spiffe`, loaded and kept current by the same code as a cluster's (`server/tls`: `TlsSources`, `ReloadingSslContext`, `PeerTrust`).
+`Deliver` streams run over mutual TLS when both ends configure it: `dispatch.tls` on the dispatcher, `dispatcher.tls` on the server that receives. The credentials come from the sources of section 9, `files` or `spiffe`, loaded and kept current by the same code as a cluster's (`server/tls`: `TlsSources`, `ReloadingSslContext`). With a `spiffe` source each context is kafka-spiffe's `SnapshotSslContext` of the library's snapshot, and peers are verified by its `SpiffeTrustManager` (ADR 9); with `files`, by the server's own `PeerTrust`.
 
 **The handshake.** TLS 1.3 only, with the JDK's TLS, because both ends are this server. Identities are SPIFFE IDs: the one URI subject alternative name of a certificate. No host name is ever checked, since a sidecar connects to replicas by IP address.
 
 | End | Presents | Accepts |
 |---|---|---|
-| Dispatcher | The certificate of `dispatch.tls` | Any client certificate that verifies. With a `spiffe` source: one that carries a SPIFFE ID and chains to the bundle of the trust domain that ID names, federated bundles included, so that an authority federated with vouches only for its own identities. With `files`: one that chains to the CA bundle. A connection without a client certificate is closed |
+| Dispatcher | The certificate of `dispatch.tls` | Any client certificate that verifies. With a `spiffe` source: an X.509-SVID (one SPIFFE ID, not a CA, an extended key usage that allows `clientAuth` if it has one) of a trust domain the snapshot has a bundle of, chained to that bundle, federated bundles included, so that an authority federated with vouches only for its own identities. With `files`: one that chains to the CA bundle. A connection without a client certificate is closed |
 | Sidecar | The certificate of `dispatcher.tls` | A certificate that verifies the same way and whose SPIFFE ID is in `acceptedSpiffeIds` or in `acceptedTrustDomain`. Every replica must present one: the check is made on the connection to the Service's address and on each connection to a replica |
 
 - The dispatcher's handshake does not consult the policy. A sidecar the policy has no rule for completes the handshake and is refused when it declares, with a status and a message; a handshake can only fail, and the sidecar could not tell why.
@@ -574,7 +574,7 @@ A sidecar hands the app the records of a partition from one stream at a time, so
 
 **Authorization.** The dispatcher authorizes each declaration by the SPIFFE ID of the connection it arrives on, against `dispatch.policy` (`Policy`).
 
-- A certificate without a SPIFFE ID (possible only with a `files` source) names nobody: `UNAUTHENTICATED`.
+- A certificate without a SPIFFE ID (possible only with a `files` source: with `spiffe`, the library ends the handshake) names nobody: `UNAUTHENTICATED`.
 - Whatever no rule allows is `PERMISSION_DENIED`, with one message whatever the reason: `<SPIFFE ID> is not allowed to consume topic <t> in group <g> on cluster <c>`, and `with dead-letter topic <d>` when the declaration names one. It is made of who asked and what was asked, so it tells a sidecar nothing of the clusters the dispatcher has, of the rules of other identities, or of which part of its own rule failed. The dispatcher logs each refusal.
 - A malformed declaration is `INVALID_ARGUMENT` before the policy is consulted: that answer is the same for everyone.
 - The dead-letter topic is checked with the rest: the dispatcher writes dead letters with its own credentials, so a sidecar that could name any topic could make it write, to wherever its Kafka principal may, a copy of whatever the sidecar may read. A rule lists the topics it allows (`deadLetterTopics`); one that lists none allows no dead-lettering.
