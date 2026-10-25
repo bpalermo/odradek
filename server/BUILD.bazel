@@ -66,6 +66,7 @@ java_library(
         "@grpc-java//netty",
         "@grpc-java//stub",
         "@maven//:build_buf_protovalidate",
+        "@maven//:io_github_bpalermo_kafka_spiffe",
         "@maven//:io_netty_netty_buffer",
         "@maven//:io_netty_netty_handler",
         "@maven//:io_netty_netty_transport",

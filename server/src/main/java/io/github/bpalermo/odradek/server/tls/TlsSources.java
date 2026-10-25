@@ -61,6 +61,8 @@ public final class TlsSources implements Closeable {
   private final List<FileCredentialSource> files;
   private final List<SpiffeCredentialSource> watches;
   private final ScheduledExecutorService poller;
+  private final PeerVerifications listenerVerifications = new PeerVerifications();
+  private final PeerVerifications dispatcherVerifications = new PeerVerifications();
 
   /** What {@link #load} fills in. */
   private static final class Loading {
@@ -334,6 +336,43 @@ public final class TlsSources implements Closeable {
       sources.put(DISPATCHER, dispatcher.source());
     }
     return sources;
+  }
+
+  /**
+   * What the library's verification of the delivery port's peers came to, for the end a section
+   * configures ({@link #LISTENER} or {@link #DISPATCHER}): the observer its contexts are made with.
+   * It counts only for a {@code spiffe} source; a {@code files} source's peers are verified by the
+   * server's own code.
+   */
+  public PeerVerifications verifications(String section) {
+    return switch (section) {
+      case LISTENER -> listenerVerifications;
+      case DISPATCHER -> dispatcherVerifications;
+      default -> throw new IllegalArgumentException("no delivery section " + section);
+    };
+  }
+
+  /**
+   * Whether a cluster's Kafka clients use the library's engine factory: a {@code spiffe} source.
+   */
+  public boolean kafkaSpiffe() {
+    return bindings.values().stream().anyMatch(b -> b.source() instanceof SpiffeCredentialSource);
+  }
+
+  /**
+   * The sections of the delivery port whose peers the library verifies, a {@code spiffe} source,
+   * with their counts.
+   */
+  public Map<String, PeerVerifications> spiffeDeliveryVerifications() {
+    Map<String, PeerVerifications> verified = new TreeMap<>();
+    deliverySources()
+        .forEach(
+            (section, source) -> {
+              if (source instanceof SpiffeCredentialSource) {
+                verified.put(section, verifications(section));
+              }
+            });
+    return verified;
   }
 
   /**

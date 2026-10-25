@@ -1,8 +1,10 @@
 package io.github.bpalermo.odradek.server.telemetry;
 
+import io.github.bpalermo.kafka.spiffe.kafka.PeerVerificationStats;
 import io.github.bpalermo.odradek.delivery.v1.ReplicaList;
 import io.github.bpalermo.odradek.server.admin.Readiness;
 import io.github.bpalermo.odradek.server.tls.CredentialSource;
+import io.github.bpalermo.odradek.server.tls.PeerVerifications;
 import io.github.bpalermo.odradek.server.tls.TlsSources;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
@@ -11,9 +13,11 @@ import io.opentelemetry.api.metrics.DoubleHistogram;
 import io.opentelemetry.api.metrics.LongCounter;
 import io.opentelemetry.api.metrics.LongUpDownCounter;
 import io.opentelemetry.api.metrics.Meter;
+import io.opentelemetry.api.metrics.ObservableLongMeasurement;
 import java.time.Clock;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Supplier;
 
@@ -41,6 +45,12 @@ public final class ServerMetrics {
    * port, and the value is the configuration section that names them.
    */
   static final AttributeKey<String> DELIVERY = AttributeKey.stringKey("delivery");
+
+  /** On odradek.tls.peer.verifications: the role the server took in the handshake. */
+  static final AttributeKey<String> SIDE = AttributeKey.stringKey("side");
+
+  /** On odradek.tls.peer.verifications: {@code accepted} or {@code rejected}. */
+  static final AttributeKey<String> RESULT = AttributeKey.stringKey("result");
 
   private static final String OK = "ok";
   private static final String ERROR = "error";
@@ -714,6 +724,63 @@ public final class ServerMetrics {
   }
 
   /**
+   * What kafka-spiffe's verification of the server's peers came to (ADR 9), wherever it verifies
+   * them: the Kafka clients of {@code spiffe} clusters, whose counts are the process's (every such
+   * cluster shares the library's source and count, so the series carry no {@code cluster}), and
+   * each end of the delivery port with a {@code spiffe} source, under {@code delivery}. {@code
+   * side} is the role the server took in the handshake; {@code reason} is set on a refusal only.
+   */
+  private void observePeerVerifications(TlsSources tls) {
+    boolean kafka = tls.kafkaSpiffe();
+    Map<String, PeerVerifications> delivery = tls.spiffeDeliveryVerifications();
+    if (!kafka && delivery.isEmpty()) {
+      return;
+    }
+    PeerVerificationStats library = PeerVerificationStats.of(null);
+    meter
+        .counterBuilder("odradek.tls.peer.verifications")
+        .setDescription(
+            "Peers whose X.509-SVID the server verified in a handshake, accepted or refused, by"
+                + " the side the server took and the reason of a refusal.")
+        .setUnit("{peer}")
+        .buildWithCallback(
+            measurement -> {
+              if (kafka) {
+                record(measurement, Attributes.empty(), "client", library.client());
+              }
+              delivery.forEach(
+                  (section, counts) -> {
+                    Attributes where = Attributes.of(DELIVERY, section);
+                    if (TlsSources.LISTENER.equals(section)) {
+                      record(measurement, where, "server", counts.server());
+                    } else {
+                      record(measurement, where, "client", counts.client());
+                    }
+                  });
+            });
+  }
+
+  private static void record(
+      ObservableLongMeasurement measurement,
+      Attributes where,
+      String side,
+      PeerVerificationStats.Side counts) {
+    measurement.record(
+        counts.accepted(), where.toBuilder().put(SIDE, side).put(RESULT, "accepted").build());
+    counts
+        .rejected()
+        .forEach(
+            (reason, count) ->
+                measurement.record(
+                    count,
+                    where.toBuilder()
+                        .put(SIDE, side)
+                        .put(RESULT, "rejected")
+                        .put(REASON, reason.name().toLowerCase(Locale.ROOT).replace('_', '-'))
+                        .build()));
+  }
+
+  /**
    * Reports the state of the TLS credentials and of readiness on every collection.
    *
    * <p>Alert on {@code odradek.tls.certificate.not_after} minus now, not on reload events: a
@@ -756,6 +823,7 @@ public final class ServerMetrics {
             measurement ->
                 sources.forEach(
                     (attributes, source) -> measurement.record(source.failures(), attributes)));
+    observePeerVerifications(tls);
     meter
         .gaugeBuilder("odradek.ready")
         .ofLongs()
