@@ -88,11 +88,16 @@ jobs:
   # io.github.bpalermo:odradek-client and :odradek-extension.
   #
   # Off until the repository variable PUBLISH_MAVEN is `true`. NOT VALIDATED:
-  # it has never run. It needs, in the `release` environment, MAVEN_USER and
-  # MAVEN_PASSWORD (a Central Portal token), GPG_PRIVATE_KEY and
-  # GPG_PASSPHRASE, and the io.github.bpalermo namespace verified on Maven
-  # Central. MAVEN_REPO defaults to the Portal's staging-compatible endpoint;
-  # a deployment made there still has to be released in the Portal.
+  # it has never run. It needs, in the `release` environment: MAVEN_USER and
+  # MAVEN_PASSWORD (a Central Portal token); GPG_PRIVATE_KEY (the secret key
+  # ring, `gpg --export-secret-keys`, base64-encoded) and GPG_PASSPHRASE; and
+  # the io.github.bpalermo namespace verified on Maven Central. Signing is in
+  # memory (USE_IN_MEMORY_PGP_KEYS): the publisher's gpg mode never passes a
+  # passphrase, so it cannot use a protected key on a runner. The signing-check
+  # workflow tests those two secrets without publishing.
+  #
+  # The upload goes to the Portal's staging-compatible endpoint. A deployment
+  # made there still has to be released in the Portal.
   maven:
     if: vars.PUBLISH_MAVEN == 'true'
     needs: [plan, images]
@@ -100,6 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+      STAGING: https://ossrh-staging-api.central.sonatype.com
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -111,23 +117,26 @@ jobs:
           disk-cache: release-maven
           repository-cache: true
           cache-save: false
-      # Built before any credential exists on the runner.
-      - run: bazel build --config=ci //client/java:maven.publish //extension/java:maven.publish
-      - name: Import the signing key
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-        run: printf '%s' "${GPG_PRIVATE_KEY}" | gpg --batch --import
+      # Built before any credential exists on the runner, as `bazel run` builds
+      # them: the scripts it writes are what the upload runs, so nothing is built
+      # while the secrets are in the environment.
+      - run: |
+          set -euo pipefail
+          bazel run --config=ci --script_path=publish-extension.sh //extension/java:maven.publish
+          bazel run --config=ci --script_path=publish-client.sh //client/java:maven.publish
       - name: Upload
         env:
-          MAVEN_REPO: ${{ vars.MAVEN_REPO || 'https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/' }}
+          MAVEN_REPO: ${{ env.STAGING }}/service/local/staging/deploy/maven2/
           MAVEN_USER: ${{ secrets.MAVEN_USER }}
           MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
-          GPG_SIGN: "true"
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          # Not GPG_SIGN: the publisher refuses both modes at once.
+          USE_IN_MEMORY_PGP_KEYS: "true"
+          PGP_SIGNING_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          PGP_SIGNING_PWD: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
-          bazel run --config=ci //extension/java:maven.publish
-          bazel run --config=ci //client/java:maven.publish
+          ./publish-extension.sh
+          ./publish-client.sh
 
   # com.github.bpalermo/odradek-clj.
   #
