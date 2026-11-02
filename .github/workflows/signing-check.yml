@@ -1,0 +1,86 @@
+name: signing-check
+
+# Tests the release environment's signing secrets without publishing anything:
+# the release workflow's own publishers, with in-memory signing as it uses it,
+# write both Java artifacts to a local repository, and every signature is
+# verified against the public key fetched from the keyservers Maven Central
+# reads. Run it by hand (Actions > signing-check > Run workflow) after changing
+# GPG_PRIVATE_KEY or GPG_PASSPHRASE, and before the first release that sets
+# PUBLISH_MAVEN.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The release signing key, shared with kafka-spiffe (same namespace, same
+  # author): RSA 4096, sign-only, expires 2029-10-24.
+  FINGERPRINT: 1AD8BBC7819C4FFC7ECB0DC08D760DEA50D2412D
+
+jobs:
+  check:
+    # The release environment's secrets are for main and version tags only (its
+    # deployment branch policy), so the check runs from main.
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: signing-check
+          repository-cache: true
+          cache-save: false
+      # As the release builds them: the scripts `bazel run` writes are what the
+      # signing step runs.
+      - run: |
+          set -euo pipefail
+          bazel run --config=ci --script_path=publish-extension.sh //extension/java:maven.publish
+          bazel run --config=ci --script_path=publish-client.sh //client/java:maven.publish
+      - name: Sign into a local repository
+        env:
+          USE_IN_MEMORY_PGP_KEYS: "true"
+          PGP_SIGNING_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          PGP_SIGNING_PWD: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export MAVEN_REPO="file://${RUNNER_TEMP}/repo"
+          ./publish-extension.sh
+          ./publish-client.sh
+      - name: Verify every signature against the published key
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          mkdir -m 700 "${GNUPGHOME}"
+          for server in hkps://keyserver.ubuntu.com hkps://keys.openpgp.org; do
+            gpg --batch --keyserver "${server}" --recv-keys "${FINGERPRINT}"
+          done
+          count=0
+          for artifact in odradek-extension odradek-client; do
+            dir="${RUNNER_TEMP}/repo/io/github/bpalermo/${artifact}/0.0.0-dev"
+            for file in "${dir}"/*.jar "${dir}"/*.pom; do
+              # gpg exits non-zero on a bad or missing signature: read its status
+              # lines all the same, so the error below names the file.
+              status="$(gpg --batch --status-fd 1 --verify "${file}.asc" "${file}" 2>/dev/null || true)"
+              # A good signature by this key, valid now: not expired, not revoked.
+              if grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|KEYEXPIRED|KEYREVOKED|NO_PUBKEY)( |$)' <<<"${status}" ||
+                ! grep -q "^\[GNUPG:\] GOODSIG ${FINGERPRINT: -16} " <<<"${status}" ||
+                ! grep -q "^\[GNUPG:\] VALIDSIG ${FINGERPRINT} " <<<"${status}"; then
+                echo "::error::${file##*/} is not validly signed by ${FINGERPRINT}:" >&2
+                grep '^\[GNUPG:\]' <<<"${status}" >&2 || true
+                exit 1
+              fi
+              count=$((count + 1))
+            done
+          done
+          # Each artifact is a jar, its sources, its javadoc and its POM.
+          if [ "${count}" -ne 8 ]; then
+            echo "::error::expected four files for each of the two artifacts; verified ${count}" >&2
+            exit 1
+          fi
+          echo "${count} files signed by ${FINGERPRINT}"
