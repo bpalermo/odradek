@@ -47,7 +47,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>A context per set of credentials also means a TLS session cache per set: a connection made
  * after a rotation cannot resume a session negotiated before it, so the certificate a peer is seen
- * with is always one it presented in that handshake.
+ * with is always one it presented in that handshake. Within one set, the library's engines verify a
+ * resumed session's peer again, at the context's clock, as a full handshake would have.
  *
  * <p>The JDK's TLS, never OpenSSL's: nothing is loaded that the native image would have to carry.
  * TLS 1.3 only, because both ends are this server.
@@ -121,27 +122,27 @@ public final class ReloadingSslContext extends SslContext {
         });
   }
 
-  /** Contexts of the library's snapshots, verifying peers' IDs with what {@code peers} gives. */
+  /**
+   * Contexts of the library's snapshots, verifying peers' IDs with what {@code peers} gives, at
+   * {@code clock}.
+   */
   private static ReloadingSslContext ofSnapshots(
       String name,
-      SpiffeCredentialSource source,
+      Supplier<X509Context> snapshots,
       boolean client,
       Function<X509Context, SpiffeIdMatcher> peers,
-      SpiffeTrustManager.Observer observer)
+      SpiffeTrustManager.Observer observer,
+      Clock clock)
       throws CredentialException {
     return new ReloadingSslContext(
         name,
-        source::snapshot,
+        snapshots::get,
         snapshot -> ((X509Context) snapshot).expiresAt(),
         client,
         snapshot -> {
           X509Context context = (X509Context) snapshot;
           return SnapshotSslContext.create(
-              context,
-              peers.apply(context),
-              SnapshotSslContext.Settings.DEFAULT,
-              Clock.systemUTC(),
-              observer);
+              context, peers.apply(context), SnapshotSslContext.Settings.DEFAULT, clock, observer);
         });
   }
 
@@ -170,11 +171,26 @@ public final class ReloadingSslContext extends SslContext {
    */
   public static ReloadingSslContext forListener(
       CredentialSource source, SpiffeTrustManager.Observer observer) throws CredentialException {
-    String name = TlsSources.LISTENER;
     if (source instanceof SpiffeCredentialSource spiffe) {
-      return ofSnapshots(name, spiffe, false, ReloadingSslContext::anyOfTheBundles, observer);
+      return forListener(spiffe::snapshot, observer, Clock.systemUTC());
     }
-    return ofCredentials(name, source, false, PeerTrust::ofSidecar);
+    return ofCredentials(TlsSources.LISTENER, source, false, PeerTrust::ofSidecar);
+  }
+
+  /**
+   * The listener's context of the library's snapshots as {@code snapshots} gives them, verifying
+   * peers at {@code clock}: what a {@code spiffe} source gets, with both given by a test.
+   */
+  static ReloadingSslContext forListener(
+      Supplier<X509Context> snapshots, SpiffeTrustManager.Observer observer, Clock clock)
+      throws CredentialException {
+    return ofSnapshots(
+        TlsSources.LISTENER,
+        snapshots,
+        false,
+        ReloadingSslContext::anyOfTheBundles,
+        observer,
+        clock);
   }
 
   /** As below, counting nothing. */
@@ -192,22 +208,42 @@ public final class ReloadingSslContext extends SslContext {
    */
   public static ReloadingSslContext forDispatcher(
       TlsBinding binding, SpiffeTrustManager.Observer observer) throws CredentialException {
-    String name = TlsSources.DISPATCHER;
     PeerPolicy policy = binding.policy();
     if (binding.source() instanceof SpiffeCredentialSource spiffe) {
-      if (!policy.spiffe()) {
-        throw new CredentialException(
-            name + ": a dispatcher is verified by SPIFFE ID; none is accepted");
-      }
-      SpiffeIdMatcher accepted =
-          SpiffeIdMatcher.none()
-              .withIds(policy.spiffeIds())
-              .withTrustDomains(
-                  policy.trustDomain().isEmpty() ? List.of() : List.of(policy.trustDomain()));
-      return ofSnapshots(name, spiffe, true, snapshot -> accepted, observer);
+      return forDispatcher(spiffe::snapshot, policy, observer, Clock.systemUTC());
     }
     return ofCredentials(
-        name, binding.source(), true, credentials -> PeerTrust.ofDispatcher(credentials, policy));
+        TlsSources.DISPATCHER,
+        binding.source(),
+        true,
+        credentials -> PeerTrust.ofDispatcher(credentials, policy));
+  }
+
+  /**
+   * A sidecar's context of the library's snapshots as {@code snapshots} gives them, accepting a
+   * dispatcher {@code policy} accepts, at {@code clock}: what a {@code spiffe} source gets, with
+   * both given by a test.
+   *
+   * @throws CredentialException if the current snapshot cannot be used, or the policy names no
+   *     identity
+   */
+  static ReloadingSslContext forDispatcher(
+      Supplier<X509Context> snapshots,
+      PeerPolicy policy,
+      SpiffeTrustManager.Observer observer,
+      Clock clock)
+      throws CredentialException {
+    String name = TlsSources.DISPATCHER;
+    if (!policy.spiffe()) {
+      throw new CredentialException(
+          name + ": a dispatcher is verified by SPIFFE ID; none is accepted");
+    }
+    SpiffeIdMatcher accepted =
+        SpiffeIdMatcher.none()
+            .withIds(policy.spiffeIds())
+            .withTrustDomains(
+                policy.trustDomain().isEmpty() ? List.of() : List.of(policy.trustDomain()));
+    return ofSnapshots(name, snapshots, true, snapshot -> accepted, observer, clock);
   }
 
   /** Any SPIFFE ID of a trust domain the snapshot holds a bundle of. */
