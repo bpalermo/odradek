@@ -21,6 +21,9 @@ env:
 
 jobs:
   check:
+    # The release environment's secrets are for main and version tags only (its
+    # deployment branch policy), so the check runs from main.
+    if: github.ref == 'refs/heads/main'
     environment: release
     runs-on: ubuntu-latest
     steps:
@@ -61,9 +64,15 @@ jobs:
           for artifact in odradek-extension odradek-client; do
             dir="${RUNNER_TEMP}/repo/io/github/bpalermo/${artifact}/0.0.0-dev"
             for file in "${dir}"/*.jar "${dir}"/*.pom; do
-              status="$(gpg --batch --status-fd 1 --verify "${file}.asc" "${file}" 2>/dev/null)"
-              if ! grep -q "^\[GNUPG:\] VALIDSIG ${FINGERPRINT} " <<<"${status}"; then
-                echo "::error::${file##*/} is not signed by ${FINGERPRINT}" >&2
+              # gpg exits non-zero on a bad or missing signature: read its status
+              # lines all the same, so the error below names the file.
+              status="$(gpg --batch --status-fd 1 --verify "${file}.asc" "${file}" 2>/dev/null || true)"
+              # A good signature by this key, valid now: not expired, not revoked.
+              if grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|KEYEXPIRED|KEYREVOKED|NO_PUBKEY)( |$)' <<<"${status}" ||
+                ! grep -q "^\[GNUPG:\] GOODSIG ${FINGERPRINT: -16} " <<<"${status}" ||
+                ! grep -q "^\[GNUPG:\] VALIDSIG ${FINGERPRINT} " <<<"${status}"; then
+                echo "::error::${file##*/} is not validly signed by ${FINGERPRINT}:" >&2
+                grep '^\[GNUPG:\]' <<<"${status}" >&2 || true
                 exit 1
               fi
               count=$((count + 1))
