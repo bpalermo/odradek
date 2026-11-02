@@ -24,7 +24,7 @@
     "dev.cel:common": -1788353211,
     "dev.cel:protobuf": -1889190299,
     "dev.cel:runtime": 482529582,
-    "io.github.bpalermo:kafka-spiffe": 2051735105,
+    "io.github.bpalermo:kafka-spiffe": -1552670717,
     "io.netty:netty-buffer": 1648289272,
     "io.netty:netty-codec-base": 1202692320,
     "io.netty:netty-codec-http": -1193268201,
@@ -100,7 +100,7 @@
     "dev.cel:protobuf": 1051071068,
     "dev.cel:runtime": -928569700,
     "dev.cel:v1alpha1": -1522283694,
-    "io.github.bpalermo:kafka-spiffe": 675002813,
+    "io.github.bpalermo:kafka-spiffe": 961255162,
     "io.grpc:grpc-api": 1650246748,
     "io.grpc:grpc-context": -1599813506,
     "io.grpc:grpc-protobuf": 319751986,
@@ -404,9 +404,9 @@
     },
     "io.github.bpalermo:kafka-spiffe": {
       "shasums": {
-        "jar": "322fcf8d8b9a29e65dc268c7e1d9de6741b995f798ced686da3726757ed15e64"
+        "jar": "2cfe82a01ec4b39a41a8aef5c6188337fcc9b313dec457acc6a58b0032130fbc"
       },
-      "version": "0.2.0"
+      "version": "0.3.1"
     },
     "io.grpc:grpc-api": {
       "shasums": {
